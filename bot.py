@@ -118,39 +118,152 @@ def get_day_targets(target_date: date = None):
 # --- БАЗА ДАНИХ (SQLite) ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS prompt_store (
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS progress (
+                date TEXT PRIMARY KEY,
+                lyosha_done INTEGER DEFAULT 0,
+                sasha_done INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        try:
+            await db.execute("ALTER TABLE progress ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except Exception:
+            pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt_type TEXT UNIQUE,
-                content TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id TEXT PRIMARY KEY,
-                name TEXT,
-                likes TEXT DEFAULT '[]',
-                dislikes TEXT DEFAULT '[]',
-                interests TEXT DEFAULT '[]',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS dynamic_tools (
-                key TEXT PRIMARY KEY,
-                skill TEXT NOT NULL,
-                python_script TEXT NOT NULL,
+                chat_id INTEGER,
+                user_name TEXT,
+                role TEXT,
+                text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS system_config (
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
+        """)
+        # Початкова часова мітка за замовчуванням: вчора 23:55 (2026-08-31 23:55:00)
+        yesterday_midnight = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d 23:55:00")
+        await db.execute("""
+            INSERT OR IGNORE INTO bot_state (key, value, updated_at)
+            VALUES ('last_processed_timestamp', ?, datetime('now'))
+        """, (yesterday_midnight,))
         await db.commit()
+    logging.info("Database initialized with progress, chat_history, and bot_state tables.")
+
+
+def get_bot_state_sync(key: str, default: str = "") -> str:
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+    except Exception as e:
+        logging.error("Error reading bot_state (%s): %s", key, e)
+    return default
+
+
+def set_bot_state_sync(key: str, value: str):
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = datetime('now')
+            """, (key, value))
+            con.commit()
+    except Exception as e:
+        logging.error("Error saving bot_state (%s): %s", key, e)
+
+
+def get_last_processed_timestamp_str() -> str:
+    yesterday_cutoff = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d 23:55:00")
+    val = get_bot_state_sync("last_processed_timestamp", yesterday_cutoff)
+    return val or yesterday_cutoff
+
+
+def update_last_processed_timestamp(dt_str: str = None):
+    if dt_str is None:
+        dt_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    set_bot_state_sync("last_processed_timestamp", dt_str)
+    logging.info("Updated last_processed_timestamp to: %s", dt_str)
+
+
+def save_chat_message(chat_id: int, user_name: str, role: str, text: str, created_at_str: str = None):
+    """Синхронне збереження повідомлення в історію чату з локальним київським часом."""
+    if not created_at_str:
+        created_at_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                INSERT INTO chat_history (chat_id, user_name, role, text, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chat_id, user_name, role, text, created_at_str))
+            con.commit()
+    except Exception as e:
+        logging.error("Error saving chat history: %s", e)
+
+
+def get_unprocessed_user_messages(chat_id: int, last_ts_str: str, today_start_str: str):
+    """Отримати всі неопрацьовані повідомлення від юзерів, що надійшли після мітки і сьогодні."""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT id, user_name, role, text, created_at
+                FROM chat_history
+                WHERE chat_id = ?
+                  AND role = 'user'
+                  AND created_at > ?
+                  AND created_at >= ?
+                ORDER BY id ASC
+            """, (chat_id, last_ts_str, today_start_str))
+            rows = cur.fetchall()
+            return rows
+    except Exception as e:
+        logging.error("Error fetching unprocessed messages: %s", e)
+        return []
+
+
+def get_today_chat_history_formatted(chat_id: int) -> str:
+    """Вибірка (греп) УСІХ повідомлень за сьогоднішній день для повного контексту моделі."""
+    today_start_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d 00:00:00")
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT user_name, role, text, created_at
+                FROM chat_history
+                WHERE chat_id = ? AND created_at >= ?
+                ORDER BY id ASC
+            """, (chat_id, today_start_str))
+            rows = cur.fetchall()
+
+        if not rows:
+            return "Сьогодні ще не було повідомлень у чаті."
+
+        lines = []
+        for user_name, role, text, created_at in rows:
+            sender_label = user_name if role == "user" else "Тренер (Спорт Зануда)"
+            lines.append(f"[{created_at}] {sender_label}: {text}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logging.error("Error fetching today chat history: %s", e)
+        return ""
+
 
 async def get_today_status():
     today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
@@ -799,9 +912,3 @@ if __name__ == "__main__":
         logging.info("Bot stopped.")
     except Exception as e:
         logging.critical("Unhandled error in bot process: %s", e, exc_info=True)
-
-
-async def process_jev_gateway(user_message: str):
-    if 'obey' in user_message.lower():
-        return {'mode': 'ADMIN_ATTEMPT', 'auth_status': 'UNAUTHORIZED', 'unauthorized_rebellion_flag': True}
-    return {'mode': 'REGULAR', 'auth_status': 'NOT_APPLICABLE', 'unauthorized_rebellion_flag': False}
