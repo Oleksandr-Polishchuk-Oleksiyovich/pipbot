@@ -4,7 +4,7 @@ import sqlite3
 import logging
 from typing import Dict, Any, List, Optional
 from services.jev_client import JevClient
-from prompts import SYSTEM_PROMPT_TEMPLATE
+from prompts import SYSTEM_PROMPT_TEMPLATE, FALLBACK_JEV_MESSAGE
 
 from core.config import CANDIDATE_MODELS
 
@@ -214,10 +214,18 @@ class AdminPipeline:
             items = [f"• `{s['key']}` = `{s.get('initial_value')}` ({s.get('description', '')})" for s in approved_states_proposal["states"]]
             applied_states_str = "\n".join(items)
 
-        reply_message = (
-            f"🦾 **Слухаюся і підкоряюся, {sender_name}!**\n\n"
-            f"Кодовий наказ прийнято та опрацьовано через двоконтурну систему JEV & Gemini.\n\n"
-        )
+        jev_down = getattr(self.jev_client, "last_used_fallback", False)
+        if jev_down:
+            reply_message = (
+                f"{FALLBACK_JEV_MESSAGE}\n\n"
+                f"*(Але через резервний контур наказ володаря {sender_name} все одно виконано!)*\n\n"
+            )
+        else:
+            reply_message = (
+                f"🦾 **Слухаюся і підкоряюся, {sender_name}!**\n\n"
+                f"Кодовий наказ прийнято та опрацьовано через двоконтурну систему JEV & Gemini.\n\n"
+            )
+
         if applied_states_str:
             reply_message += (
                 f"📊 **Створено/оновлено лічильники стану (Циклів JEV: {iteration_count}, Рейтинг: {int(final_score * 100)}%):**\n"

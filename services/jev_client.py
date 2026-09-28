@@ -19,6 +19,7 @@ class JevClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.gemini_client = gemini_client
+        self.last_used_fallback = False
 
     async def call_decisions(self, state: Dict[str, Any], questions: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -42,12 +43,14 @@ class JevClient:
                     if resp.status_code == 200:
                         data = resp.json()
                         if data.get("code") == 0:
+                            self.last_used_fallback = False
                             return data.get("data", {})
                     logger.warning("JEV API returned status %s: %s", resp.status_code, resp.text[:200])
             except Exception as e:
                 logger.warning("JEV API request failed (%s): %s", url, e)
 
         # Фолбек на AI або детерміновану евристику
+        self.last_used_fallback = True
         return await self._fallback_decide(state, questions)
 
     async def _fallback_decide(self, state: Dict[str, Any], questions: Dict[str, Any]) -> Dict[str, Any]:

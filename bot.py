@@ -470,7 +470,7 @@ def get_random_anime_quote(category: str) -> str:
         return f"Помилка читання цитати: {e}"
 
 # --- СИСТЕМНИЙ ПРОМПТ AI ТРЕНЕРА ---
-from prompts import SYSTEM_PROMPT_TEMPLATE, DYNAMIC_PROMPT_TEMPLATE
+from prompts import SYSTEM_PROMPT_TEMPLATE, DYNAMIC_PROMPT_TEMPLATE, FALLBACK_GEMINI_MESSAGE, FALLBACK_JEV_MESSAGE
 
 def admin_set_lives(secret_phrase: str, lyosha_lives: int = None, sasha_lives: int = None) -> str:
     """
@@ -699,11 +699,7 @@ async def process_chat_updates(chat_id: int, trigger_type: str = "push", job_nam
 
         # 3. Загальний фолбек, якщо це було інше повідомлення і AI недоступний
         if not replied:
-            general_fallback = (
-                "🦾 **Тренер на зв'язку!**\n\n"
-                "Сервери зв'язку трохи задихалися, але Зануда все бачить.\n\n"
-                "Хто ще не здав сьогоднішню норму — на підлогу і відтискатися! 💪"
-            )
+            general_fallback = FALLBACK_GEMINI_MESSAGE
             save_chat_message(chat_id, "Спорт Зануда", "coach", general_fallback)
             await send_safe_message(chat_id, general_fallback)
 
