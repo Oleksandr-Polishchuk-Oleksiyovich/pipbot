@@ -96,6 +96,13 @@ if GEMINI_API_KEY:
     except Exception as e:
         logging.error("Failed to initialize Gemini Client: %s", e)
 
+from services.jev_client import JevClient
+from agents.admin_pipeline import AdminPipeline
+
+jev_client = JevClient(gemini_client=gemini_client)
+admin_pipeline = AdminPipeline(gemini_client, jev_client, DB_PATH)
+
+
 
 # --- РОЗРАХУНОК НОРМИ ---
 def get_day_targets(target_date: date = None):
@@ -465,6 +472,23 @@ def get_random_anime_quote(category: str) -> str:
 # --- СИСТЕМНИЙ ПРОМПТ AI ТРЕНЕРА ---
 from prompts import SYSTEM_PROMPT_TEMPLATE, DYNAMIC_PROMPT_TEMPLATE
 
+def admin_set_lives(secret_phrase: str, lyosha_lives: int = None, sasha_lives: int = None) -> str:
+    """
+    Встановити або змінити кількість життів для Сонцеликого Льоші або Саші.
+    :param secret_phrase: Кодова фраза адміна (obey тощо).
+    :param lyosha_lives: Нова кількість життів для Сонцеликого Льоші.
+    :param sasha_lives: Нова кількість життів для Саші.
+    """
+    msg = []
+    if lyosha_lives is not None:
+        set_bot_state_sync("lives_lyosha", str(lyosha_lives))
+        msg.append(f"Сонцеликий Льоша: {lyosha_lives} ❤️")
+    if sasha_lives is not None:
+        set_bot_state_sync("lives_sasha", str(sasha_lives))
+        msg.append(f"Саша: {sasha_lives} ❤️")
+    return "Лічильники життів успішно оновлено: " + ", ".join(msg)
+
+
 def build_system_instruction(chat_id: int) -> str:
     targets = get_day_targets()
     lyosha_done, sasha_done = get_today_status_sync()
@@ -483,10 +507,16 @@ def build_system_instruction(chat_id: int) -> str:
         sasha_status=sasha_status
     )
     
+    lives_lyosha = get_bot_state_sync("lives_lyosha", "")
+    lives_sasha = get_bot_state_sync("lives_sasha", "")
+    if lives_lyosha or lives_sasha:
+        instruction += f"\n\n❤️ АКТУАЛЬНІ ЖИТТЯ У БД:\n- Сонцеликий Льоша: {lives_lyosha or 'не встановлено'}\n- Саша: {lives_sasha or 'не встановлено'}\n"
+
     if dynamic_override:
         instruction += DYNAMIC_PROMPT_TEMPLATE.format(dynamic_override=dynamic_override)
         
     return instruction
+
 
 
 async def ask_gemini_agent_with_full_context(today_history_text: str, chat_id: int) -> str:
@@ -506,7 +536,7 @@ async def ask_gemini_agent_with_full_context(today_history_text: str, chat_id: i
         f"Сформулюй лаконічну, дотепну та чітку відповідь на останні повідомлення. "
         f"Обов'язково гарно форматуй відповідь: частіше вживай переноси рядків, розбивай текст на короткі абзаци, використовуй Markdown та емодзі."
     )
-    tools_list = [mark_participant_done, check_challenge_status, get_challenge_rules, admin_set_system_prompt, admin_set_pushup_targets, get_random_anime_quote]
+    tools_list = [mark_participant_done, check_challenge_status, get_challenge_rules, admin_set_system_prompt, admin_set_pushup_targets, admin_set_lives, get_random_anime_quote]
 
     for model_name in CANDIDATE_MODELS:
         try:
@@ -550,6 +580,42 @@ async def process_chat_updates(chat_id: int, trigger_type: str = "push", job_nam
         logging.info("[%s trigger] Found %d unprocessed user message(s) since %s. Fetching all today messages...",
                      trigger_type, len(unprocessed_msgs), last_ts_str)
 
+        # 1.1 ПЕРЕВІРКА НА АДМІН-КОМАНДИ ТА СЕКРЕТНІ КОДОВІ ФРАЗИ (JEV + Gemini Admin Pipeline)
+        admin_directive_msg = None
+        secret_keywords = ["obey", "лелуш", "осуварі", "you will obey"]
+        for _, u_name, _, u_text, _ in unprocessed_msgs:
+            t_lower = u_text.lower()
+            if any(kw in t_lower for kw in secret_keywords):
+                admin_directive_msg = (u_name, u_text)
+                break
+
+        if admin_directive_msg:
+            sender_name, admin_directive = admin_directive_msg
+            logging.info("Admin keyword detected from '%s'. Running JEV+Gemini AdminPipeline...", sender_name)
+
+            # Відправляємо відео підкорення master
+            obey_dir = os.path.join(BASE_DIR, "answer_to_admin", "obey")
+            if os.path.exists(obey_dir):
+                import glob, random
+                videos = glob.glob(os.path.join(obey_dir, "*.mp4")) + glob.glob(os.path.join(obey_dir, "*.mov")) + glob.glob(os.path.join(obey_dir, "*.gif"))
+                if videos:
+                    video_path = random.choice(videos)
+                    try:
+                        await bot.send_video(chat_id, FSInputFile(video_path))
+                    except Exception as e:
+                        logging.error("Failed to send obey video: %s", e)
+
+            # Викликаємо AdminPipeline (JEV triage -> loop up to 7 -> JEV conflicts -> merge)
+            pipeline_res = await admin_pipeline.process_admin_directive(admin_directive, sender_name)
+            reply_text = pipeline_res.get("reply_message") or "🦾 Наказ володаря прийнято та виконано!"
+
+            save_chat_message(chat_id, "Спорт Зануда", "coach", reply_text)
+            latest_msg_time = unprocessed_msgs[-1][4]
+            update_last_processed_timestamp(latest_msg_time)
+            await send_safe_message(chat_id, reply_text)
+            return
+
+        # 1.2 ЗВИЧАЙНИЙ РЕЖИМ СПІЛКУВАННЯ / ЗВІТІВ
         # Греп УСІХ повідомлень за сьогодні для передачі повного контексту в AI
         today_history_text = get_today_chat_history_formatted(chat_id)
 
@@ -562,32 +628,9 @@ async def process_chat_updates(chat_id: int, trigger_type: str = "push", job_nam
             save_chat_message(chat_id, "Спорт Зануда", "coach", ai_reply)
             latest_msg_time = unprocessed_msgs[-1][4]
             update_last_processed_timestamp(latest_msg_time)
-            
-            # --- ЛОГІКА ВІДПРАВКИ ВІДЕО НА КОМАНДУ OBEY / КОДОВУ ФРАЗУ ВІД БУДЬ-КОГО ---
-            send_obey_video = False
-            secret_keywords = ["obey", "лелуш", "осуварі"]
-            for _, u_name, _, u_text, _ in unprocessed_msgs:
-                t_lower = u_text.lower()
-                if any(kw in t_lower for kw in secret_keywords):
-                    send_obey_video = True
-                    break
-                    
-            if send_obey_video:
-                import glob
-                import random
-                obey_dir = os.path.join(BASE_DIR, "answer_to_admin", "obey")
-                if os.path.exists(obey_dir):
-                    videos = glob.glob(os.path.join(obey_dir, "*.mp4")) + glob.glob(os.path.join(obey_dir, "*.mov")) + glob.glob(os.path.join(obey_dir, "*.gif"))
-                    if videos:
-                        video_path = random.choice(videos)
-                        try:
-                            await bot.send_video(chat_id, FSInputFile(video_path))
-                        except Exception as e:
-                            logging.error("Failed to send obey video: %s", e)
-            # -----------------------------------------------
-            
             await send_safe_message(chat_id, ai_reply)
             return
+
 
         # Алгоритмічний фолбек якщо AI недоступний або повернув пусту відповідь
         replied = False

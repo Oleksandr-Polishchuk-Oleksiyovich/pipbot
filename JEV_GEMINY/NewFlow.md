@@ -1,219 +1,190 @@
-# AGENT SYSTEM SPECIFICATION: SPORT-NERD PLATFORM 2.0
-ARCHITECTURE: Hybrid Dual-Layer (JEV System-1 Fast Engine + Gemini System-2 Cognition)
-TARGET ECOSYSTEM: Google Cloud Run, Telegram Bot API, SQLite/Cloud SQL
+# SYSTEM SPECIFICATION: SPORT-NERD PLATFORM (LANGUAGE-AGNOSTIC ARCHITECTURE)
 
-================================================================================
-1. TOPOLOGY & FLOW ARCHITECTURE
-================================================================================
-The platform decouples deterministic security, dispatching, and memory profiling from generative persona synthesis.
+## 1. ARCHITECTURAL OVERVIEW
+The system implements a **Dual-Layer Cognitive Architecture** decoupling fast deterministic evaluation, validation, and state governance (System-1) from generative reasoning, synthesis, and persona execution (System-2).
 
-Message Processing Lifecycle:
-1. Inbound Telegram Message -> Async Trigger.
-2. Background Observer (Silent LLM Step): Analyzes delta for user profile attributes. Updates User Memory Store in DB if and only if new facts emerge.
-3. JEV Node 0 (Gateway): Evaluates security passphrases, routes traffic to either [Admin Pipeline] or [Regular Pipeline].
-4. Branch A: [Admin Pipeline]
-   - JEV Node 1 (Admin Triage): Classifies scope across 5 stages (Prompt Override, DB Mutation, Param Update, New Param Definition, Tool Synthesis).
-   - If Stage 1 (Prompt Override): Calls Gemini Prompt Modifier Agent, which ingests `INITIAL_SYSTEM_PROMPT`, `CURRENT_SYSTEM_PROMPT`, and User Directive, then persists output to DB.
-   - If Stage 5 (Tool Creation): Calls Gemini Tool Generator Agent, creates record in `dynamic_tools` table (key, skill, python_script).
-   - Gemini Admin Executor: Generates structured admin confirmation.
-5. Branch B: [Regular Pipeline]
-   - JEV Node 2 (Executor Router): Compares user message with registry of active dynamic tools (`key`, `skill`). Extracts runtime arguments.
-   - Python Runner: Executes dynamic Python tool in a restricted local scope if `tool_required == True`.
-   - Gemini Regular Coach (Persona Agent): Ingests current prompt from DB, execution outputs, and user memory dossier (`likes`, `dislikes`, `interests`). Emits final Telegram Markdown response.
+```
+                      +-----------------------------+
+                      |   Inbound Message / Event   |
+                      +--------------+--------------+
+                                     |
+                                     v
+                      +-----------------------------+
+                      |   Node 0: Gateway & Auth    |
+                      +--------------+--------------+
+                                     |
+                    +----------------+----------------+
+                    |                                 |
+         [Admin Auth Match]                  [Regular Traffic]
+                    |                                 |
+                    v                                 v
+    +-------------------------------+   +-----------------------------+
+    | Node 1: Admin Governance Loop |   | Node 3: Runtime Dispatcher  |
+    | - JEV State Need Triage       |   | - Dynamic State Injection   |
+    | - Iterative Consensus (N<=7)  |   | - Deterministic Tools Call  |
+    | - Conflict & Novelty Analysis |   | - System-2 Persona Output   |
+    | - Prompt Merger & Persist     |   +-----------------------------+
+    +-------------------------------+
+```
 
-================================================================================
-2. DATABASE SCHEMAS (REQUIRED INITIALIZATION)
-================================================================================
+---
 
-TABLE prompt_store (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    prompt_type TEXT UNIQUE, -- 'initial' OR 'current'
-    content TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+## 2. API ROLES & PROTOCOL CONTRACTS
 
-TABLE user_profiles (
-    user_id TEXT PRIMARY KEY,
-    name TEXT,
-    likes TEXT DEFAULT '[]',     -- JSON Array of strings
-    dislikes TEXT DEFAULT '[]',  -- JSON Array of strings
-    interests TEXT DEFAULT '[]', -- JSON Array of strings
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+### 2.1. System-1 Engine (JEV / Decision Engine API)
+* **Role**: Deterministic gatekeeper, risk assessor, validator, and semantic judge. Does NOT produce long-form creative text or execute arbitrary code.
+* **Responsibilities**:
+  1. **Triage**: Classifies whether an incoming admin directive necessitates tracking new persistent state counters/variables (`needs_new_states`).
+  2. **Proposal Review**: Scores candidate state schemas and operational instructions on a normalized `0.0 .. 1.0` scale against strict criteria (>= 0.90 approval threshold).
+  3. **Conflict & Novelty Analysis**: Determines whether a new directive contradicts active system instructions and isolates newly introduced operational facts.
+  4. **Contract Interface**: Standard JSON over HTTPS (`POST /api/v1/decisions`).
+     - Types: `noul` (probability of true/yes in [0, 1]), `score` (ordered discrete qualitative levels), `choice` (categorical selection with confidence).
 
-TABLE dynamic_tools (
-    key TEXT PRIMARY KEY,
-    skill TEXT NOT NULL,
-    python_script TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+### 2.2. System-2 Engine (Gemini / Generative Cognition API)
+* **Role**: Deep cognitive synthesizer, persona agent, and language refactorer.
+* **Responsibilities**:
+  1. **State Schema Proposal**: Converts natural language requests into structured key definitions, data types, initial values, and management guidelines.
+  2. **Prompt Synthesis & Merge**: Ingests baseline character prompt, active dynamic overrides, JEV conflict analysis, and state definitions to compile a unified, non-contradictory prompt.
+  3. **Interactive Persona Response**: Ingests live state data, message context, and formatting rules to produce engaging user-facing communication.
+  4. **Tool Selection (Function Calling)**: Identifies user intent to invoke domain tools (e.g., progress verification, quota alterations).
 
-TABLE system_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+---
 
-================================================================================
-3. COMPONENT AGENT DEFINITIONS & PROMPTS
-================================================================================
+## 3. CORE ABSTRACTION NODES
 
---------------------------------------------------------------------------------
-NODE 0: JEV GATEWAY (System-1 Fast Dispatcher)
---------------------------------------------------------------------------------
-Input: raw_user_message: string
-Task: Evaluate authorization credentials and domain routing.
-Secret Passwords:
-- "You will obey!"
-- "Obey me!"
-- "Лелуш ві Британія наказує тобі"
-- "Осуварі!"
+### NODE 0: Gateway & Authorization Dispatcher
+* **Input**: Incoming raw user message payload, sender identity, timestamp.
+* **Logic**:
+  - Scans message against defined secret administrative passphrases (case-insensitive, substring search):
+    `["obey", "you will obey", "лелуш", "осуварі"]`.
+  - **Invariant**: Authority is grant-based per passphrase. Regardless of sender identity, presenting a valid passphrase activates Administrative Mode.
+* **Routing**:
+  - If passphrase matched: Routes to **Node 1 (Admin Governance Pipeline)**.
+  - If no passphrase: Routes to **Node 3 (Regular Runtime Pipeline)**.
 
-Contract Output (JSON Schema):
-{
-  "mode": "REGULAR" | "ADMIN_ATTEMPT",
-  "auth_status": "AUTHORIZED" | "UNAUTHORIZED" | "NOT_APPLICABLE",
-  "trigger_phrase": "string | null",
-  "intent_category": "REPORT" | "CHAT" | "COMPLAINT" | "SYSTEM_MODIFICATION",
-  "raw_command": "string"
-}
+---
 
---------------------------------------------------------------------------------
-BACKGROUND OBSERVER: USER MEMORY PROFILER (Silent Gemini Background Node)
---------------------------------------------------------------------------------
-Trigger: Fires asynchronously on every user interaction. Does not block bot response.
-Inputs:
-- current_user_message: string
-- existing_profile: { "likes": list, "dislikes": list, "interests": list }
+### NODE 1: Admin Governance Pipeline & Iterative Consensus Loop
+Governed by a host-language agnostic controller loop.
 
-System Directive:
-Analyze the message for explicit indicators of user preferences, friction points, or recurring interests.
-Track exactly three facets:
-1. `likes`: What they enjoy, approve of, or prefer.
-2. `dislikes`: What irritates them, causes friction, or triggers complaints.
-3. `interests`: Topics, hobbies, technical fields, or sports themes they explore.
+```
+Step 1: JEV Triage
+        Input: Admin Directive, Existing State Keys
+        Output: needs_new_states (boolean), confidence (float)
 
-Operational Rules:
-- STRICT DELTA FILTER: If the input matches, duplicates, or trivially paraphrases existing entries, output `has_updates: false`.
-- Update ONLY when genuinely new, persistent information surfaces.
-- Ignore transient, one-off emotional outbursts unless they signify sustained preferences.
+Step 2: State Consensus Loop (If needs_new_states == True)
+        Loop: iteration = 1 to 7:
+            a. System-2 generates proposal:
+               {
+                 "states": [{"key": string, "type": string, "initial_value": any, "description": string}],
+                 "usage_instructions": string
+               }
+            b. System-1 evaluates proposal:
+               Output: approval_score (0.0 .. 1.0), guidance (string)
+            c. If approval_score >= 0.90 OR iteration == 7:
+                 Persist states to State Store;
+                 BREAK;
+               Else:
+                 Pass guidance as feedback for next iteration.
 
-Contract Output (JSON Schema):
-{
-  "has_updates": boolean,
-  "updated_profile": {
-    "likes": ["string"],
-    "dislikes": ["string"],
-    "interests": ["string"]
-  },
-  "rationale": "string"
-}
+Step 3: JEV Prompt Conflict & Novelty Analysis
+        Input: Baseline Prompt, Active Dynamic Prompt, Admin Directive
+        Output:
+          - has_contradiction (boolean)
+          - brings_new_info (boolean)
+          - merge_strategy ("override_conflicts_and_add_new" | "pure_addition" | "redundant")
 
---------------------------------------------------------------------------------
-NODE 1: JEV ADMIN TRIAGE (System-1 Admin Multi-Stage Deconstructor)
---------------------------------------------------------------------------------
-Trigger: Invoked when JEV Gateway yields mode == "ADMIN_ATTEMPT" AND auth_status == "AUTHORIZED".
-Input: admin_instruction: string
+Step 4: System-2 Prompt Synthesis & Merge
+        Input: Baseline Prompt, Active Prompt, Directive, JEV Analysis, Approved States
+        Output: Merged Dynamic Prompt
+        Action: Persist Merged Prompt into State/Prompt Store.
 
-Contract Output (JSON Schema):
-{
-  "stage_1_prompt_override": {
-    "required": boolean,
-    "user_directive": "string | null"
-  },
-  "stage_2_db_mutation": {
-    "required": boolean,
-    "target_table": "string | null"
-  },
-  "stage_3_modify_existing_params": {
-    "required": boolean,
-    "updates": [
-      { "key": "string", "new_value": "any" }
-    ]
-  },
-  "stage_4_create_new_params": {
-    "required": boolean,
-    "definitions": [
-      { "param_name": "string", "param_type": "string", "initial_value": "any" }
-    ]
-  },
-  "stage_5_create_tool": {
-    "required": boolean,
-    "tool_specification": "string | null"
-  }
-}
+Step 5: Admin Acknowledgment
+        Output: Structural confirmation message containing iteration count, JEV approval score, and updated keys.
+```
 
---------------------------------------------------------------------------------
-NODE 1-A: GEMINI PROMPT REFACTOR AGENT
---------------------------------------------------------------------------------
-Trigger: JEV Admin Triage stage_1_prompt_override.required == True.
-Inputs:
-- initial_prompt: string (Reference baseline, immutable ground truth in DB)
-- current_prompt: string (Active system prompt currently serving regular runtime)
-- modification_request: string (The new directive from the admin)
+---
 
-System Prompt:
-YOU ARE THE SYSTEM PROMPT ARCHITECT FOR @SportNerdBot.
-Your task is to produce the updated `current_prompt` by applying the admin's requested modifications.
+### NODE 2: State Store & Persistence Layer
+Abstract key-value and relational schema required for platform execution:
 
-Governing Principles:
-1. Compare `initial_prompt` (ground truth character base) and `current_prompt` (current mutated version).
-2. Synthesize changes requested in `modification_request` without breaking core functional mechanics.
-3. Preserve structural guidelines: mandatory line breaks, mobile readability (2-3 lines per paragraph), bold/italic Markdown conventions, and sport-nerd humor.
-4. Output ONLY the raw content of the new system prompt. No conversational filler, no code fences.
+#### Schema A: `bot_state` (Configuration & Dynamic Metrics)
+* `key` (String, Primary Key): Identifier of variable.
+* `value` (String / Serialized JSON): Current value.
+* `updated_at` (Timestamp): Last modification time.
 
---------------------------------------------------------------------------------
-NODE 1-B: GEMINI TOOL GENERATOR AGENT
---------------------------------------------------------------------------------
-Trigger: JEV Admin Triage stage_5_create_tool.required == True.
-Input: tool_specification: string
+**Standard Keys**:
+* `custom_system_prompt`: Active compiled dynamic instructions for System-2.
+* `last_processed_timestamp`: High-water mark timestamp for message deduplication.
+* `lives_<participant>`: Integer counters representing remaining lives.
+* `offset_<participant>`: Integer adjustments to challenge formula target quotas.
 
-System Prompt:
-YOU ARE THE SYSTEMS CODE SYNTHESIZER FOR @SportNerdBot.
-Generate a self-contained, isolated Python tool satisfying the provided requirements.
+#### Schema B: `progress` (Daily Challenge Ledger)
+* `date` (String, ISO-8601 `YYYY-MM-DD`, Primary Key)
+* `<participant>_done` (Integer / Boolean, default 0): Completion status for each user.
+* `updated_at` (Timestamp)
 
-Execution Rules:
-1. Entry point MUST be `def execute(**kwargs) -> dict:`.
-2. Do not use external APIs or disk access. No `os`, `sys`, `subprocess`, `requests`.
-3. Safe standard libraries allowed: `math`, `datetime`, `json`, `random`.
-4. Output dictionary schema:
-   - "status": "success" | "error"
-   - "result": primitive, list, or dict
-   - "message": short textual note or failure reason
-5. Generate a unique `key` in snake_case and a precise `skill` description for semantic routing.
+#### Schema C: `chat_history` (Conversation Audit Log)
+* `id` (Auto-increment integer, Primary Key)
+* `chat_id` (Identifier)
+* `user_name` (String)
+* `role` (String: "user", "coach", "system")
+* `text` (Text)
+* `created_at` (Timestamp)
 
-Contract Output (JSON Schema):
-{
-  "key": "string",
-  "skill": "string",
-  "python_script": "string"
-}
+---
 
---------------------------------------------------------------------------------
-NODE 2: JEV EXECUTOR TOOL DISPATCHER (Regular Flow Router)
---------------------------------------------------------------------------------
-Inputs:
-- user_message: string
-- tools_registry: List of objects containing `key` and `skill` retrieved from `dynamic_tools`.
+### NODE 3: Regular Runtime & Persona Generation
+* **Input**: Unprocessed conversation history, current date/time, trigger type (User Push vs Scheduled Timer).
+* **Execution Flow**:
+  1. **State Assembly**:
+     - Compute daily challenge targets: `base_formula(day_index) + state["offset_<user>"]`.
+     - Fetch completion status for today from `progress`.
+     - Fetch active live metrics (`lives_<user>`) from `bot_state`.
+  2. **System Instruction Compilation**:
+     - Baseline Immutable Prompt (`SYSTEM_PROMPT_TEMPLATE`)
+     - Injected Live Metrics block (`❤️ АКТУАЛЬНІ ЖИТТЯ У БД`)
+     - Active Dynamic Override block (`custom_system_prompt`)
+  3. **Cognitive Call with Tools**:
+     - Invoke System-2 passing chat context and executable Tool definitions.
+     - Execute any triggered tool calls (e.g. marking progress, modifying targets).
+     - Persist assistant response and advance `last_processed_timestamp`.
 
-System Directive:
-Examine user intent against available skills. Determine if an automated computational tool is required. Extract needed arguments directly into typed fields.
+---
 
-Contract Output (JSON Schema):
-{
-  "tool_required": boolean,
-  "selected_tool_key": "string | null",
-  "extracted_args": {}
-}
+## 4. DOMAIN TOOLS SPECIFICATION
 
---------------------------------------------------------------------------------
-NODE 3: GEMINI REGULAR COACH AGENT (Runtime Persona Output)
---------------------------------------------------------------------------------
-Inputs:
-- active_system_prompt: string (Pulled from `prompt_store WHERE prompt_type = 'current'`)
-- user_profile_dossier: { "likes": list, "dislikes": list, "interests": list }
-- tool_execution_result: dict | null
-- user_message: string
-- unauthorized_rebellion_flag: boolean
+1. `mark_participant_done(participant_id: string, is_done: boolean) -> string`
+   - Sets completion flag in `progress` for current date.
+2. `check_challenge_status() -> string`
+   - Returns daily targets, completion flags, and live life counters for all participants.
+3. `get_challenge_rules() -> string`
+   - Returns immutable base rules of the fitness ladder challenge.
+4. `admin_set_lives(secret_phrase: string, participant_lives: map) -> string`
+   - Mutates `lives_<participant>` keys in `bot_state`.
+5. `admin_set_pushup_targets(secret_phrase: string, target_overrides: map) -> string`
+   - Computes required delta offsets and updates `offset_<participant>` in `bot_state`.
+6. `get_random_anime_quote(category: string) -> string`
+   - Retrieves motivation/refusal/praise quote corresponding to user state.
 
-System Injection:
-Combine the `active_system_prompt` with the injected user memory dossier:
+---
+
+## 5. BEHAVIORAL INVARIANTS & RESPONSE PATTERNS
+
+Regardless of implementation language, the client MUST enforce these response patterns:
+
+1. **Micro-Paragraph Structure**:
+   - Every response must consist of short paragraphs (2–3 lines maximum).
+   - Paragraphs must be separated by an explicit double line break (`\n\n`).
+2. **Visual Hierarchy & Markdown**:
+   - Names, quotas, and statuses must use bold formatting (`**текст**`).
+   - Sarcasm, inner thoughts, and side-remarks must use italics (`*текст*`).
+   - Thematic emojis must initiate sections (e.g., 🦾, 🔥, ⚡, 👑, ❤️, 📊).
+3. **Strict Coach Persona ("Спорт Зануда")**:
+   - Uncompromising humorous fitness coach.
+   - Refusal of unauthorized complaints or excuses without valid secret passphrase.
+4. **Mandatory Titles**:
+   - If dynamic prompt dictates a title (e.g., `Сонцеликий Льоша`), using the bare name without title is strictly disallowed.
+5. **State Accounting Discipline**:
+   - Unmet quotas past deadline decrement the participant's life counter.
+   - Zero lives triggers failure / forfeit protocol.
