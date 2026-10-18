@@ -1,9 +1,9 @@
 """Telegram-адаптер (aiogram) + планувальник. Уся логіка — в app/flow.py та agents/."""
 import asyncio
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
-import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
@@ -51,6 +51,22 @@ class TelegramSender:
     async def send_video(self, chat_id: int, path: str) -> None:
         await self.bot.send_video(chat_id, FSInputFile(path))
 
+    async def fetch_chat_members(self, chat_id: int) -> dict:
+        """Дістає доступну з Telegram API інформацію про учасників чату (кількість та список адмінів/творця)."""
+        count = await self.bot.get_chat_member_count(chat_id)
+        admins = await self.bot.get_chat_administrators(chat_id)
+        members = []
+        for m in admins:
+            u = m.user
+            if not u.is_bot:
+                members.append({
+                    "telegram_id": u.id,
+                    "full_name": u.full_name or u.first_name or "",
+                    "username": u.username or "",
+                    "role": m.status,
+                })
+        return {"member_count": count, "visible_members": members}
+
 
 def describe_message(message: Message) -> str:
     """Текстове представлення повідомлення для журналу (медіа, підписи, контекст reply)."""
@@ -91,8 +107,15 @@ def build_app():
     flow = ChatFlow(store, llm, TelegramSender(bot))
 
     async def reply_command(message: Message, text: str, markdown: bool = True) -> None:
-        name = message.from_user.full_name or "Користувач"
-        flow.record_user_message(message.chat.id, name, message.text or "")
+        user = message.from_user
+        name = (user.full_name or user.first_name) if user else "Користувач"
+        flow.record_user_message(
+            message.chat.id,
+            name,
+            message.text or "",
+            telegram_id=user.id if user else None,
+            username=user.username if user else None,
+        )
         store.save_message(message.chat.id, "Спорт Зануда", "coach", text,
                            flow.now().strftime("%Y-%m-%d %H:%M:%S"))
         store.set_state("last_processed_timestamp", flow.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -101,12 +124,13 @@ def build_app():
     @dp.message(Command("start", "help"))
     async def cmd_help(message: Message):
         await reply_command(message, (
-            "🥊 **Привіт! Я ваш сімейний AI-тренер @SportNerdBot!**\n\n"
+            "🥊 **Привіт! Я ваш спортивний AI-тренер @SportNerdBot!**\n\n"
             "📌 **Швидкі команди:**\n"
             "/status — поточний стан виконання на сьогодні\n"
             "/rules — правила челенджу\n\n"
             "💡 **Як звітувати:**\n"
-            "Надсилайте відео, кружечки або пишіть словами (*«Льоша здав відос»*, *«Саша закрив свої 26»*)."
+            "Надсилайте відео, кружечки або пишіть словами (*«здав відос»*, *«закрив свої 26»*).\n"
+            "Нові учасники при першому повідомленні проходять коротке опитування і одразу вступають у челендж!"
         ))
 
     @dp.message(Command("rules"))
@@ -117,20 +141,54 @@ def build_app():
     async def cmd_status(message: Message):
         s = challenge.status_snapshot(store, flow.now().date())
         lines = [f"📊 **СТАТУС НА СЬОГОДНІ ({s['date']}) — {s['exercise_name'].upper()}:**\n"]
-        for p, meta in challenge.PARTICIPANTS.items():
-            state = "✅ ВИКОНАНО" if s["done"][p] else f"❌ Ще потрібно `{s['targets'][p]}`"
-            lives = f" | ❤️ {s['lives'][p]}" if s["lives"][p] is not None else ""
+        for p, meta in s["participants"].items():
+            state = "✅ ВИКОНАНО" if meta["done"] else f"❌ Ще потрібно `{meta['target']}`"
+            if meta["lives"] is not None:
+                lives = f" | ❤️ {meta['lives']}/{meta['max_lives']}" if meta.get("max_lives") else f" | ❤️ {meta['lives']}"
+            else:
+                lives = ""
             lines.append(f"{meta['emoji']} **{meta['name']}:** {state}{lives}")
-        lines.append("\n🎉 **Обоє закрили день!** 🥇" if all(s["done"].values()) else "\n⚡ Дотискайте норму, день ще триває!")
+        if s.get("uninitialized"):
+            names = ", ".join(u["display_name"] for u in s["uninitialized"])
+            lines.append(f"\n🆕 *Очікують на завершення реєстрації:* {names}")
+        lines.append("\n🎉 **Усі закрили день!** 🥇" if s["done"] and all(s["done"].values()) else "\n⚡ Дотискайте норму, день ще триває!")
         await reply_command(message, "\n".join(lines))
 
     @dp.message()
     async def on_message(message: Message):
         if message.text and message.text.startswith("/"):
             return
-        sender = message.from_user.full_name or message.from_user.first_name or "Користувач"
-        flow.record_user_message(message.chat.id, sender, describe_message(message),
-                                 message.date.astimezone(TIMEZONE))
+        msg_dt = message.date.astimezone(TIMEZONE)
+        # Якщо в чат додали нових людей — реєструємо кожного не-бота як 'uninitialized' і запускаємо онбординг
+        if message.new_chat_members:
+            added_any = False
+            for member in message.new_chat_members:
+                if member.is_bot:
+                    continue
+                m_name = member.full_name or member.first_name or f"User {member.id}"
+                flow.record_user_message(
+                    message.chat.id,
+                    m_name,
+                    f"[Новий учасник {m_name} приєднався до чату]",
+                    msg_dt,
+                    telegram_id=member.id,
+                    username=member.username,
+                )
+                added_any = True
+            if added_any:
+                await flow.process(message.chat.id, trigger="push")
+            return
+
+        user = message.from_user
+        sender = (user.full_name or user.first_name) if user else "Користувач"
+        flow.record_user_message(
+            message.chat.id,
+            sender,
+            describe_message(message),
+            msg_dt,
+            telegram_id=user.id if user else None,
+            username=user.username if user else None,
+        )
         await flow.process(message.chat.id, trigger="push")
 
     return bot, dp, flow

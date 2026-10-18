@@ -2,9 +2,11 @@
 Оркестратор флоу бота. Не залежить від aiogram: усе спілкування з Telegram — через Sender,
 тому той самий код ганяється в інтеграційних тестах з фейковим Sender.
 
-push / startup:  нові повідомлення → RouterAgent ─┬─ admin  → AdminAgent (тули + редактор промпту тренера)
-                                                   ├─ coach  → ReportJudgeAgent (запис у БД) → CoachAgent (відповідь)
-                                                   └─ ignore → лише зсув мітки
+push / startup:  нові повідомлення ─┬─ програмна перевірка: автор відсутній у БД або має status='uninitialized'
+                                    │   (і без кодової фрази адміна) → OnboardingAgent (промпт 'onboarding' із БД)
+                                    └─ інакше RouterAgent ─┬─ admin  → AdminAgent (тули + редактор промпту тренера)
+                                                           ├─ coach  → ReportJudgeAgent (запис у БД) → CoachAgent
+                                                           └─ ignore → лише зсув мітки
 timer:           morning / afternoon / evening — шаблони; night — CoachAgent; settle — списання життів за вчора
 """
 import asyncio
@@ -13,17 +15,19 @@ import logging
 import os
 import random
 from datetime import datetime, timedelta
-from typing import Callable, List, Optional, Protocol
+from typing import Callable, Dict, List, Optional, Protocol
 
 from agents.admin import AdminAgent
 from agents.coach import CoachAgent
+from agents.onboarding import OnboardingAgent
 from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptMergerAgent, PromptVerifierAgent
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent
-from agents.router import RouteDecision, RouterAgent
+from agents.router import RouteDecision, RouterAgent, has_passphrase
 from core import challenge
 from core.config import OBEY_MEDIA_DIR, TIMEZONE
 from core.llm import GeminiLLM, LLMUnavailable
-from database.store import ChatMessage, Store, format_ts
+from database.store import ChatMessage, Store, User, format_ts
+from migrate_users import ensure_default_users, migrate_dynamic_prompt
 from prompts import DEFAULT_PROMPTS, FALLBACK_ADMIN_MESSAGE, FALLBACK_GEMINI_MESSAGE
 
 logger = logging.getLogger(__name__)
@@ -46,19 +50,23 @@ class ChatFlow:
         self.now = now
         self.obey_media_dir = obey_media_dir
         self._lock = asyncio.Lock()
+        self._chat_members_cache: Dict = {}
 
         self.router = RouterAgent(llm, store)
+        self.onboarding = OnboardingAgent(llm, store)
         self.judge = ReportJudgeAgent(llm, store)
-        self.coach = CoachAgent(llm, store)
+        self.coach = CoachAgent(llm, store, chat_members_fetcher=lambda: self._chat_members_cache)
         self.editor = CoachPromptEditor(PromptConflictAgent(llm, store), PromptMergerAgent(llm, store),
                                         PromptVerifierAgent(llm, store))
-        self.admin = AdminAgent(llm, store, self.editor)
+        self.admin = AdminAgent(llm, store, self.editor, chat_members_fetcher=lambda: self._chat_members_cache)
 
     def init_storage(self) -> None:
         self.store.init_schema()
+        ensure_default_users(self.store)
         seeded = self.store.seed_prompts(DEFAULT_PROMPTS)
         if seeded:
             logger.info("Seeded prompts: %s", seeded)
+        migrate_dynamic_prompt(self.store)
         if not self.store.get_state("last_processed_timestamp"):
             self.store.set_state("last_processed_timestamp", self._yesterday_cutoff())
 
@@ -78,8 +86,34 @@ class ChatFlow:
         self.store.save_message(chat_id, COACH_NAME, "coach", text, format_ts(self.now()))
         await self.sender.send_text(chat_id, text)
 
-    def record_user_message(self, chat_id: int, user_name: str, text: str, created_at: Optional[datetime] = None) -> None:
-        self.store.save_message(chat_id, user_name, "user", text, format_ts(created_at or self.now()))
+    async def _refresh_chat_members(self, chat_id: int) -> None:
+        fetch_fn = getattr(self.sender, "fetch_chat_members", None)
+        if callable(fetch_fn):
+            try:
+                self._chat_members_cache = await fetch_fn(chat_id)
+            except Exception as e:
+                logger.debug("Could not fetch chat members from Telegram: %s", e)
+
+    def record_user_message(
+        self,
+        chat_id: int,
+        user_name: str,
+        text: str,
+        created_at: Optional[datetime] = None,
+        telegram_id: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> User:
+        if not self.store.list_users():
+            ensure_default_users(self.store)
+        dt = created_at or self.now()
+        user = self.store.resolve_or_create_user(
+            user_name,
+            dt.date().isoformat(),
+            telegram_id=telegram_id,
+            username=username,
+        )
+        self.store.save_message(chat_id, user_name, "user", text, format_ts(dt))
+        return user
 
     # --- головна точка входу ---
     async def process(self, chat_id: int, trigger: str = "push", job: str = "") -> None:
@@ -88,24 +122,61 @@ class ChatFlow:
             pending = self.store.unprocessed_user_messages(chat_id, last_ts, self._day_start())
             if pending:
                 logger.info("[%s] %d unprocessed message(s) since %s", trigger, len(pending), last_ts)
+                await self._refresh_chat_members(chat_id)
                 await self._handle_pending(chat_id, pending)
                 self.store.set_state("last_processed_timestamp", pending[-1].created_at)
             elif trigger == "timer":
                 await self._handle_timer(chat_id, job)
 
     async def _handle_pending(self, chat_id: int, pending: List[ChatMessage]) -> None:
+        today_iso = self.now().date().isoformat()
         history = self.store.messages_since(chat_id, self._day_start())
+
+        # Програмна перевірка авторів: якщо автора немає в БД — він створюється як 'uninitialized'.
+        uninit_by_slug: Dict[str, tuple[User, List[ChatMessage]]] = {}
+        active_pending: List[ChatMessage] = []
+        for m in pending:
+            u = self.store.resolve_or_create_user(m.user_name, today_iso)
+            if u.status == "uninitialized" and not has_passphrase(m.text):
+                if u.slug not in uninit_by_slug:
+                    uninit_by_slug[u.slug] = (u, [])
+                uninit_by_slug[u.slug][1].append(m)
+            else:
+                active_pending.append(m)
+
+        # Якщо є повідомлення від неактуалізованих юзерів — програмно ведемо їх через OnboardingAgent.
+        for slug, (user, user_msgs) in uninit_by_slug.items():
+            await self._handle_onboarding(chat_id, user, user_msgs, history)
+
+        if not active_pending:
+            return
+
         try:
-            decision = await self._call(self.router.decide, pending, history)
+            decision = await self._call(self.router.decide, active_pending, history)
         except LLMUnavailable as e:
             logger.warning("Router unavailable (%s) — keyword fallback", e)
-            decision = RouterAgent.fallback(pending)
+            decision = RouterAgent.fallback(active_pending)
         logger.info("Route decision: %s", decision.model_dump())
 
         if decision.route == "admin":
-            await self._handle_admin(chat_id, decision, pending, history)
+            await self._handle_admin(chat_id, decision, active_pending, history)
         elif decision.route == "coach":
-            await self._handle_coach(chat_id, pending, history)
+            await self._handle_coach(chat_id, active_pending, history)
+
+    async def _handle_onboarding(
+        self,
+        chat_id: int,
+        user: User,
+        pending: List[ChatMessage],
+        history: List[ChatMessage],
+    ) -> None:
+        today = self.now().date()
+        try:
+            reply, _ = await self._call(self.onboarding.interview, today, user, pending, history)
+        except LLMUnavailable as e:
+            logger.warning("Onboarding agent unavailable (%s) — deterministic fallback", e)
+            reply = OnboardingAgent.fallback(self.store, user, pending, today)
+        await self._say(chat_id, reply)
 
     async def _handle_admin(self, chat_id: int, decision: RouteDecision, pending: List[ChatMessage],
                             history: List[ChatMessage]) -> None:
@@ -120,13 +191,13 @@ class ChatFlow:
 
     async def _handle_coach(self, chat_id: int, pending: List[ChatMessage], history: List[ChatMessage]) -> None:
         today = self.now().date()
-        done_before = dict(zip(("lyosha", "sasha"), self.store.get_progress(today.isoformat())))
+        done_before = self.store.get_day_progress(today.isoformat())
         llm_ok = True
         try:
             verdict = await self._call(self.judge.judge, pending, history, done_before)
         except LLMUnavailable as e:
             logger.warning("Judge unavailable (%s) — heuristic fallback", e)
-            verdict, llm_ok = ReportJudgeAgent.fallback(pending, done_before), False
+            verdict, llm_ok = ReportJudgeAgent.fallback(pending, done_before, self.store), False
 
         notes = self._apply_verdict(verdict, done_before, today)
 
@@ -141,12 +212,15 @@ class ChatFlow:
     def _apply_verdict(self, verdict: JudgeVerdict, done_before: dict, today) -> List[str]:
         notes = []
         targets = challenge.day_targets(self.store, today)
+        pmap = challenge.participants_map(self.store)
         exercise = challenge.EXERCISES[challenge.day_exercise(self.store, today)]["genitive"]
         for r in verdict.reports:
+            if r.participant not in pmap:
+                continue
             if done_before.get(r.participant) == r.done:
                 continue
             self.store.set_done(r.participant, r.done, today.isoformat())
-            name = challenge.PARTICIPANTS[r.participant]["name"]
+            name = pmap[r.participant]["name"]
             if r.done:
                 notes.append(f"{name}: ЗАРАХОВАНО норму {targets[r.participant]} {exercise} (доказ: {r.evidence})")
             else:
@@ -179,17 +253,18 @@ class ChatFlow:
 
         missing = challenge.missing_participants(self.store, today)
         if not missing:
-            logger.info("Timer %s: both participants are done — skipping reminder", job)
+            logger.info("Timer %s: all active participants are done — skipping reminder", job)
             return
         targets = challenge.day_targets(self.store, today)
         ex = challenge.EXERCISES[challenge.day_exercise(self.store, today)]
-        p = challenge.PARTICIPANTS
-        missing_str = [f"{p[m]['emoji']} {p[m]['name']} (`{targets[m]}` {ex['genitive']})" for m in missing]
+        p = challenge.participants_map(self.store)
+        missing_str = [f"{p[m]['emoji']} {p[m]['name']} (`{targets[m]}` {ex['genitive']})" for m in missing if m in p]
 
         if job == "morning":
+            norms_lines = "\n".join(f"{meta['emoji']} {meta['name']}: `{targets[slug]}`" for slug, meta in p.items())
             text = (f"☀️ **День {challenge.day_index(today) + 1} ({today.strftime('%d.%m.%Y')})**\n\n"
                     f"{ex['emoji']} **Сьогодні {ex['name'].upper()}!**\n\n"
-                    f"🎯 **Норма на сьогодні:**\n👦 Льоша: `{targets['lyosha']}`\n👨 Саша: `{targets['sasha']}`\n\n"
+                    f"🎯 **Норма на сьогодні:**\n{norms_lines}\n\n"
                     "Чекаю на звіти! 💪")
         elif job == "afternoon":
             text = ("🔔 **Денний чек-поінт (15:00):**\nЩе винні:\n" + "\n".join(missing_str)
@@ -203,7 +278,7 @@ class ChatFlow:
             except LLMUnavailable:
                 text = ("😭 **Караул, до півночі лишилось 30 хвилин!**\n\n"
                         f"Ще не закрили день: {', '.join(missing_str)}.\n"
-                        "Невже челендж зірветься? Чи ще встигнете відтиснутись до 00:00? 🥺⏱️")
+                        "Невже челендж зірветься? Чи ще встигнете закрити норму до 00:00? 🥺⏱️")
         else:
             logger.warning("Unknown timer job: %s", job)
             return
@@ -214,8 +289,12 @@ class ChatFlow:
         changed = challenge.settle_missed_day(self.store, day)
         if not changed:
             return
-        lines = [f"💔 **{challenge.PARTICIPANTS[p]['name']}** втрачає життя → залишилось **{v}** ❤️" for p, v in changed.items()]
-        dead = [challenge.PARTICIPANTS[p]["name"] for p, v in changed.items() if v == 0]
+        pmap = challenge.participants_map(self.store)
+        lines = [
+            f"💔 **{pmap.get(p, {}).get('name', p)}** втрачає життя → залишилось **{v}** ❤️"
+            for p, v in changed.items()
+        ]
+        dead = [pmap.get(p, {}).get("name", p) for p, v in changed.items() if v == 0]
         text = f"⚰️ **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n\n" + "\n".join(lines)
         if dead:
             text += f"\n\n💀 **{', '.join(dead)} — нуль життів. Дискваліфікація!**"

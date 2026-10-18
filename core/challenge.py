@@ -1,69 +1,92 @@
 """
 Доменна логіка челенджу: норми, вправа дня, статус, життя. Без жодного AI.
+Працює з динамічним списком учасників із таблиці `users` у БД.
 
 Два режими розкладу (bot_state.schedule_mode):
-  ladder    — «Драбинка»: щодня віджимання, база + номер дня + offset_<p>.
+  ladder    — «Драбинка»: щодня віджимання, base_pushups + номер дня + ladder_offset.
   alternate — з alt_start_date чергуються дні: віджимання ↔ присідання.
-              Віджимання: alt_pushups_<p> + 1 за кожен попередній день віджимань.
+              Віджимання: alt_pushups + 1 за кожен попередній день віджимань.
               Присідання: ceil(alt_squat_factor × учорашні віджимання) — дробових норм не буває.
-Разова правка будь-якої норми на конкретний день: override_<p>_<YYYY-MM-DD>.
+Разова правка будь-якої норми на конкретний день: override_<slug>_<YYYY-MM-DD>.
 """
 import math
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
 from core.config import START_DATE
-from database.store import Store
-
-PARTICIPANTS = {
-    "lyosha": {"name": "Льоша", "base": 3, "emoji": "👦"},
-    "sasha": {"name": "Саша", "base": 13, "emoji": "👨"},
-}
-
-_ALIASES = {
-    "lyosha": ["льош", "леш", "lyosha", "alexey", "oleksiy", "олекс", "алекс", "син", "малий", "сонцелик"],
-    "sasha": ["саш", "саня", "sasha", "oleksandr", "олександр", "александр", "тато", "батько", "polishchuk"],
-}
+from database.store import DIFFICULTY_LIVES, Store, User
+from migrate_users import LYOSHA_ALIASES, SASHA_ALIASES, ensure_default_users
 
 EXERCISES = {
     "pushups": {"name": "віджимання", "genitive": "віджимань", "emoji": "💪"},
     "squats": {"name": "присідання", "genitive": "присідань", "emoji": "🦵"},
 }
 
-LADDER_RULES = (
-    "📋 Правила челенджу «Драбинка (+1 щодня)»:\n"
-    "1. Старт: 31.08.2026.\n"
-    "2. Базові норми (День 0): Льоша — 3, Саша — 13 віджимань.\n"
-    "3. Щодня норма для обох зростає на +1.\n"
-    "4. Обидва учасники мають щодня закрити свою норму до сну.\n"
-    "5. Звітувати можна відео, кружечками або будь-якими повідомленнями в чат!"
-)
+
+def _active_users(store: Store) -> List[User]:
+    users = store.list_users(status="active")
+    if not users and not store.list_users():
+        ensure_default_users(store)
+        users = store.list_users(status="active")
+    return users
+
+
+def participants_map(store: Store) -> Dict[str, dict]:
+    """Словник активних учасників {slug: метадані} із таблиці users."""
+    return {
+        u.slug: {
+            "name": u.display_name,
+            "telegram_name": u.telegram_name,
+            "base": u.base_pushups,
+            "emoji": u.emoji,
+            "description": u.description,
+            "difficulty": u.difficulty,
+            "lives": u.lives,
+            "max_lives": u.max_lives,
+        }
+        for u in _active_users(store)
+    }
 
 
 def rules_text(store: Store) -> str:
+    active = _active_users(store)
+    names = ", ".join(f"{u.emoji} {u.display_name}" for u in active) or "учасники чату"
     if store.get_state("schedule_mode", "ladder") != "alternate":
-        return LADDER_RULES
+        return (
+            "📋 Правила челенджу «Драбинка (+1 щодня)»:\n"
+            f"1. Старт челенджу: 31.08.2026. Активні учасники: {names}.\n"
+            "2. Кожен учасник має власну стартову норму та режим життів (Хардкор — 2, Норма — 5, Вітальний — 10).\n"
+            "3. Щодня норма для кожного зростає на +1.\n"
+            "4. Усі учасники мають щодня закрити свою норму до півночі (інакше -1 життя).\n"
+            "5. Звітувати можна відео, кружечками або повідомленнями в чат!"
+        )
     factor = store.get_state("alt_squat_factor", "1.5")
     start = date.fromisoformat(store.get_state("alt_start_date"))
     return (
         "📋 Правила челенджу (система чергування):\n"
         f"1. З {start.strftime('%d.%m.%Y')} дні чергуються: день віджимань ↔ день присідань.\n"
-        "2. Віджимання: +1 від останнього дня віджимань.\n"
-        f"3. Присідання: у {factor} раза більше, ніж віджимань учора (округлення вгору).\n"
-        "4. Обидва учасники мають щодня закрити свою норму до сну.\n"
-        "5. За незакритий день — мінус 1 життя.\n"
-        "6. Звітувати можна відео, кружечками або будь-якими повідомленнями в чат!"
+        f"2. Активні учасники: {names}.\n"
+        "3. Віджимання: +1 від останнього дня віджимань.\n"
+        f"4. Присідання: у {factor} раза більше, ніж віджимань учора (округлення вгору).\n"
+        "5. Усі активні учасники мають щодня закрити свою норму до півночі.\n"
+        "6. За незакритий день — мінус 1 життя (режими для новачків: Хардкор — 2, Норма — 5, Вітальний — 10).\n"
+        "7. Звітувати можна відео, кружечками або будь-якими повідомленнями в чат!"
     )
 
 
-def normalize_participant(raw: str) -> Optional[str]:
-    """«Олександр», «тато», «sasha» -> 'sasha'. Повертає None, якщо не впізнано."""
+def normalize_participant(raw: str, store: Optional[Store] = None) -> Optional[str]:
+    """Розпізнає учасника за ім'ям, ніком, slug або псевдонімом із БД."""
     value = (raw or "").lower().strip()
-    if value in PARTICIPANTS:
-        return value
-    # «олекс» входить і в «олександр», тому спершу перевіряємо Сашині псевдоніми.
-    for key in ("sasha", "lyosha"):
-        if any(alias in value for alias in _ALIASES[key]):
+    if not value:
+        return None
+    if store is not None:
+        _active_users(store)
+        user = store.find_user(raw)
+        if user is not None:
+            return user.slug
+    # Фолбек без store (для сумісності зі старими викликами)
+    for key, aliases in (("sasha", SASHA_ALIASES), ("lyosha", LYOSHA_ALIASES)):
+        if value == key or any(alias in value for alias in aliases):
             return key
     return None
 
@@ -76,7 +99,10 @@ def _alternate_index(store: Store, day: date) -> Optional[int]:
     """Номер дня від старту системи чергування або None, якщо для цієї дати діє «Драбинка»."""
     if store.get_state("schedule_mode", "ladder") != "alternate":
         return None
-    start = date.fromisoformat(store.get_state("alt_start_date"))
+    raw_start = store.get_state("alt_start_date", "")
+    if not raw_start:
+        return None
+    start = date.fromisoformat(raw_start)
     return (day - start).days if day >= start else None
 
 
@@ -85,13 +111,19 @@ def day_exercise(store: Store, day: date) -> str:
     return "squats" if k is not None and k % 2 == 1 else "pushups"
 
 
-def _formula_target(store: Store, participant: str, day: date) -> int:
+def _formula_target_for_user(store: Store, user: User, day: date) -> int:
     k = _alternate_index(store, day)
     if k is None:
-        offset = int(store.get_state(f"offset_{participant}", "0") or 0)
-        return PARTICIPANTS[participant]["base"] + day_index(day) + offset
-    # Для дня присідань k // 2 == кількість днів віджимань до вчора, тобто це саме вчорашні віджимання.
-    pushups = int(store.get_state(f"alt_pushups_{participant}")) + k // 2
+        return user.base_pushups + day_index(day) + user.ladder_offset
+    alt_base = user.alt_pushups
+    if alt_base is None:
+        raw_state = store.get_state(f"alt_pushups_{user.slug}", "")
+        if raw_state.strip().lstrip("-").isdigit():
+            alt_base = int(raw_state)
+        else:
+            alt_start = date.fromisoformat(store.get_state("alt_start_date"))
+            alt_base = user.base_pushups + day_index(alt_start) + user.ladder_offset
+    pushups = alt_base + k // 2
     if k % 2 == 0:
         return pushups
     return math.ceil(float(store.get_state("alt_squat_factor", "1.5")) * pushups)
@@ -99,33 +131,62 @@ def _formula_target(store: Store, participant: str, day: date) -> int:
 
 def day_targets(store: Store, day: date) -> Dict[str, int]:
     targets = {}
-    for p in PARTICIPANTS:
-        override = store.get_state(f"override_{p}_{day.isoformat()}", "")
-        targets[p] = max(0, int(override) if override.strip() else _formula_target(store, p, day))
+    for u in _active_users(store):
+        override = store.get_state(f"override_{u.slug}_{day.isoformat()}", "")
+        targets[u.slug] = max(0, int(override) if override.strip() else _formula_target_for_user(store, u, day))
     return targets
 
 
 def set_target(store: Store, participant: str, target: int, day: date) -> None:
     """
-    Встановити норму на `day`.
-    День віджимань: зсуваємо формулу, тож далі віджимання підуть +1 від нового значення
-    (а присідання наступного дня — від нього ж × коефіцієнт).
+    Встановити норму для `participant` на `day`.
+    День віджимань: зсуваємо формулу, тож далі віджимання підуть +1 від нового значення.
     День присідань: разова правка лише цього дня (наступні віджимання не змінюються).
     """
+    _active_users(store)
+    user = store.get_user(participant) or store.find_user(participant)
+    if user is None:
+        raise ValueError(f"Unknown participant: {participant}")
     k = _alternate_index(store, day)
     if k is None:
-        base = PARTICIPANTS[participant]["base"] + day_index(day)
-        store.set_state(f"offset_{participant}", str(target - base))
+        base = user.base_pushups + day_index(day)
+        user.ladder_offset = int(target) - base
+        store.upsert_user(user)
+        store.set_state(f"offset_{user.slug}", str(user.ladder_offset))
     elif k % 2 == 0:
-        store.set_state(f"alt_pushups_{participant}", str(target - k // 2))
+        user.alt_pushups = int(target) - k // 2
+        store.upsert_user(user)
+        store.set_state(f"alt_pushups_{user.slug}", str(user.alt_pushups))
     else:
-        store.set_state(f"override_{participant}_{day.isoformat()}", str(target))
+        store.set_state(f"override_{user.slug}_{day.isoformat()}", str(int(target)))
+
+
+def set_starting_pushups(store: Store, participant: str, starting_pushups: int, day: date) -> None:
+    """
+    Фіксує стартову норму віджимань для нового учасника на дату приєднання `day`
+    незалежно від того, чи сьогодні день віджимань чи присідань.
+    """
+    user = store.get_user(participant) or store.find_user(participant)
+    if user is None:
+        raise ValueError(f"Unknown participant: {participant}")
+    start_val = max(1, int(starting_pushups))
+    user.base_pushups = start_val
+    user.ladder_offset = -day_index(day)
+    k = _alternate_index(store, day)
+    if k is not None:
+        user.alt_pushups = start_val - (k // 2)
+        store.set_state(f"alt_pushups_{user.slug}", str(user.alt_pushups))
+    store.upsert_user(user)
+    store.set_state(f"offset_{user.slug}", str(user.ladder_offset))
 
 
 def enable_alternating(store: Store, start: date, pushups: Dict[str, int], squat_factor: float = 1.5) -> None:
     """Увімкнути систему чергування: `start` — день віджимань із нормами `pushups`."""
-    for p in PARTICIPANTS:
-        store.set_state(f"alt_pushups_{p}", str(int(pushups[p])))
+    for u in _active_users(store):
+        val = int(pushups.get(u.slug, _formula_target_for_user(store, u, start)))
+        u.alt_pushups = val
+        store.upsert_user(u)
+        store.set_state(f"alt_pushups_{u.slug}", str(val))
     store.set_state("alt_squat_factor", str(squat_factor))
     store.set_state("alt_start_date", start.isoformat())
     store.set_state("schedule_mode", "alternate")
@@ -133,25 +194,71 @@ def enable_alternating(store: Store, start: date, pushups: Dict[str, int], squat
 
 def disable_alternating(store: Store, day: date) -> None:
     """Повернутися до «Драбинки», зберігши сьогоднішню норму віджимань як точку відліку."""
-    current = {p: _formula_target(store, p, day) for p in PARTICIPANTS} if day_exercise(store, day) == "pushups" else None
+    users = _active_users(store)
+    current = {u.slug: _formula_target_for_user(store, u, day) for u in users} if day_exercise(store, day) == "pushups" else None
     store.set_state("schedule_mode", "ladder")
     if current:
-        for p, value in current.items():
-            set_target(store, p, value, day)
+        for slug, value in current.items():
+            set_target(store, slug, value, day)
 
 
 def get_lives(store: Store) -> Dict[str, Optional[int]]:
     lives = {}
-    for p in PARTICIPANTS:
-        raw = store.get_state(f"lives_{p}", "")
-        lives[p] = int(raw) if raw.strip().lstrip("-").isdigit() else None
+    for u in _active_users(store):
+        if u.lives is not None:
+            lives[u.slug] = u.lives
+        else:
+            raw = store.get_state(f"lives_{u.slug}", "")
+            lives[u.slug] = int(raw) if raw.strip().lstrip("-").isdigit() else None
     return lives
 
 
+def get_max_lives(store: Store) -> Dict[str, Optional[int]]:
+    return {u.slug: u.max_lives for u in _active_users(store)}
+
+
+def set_user_lives(store: Store, participant: str, lives: int, max_lives: Optional[int] = None) -> User:
+    _active_users(store)
+    user = store.get_user(participant) or store.find_user(participant)
+    if user is None:
+        raise ValueError(f"Unknown participant: {participant}")
+    user.lives = max(0, int(lives))
+    if max_lives is not None:
+        user.max_lives = max(1, int(max_lives))
+    elif user.max_lives is not None and user.lives > user.max_lives:
+        user.max_lives = user.lives
+    store.upsert_user(user)
+    store.set_state(f"lives_{user.slug}", str(user.lives))
+    return user
+
+
+def recommended_start_reps(max_reps: int) -> int:
+    """Пропонована стартова норма — третина від максимуму за раз (округлення вгору, мінімум 1)."""
+    return max(1, math.ceil(int(max_reps) / 3.0))
+
+
 def status_snapshot(store: Store, day: date) -> Dict:
+    users = _active_users(store)
+    uninitialized = store.list_users(status="uninitialized")
     targets = day_targets(store, day)
-    done = dict(zip(("lyosha", "sasha"), store.get_progress(day.isoformat())))
+    done = store.get_day_progress(day.isoformat())
+    lives = get_lives(store)
+    max_lives = get_max_lives(store)
     exercise = day_exercise(store, day)
+    participants_info = {
+        u.slug: {
+            "name": u.display_name,
+            "telegram_name": u.telegram_name,
+            "emoji": u.emoji,
+            "description": u.description,
+            "difficulty": u.difficulty,
+            "target": targets.get(u.slug, 0),
+            "done": done.get(u.slug, False),
+            "lives": lives.get(u.slug),
+            "max_lives": max_lives.get(u.slug),
+        }
+        for u in users
+    }
     return {
         "exercise": exercise,
         "exercise_name": EXERCISES[exercise]["name"],
@@ -160,42 +267,66 @@ def status_snapshot(store: Store, day: date) -> Dict:
         "day_num": day_index(day) + 1,
         "targets": targets,
         "done": done,
-        "lives": get_lives(store),
+        "lives": lives,
+        "max_lives": max_lives,
+        "participants": participants_info,
+        "uninitialized": [
+            {
+                "slug": u.slug,
+                "display_name": u.display_name,
+                "telegram_name": u.telegram_name,
+                "description": u.description,
+                "max_pushups_reported": u.max_pushups_reported,
+                "max_squats_reported": u.max_squats_reported,
+                "difficulty": u.difficulty,
+            }
+            for u in uninitialized
+        ],
     }
 
 
 def status_text(store: Store, day: date) -> str:
     s = status_snapshot(store, day)
     lines = [f"Дата: {s['date']} (День {s['day_num']} челенджу). Вправа дня: {s['exercise_name'].upper()}."]
-    for p, meta in PARTICIPANTS.items():
-        mark = "ВИКОНАНО ✅" if s["done"][p] else "НЕ виконано ❌"
-        lives = s["lives"][p]
-        lives_str = f" | Життя: {lives}" if lives is not None else ""
-        lines.append(f"{meta['name']}: норма {s['targets'][p]} | Статус: {mark}{lives_str}")
+    for slug, info in s["participants"].items():
+        mark = "ВИКОНАНО ✅" if info["done"] else "НЕ виконано ❌"
+        lives = info["lives"]
+        max_l = info["max_lives"]
+        if lives is not None:
+            lives_str = f" | Життя: {lives}/{max_l}" if max_l else f" | Життя: {lives}"
+        else:
+            lives_str = ""
+        lines.append(f"{info['emoji']} {info['name']}: норма {info['target']} | Статус: {mark}{lives_str}")
     return "\n".join(lines)
 
 
 def missing_participants(store: Store, day: date) -> List[str]:
     s = status_snapshot(store, day)
-    return [p for p in PARTICIPANTS if not s["done"][p]]
+    return [slug for slug, done in s["done"].items() if not done]
 
 
 def settle_missed_day(store: Store, day: date) -> Dict[str, int]:
     """
-    Знімає 1 життя кожному, хто не закрив норму за `day` (лише якщо лічильник життів існує).
+    Знімає 1 життя кожному активному учаснику, хто був у челенджі на дату `day` (joined_date <= day)
+    і не закрив норму (лише якщо лічильник життів існує).
     Ідемпотентно: дата останнього розрахунку зберігається в bot_state.lives_settled_through.
-    Повертає {participant: нове_значення} для тих, у кого списали життя.
+    Повертає {slug: нове_значення} для тих, у кого списали життя.
     """
     day_iso = day.isoformat()
     if store.get_state("lives_settled_through", "") >= day_iso:
         return {}
+    users = _active_users(store)
     lives = get_lives(store)
-    done = dict(zip(("lyosha", "sasha"), store.get_progress(day_iso)))
+    done = store.get_day_progress(day_iso)
     changed = {}
-    for p in PARTICIPANTS:
-        if lives[p] is not None and not done[p]:
-            changed[p] = max(0, lives[p] - 1)
-            store.set_state(f"lives_{p}", str(changed[p]))
+    for u in users:
+        if u.joined_date and u.joined_date > day_iso:
+            continue
+        cur_lives = lives.get(u.slug)
+        if cur_lives is not None and not done.get(u.slug, False):
+            new_val = max(0, cur_lives - 1)
+            changed[u.slug] = new_val
+            set_user_lives(store, u.slug, new_val)
     store.set_state("lives_settled_through", day_iso)
     return changed
 

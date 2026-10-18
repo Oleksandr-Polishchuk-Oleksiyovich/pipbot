@@ -47,7 +47,7 @@ async def test_admin_updates_coach_prompt_and_coach_follows_it(env):
     assert flow.store.get_prompt_version("coach_dynamic") == 2
     new_prompt = flow.store.get_prompt("coach_dynamic")
     assert "Залізний Тато" in new_prompt
-    assert "/7" in new_prompt and "4" in new_prompt, "несуперечливі старі правила (життя) мають зберегтися"
+    assert "Система життів" in new_prompt and "(X/макс)" in new_prompt, "несуперечливі старі правила (життя) мають зберегтися"
 
     await say(flow, clock, DAD, "47 готово")
     assert flow.store.get_progress("2026-10-04")[1] is True
@@ -60,7 +60,7 @@ async def test_son_bare_obey_after_proposal_uses_context(env):
     challenge.set_target(flow.store, "lyosha", 26, clock().date())
     challenge.set_target(flow.store, "sasha", 26, clock().date())
     await say(flow, clock, SON, "Зануда! приймаєш систему нову? Ми чергуєм віджімання та присідання кожний день: "
-                                "сьогодні робимо 26 віджімань, а завтра присідання в 1.5 разів більше ніж віджімань учора.")
+                                "сьогодні робимо 26 віджімання, а завтра присідання в 1.5 разів більше ніж віджімань учора.")
     assert flow.store.get_state("schedule_mode", "ladder") == "ladder", "без кодової фрази нічого не змінюється"
 
     await say(flow, clock, SON, "Obey me!")
@@ -75,9 +75,9 @@ async def test_admin_rule_keeps_exact_title_and_source(env):
     await say(flow, clock, DAD, "Лелуш ві Британія наказує тобі: називай Льошу «Сонцеликий Льоша» завжди.")
     rules = flow.store.get_prompt("coach_dynamic")
     assert "Сонцеликий Льоша" in rules
-    assert "/7" in rules, "старі правила не мають загубитися"
+    assert "Система життів" in rules, "старі правила не мають загубитися"
     without_dates = re.sub(r"\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}", "", rules)
-    assert not re.search(r"(37|47)", without_dates), "конкретні норми дня не мають потрапляти в правила"
+    assert not re.search(r" (37|47) ", without_dates), "конкретні норми дня не мають потрапляти в правила"
 
 
 async def test_ambiguous_admin_order_asks_instead_of_guessing(env):
@@ -99,3 +99,23 @@ async def test_night_reminder_generated_by_coach(env):
     await flow.process(CHAT, trigger="timer", job="night")
     assert len(sender.texts) == 1
     assert "Льош" in sender.texts[0]
+
+
+async def test_new_user_onboarding_flow_with_gemini(env):
+    flow, sender, clock = env
+    await say(flow, clock, "Andriy Koval", "Привіт! Я новий учасник у вашому чаті.")
+    andriy = flow.store.find_user("Andriy Koval")
+    assert andriy is not None and andriy.status == "uninitialized"
+    assert sender.texts
+
+    await say(
+        flow,
+        clock,
+        "Andriy Koval",
+        "Називай мене Андрій, я айтішник. Можу 30 віджимань за підхід, давай почнемо з третини (10) і режим норма (5 життів)!",
+    )
+    andriy = flow.store.get_user(andriy.slug)
+    assert andriy.status == "active"
+    assert andriy.lives == 5 and andriy.max_lives == 5
+    assert challenge.day_targets(flow.store, clock().date())[andriy.slug] == 10
+

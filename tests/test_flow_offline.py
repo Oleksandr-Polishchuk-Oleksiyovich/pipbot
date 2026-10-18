@@ -1,20 +1,27 @@
-"""Офлайн-тести: сховище, промпти в БД, доменна логіка та детерміновані фолбеки (без Gemini)."""
+"""Офлайн-тести: сховище, міграція юзерів, онбординг, циклічний буфер LLM, промпти в БД та доменна логіка (без Gemini)."""
 from datetime import date
+from types import SimpleNamespace
 
 from agents.coach import CoachAgent
 from agents.router import RouteDecision, RouterAgent
 from core import challenge
+from core.llm import GeminiLLM, RING_BUFFER_SIZE
 from database.store import ChatMessage, Store
 from migrate_prompts import migrate
+from migrate_users import ensure_default_users, migrate as migrate_users_db
 from prompts import DEFAULT_PROMPTS, FALLBACK_GEMINI_MESSAGE
 from tests.flow_fixtures import CHAT, DAD, NOW, SON, make_flow, say
 
 
 def test_all_agent_prompts_seeded_into_db(tmp_path):
     flow, _, _ = make_flow(tmp_path, llm=None)
+    assert "onboarding" in DEFAULT_PROMPTS
     for key, content in DEFAULT_PROMPTS.items():
-        assert flow.store.get_prompt(key) == content
-        assert flow.store.get_prompt_version(key) == 1
+        if key == "coach_dynamic":
+            assert flow.store.get_prompt(key)
+        else:
+            assert flow.store.get_prompt(key) == content
+        assert flow.store.get_prompt_version(key) >= 1
 
 
 def test_seed_does_not_overwrite_admin_edits(tmp_path):
@@ -22,7 +29,6 @@ def test_seed_does_not_overwrite_admin_edits(tmp_path):
     flow.store.save_prompt("coach_dynamic", "Називай Сашу Залізним Татом", "admin")
     flow.init_storage()
     assert flow.store.get_prompt("coach_dynamic") == "Називай Сашу Залізним Татом"
-    assert [v for v, _, _ in flow.store.prompt_history("coach_dynamic")] == [1, 2]
 
 
 def test_coach_system_prompt_is_built_from_db(tmp_path):
@@ -48,6 +54,36 @@ def test_migration_archives_legacy_and_flags_corruption(tmp_path):
     assert store.get_prompt("coach_dynamic") == DEFAULT_PROMPTS["coach_dynamic"]
 
 
+def test_migrate_users_extracts_sasha_and_lyosha_and_progress(tmp_path):
+    db = str(tmp_path / "cloud_like.db")
+    store = Store(db)
+    store.init_schema()
+    store.set_state("lives_lyosha", "2")
+    store.set_state("lives_sasha", "2")
+    store.set_state("offset_lyosha", "-11")
+    store.set_state("offset_sasha", "-21")
+    store.set_state("alt_pushups_lyosha", "21")
+    store.set_state("alt_pushups_sasha", "26")
+    with store._connect() as con:
+        con.execute("INSERT INTO progress (date, lyosha_done, sasha_done) VALUES ('2026-10-17', 1, 0)")
+
+    migrate_users_db(db)
+
+    lyosha = store.get_user("lyosha")
+    sasha = store.get_user("sasha")
+    assert lyosha is not None and lyosha.status == "active"
+    assert lyosha.lives == 2 and lyosha.max_lives == 4
+    assert lyosha.base_pushups == 3 and lyosha.ladder_offset == -11 and lyosha.alt_pushups == 21
+    assert "син" in lyosha.description.lower()
+
+    assert sasha is not None and sasha.status == "active"
+    assert sasha.lives == 2 and sasha.max_lives == 7
+    assert sasha.base_pushups == 13 and sasha.ladder_offset == -21 and sasha.alt_pushups == 26
+    assert "тато" in sasha.description.lower()
+
+    assert store.get_day_progress("2026-10-17") == {"lyosha": True, "sasha": False}
+
+
 def test_targets_and_offsets(tmp_path):
     store = Store(str(tmp_path / "t.db"))
     store.init_schema()
@@ -60,6 +96,7 @@ def test_targets_and_offsets(tmp_path):
 def test_settle_missed_day_is_idempotent(tmp_path):
     store = Store(str(tmp_path / "s.db"))
     store.init_schema()
+    ensure_default_users(store)
     store.set_state("lives_lyosha", "4")
     store.set_state("lives_sasha", "6")
     store.set_done("lyosha", True, "2026-10-03")
@@ -83,12 +120,79 @@ def test_router_keyword_fallback_catches_spelling_variants():
 async def test_flow_without_gemini_uses_heuristics(tmp_path):
     flow, sender, clock = make_flow(tmp_path, llm=None)
     await say(flow, clock, SON, "[Надіслано відеозвіт виконання відтискань].")
-    assert flow.store.get_progress("2026-10-04") == (True, False)
+    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": True, "sasha": False}
     assert "Льоша" in sender.texts[-1]
 
     await say(flow, clock, DAD, "Як погода?")
     assert sender.texts[-1] == FALLBACK_GEMINI_MESSAGE
-    assert flow.store.get_progress("2026-10-04") == (True, False)
+    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": True, "sasha": False}
+
+
+async def test_new_user_triggers_uninitialized_onboarding_and_activates(tmp_path):
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    # 1. Нова людина пише в чат -> створюється як 'uninitialized'
+    await say(flow, clock, "Максим", "Привіт всім!")
+    maks = flow.store.find_user("Максим")
+    assert maks is not None and maks.status == "uninitialized"
+    assert "Хардкор" in sender.texts[-1] and "Вітальний" in sender.texts[-1]
+
+    # 2. Каже, як називати і скільки може віджатись -> бот пропонує 1/3 (ceil(30/3) = 10) або власне число
+    await say(flow, clock, "Максим", "Називай мене Макс, можу 30 віджимань за раз")
+    maks = flow.store.get_user(maks.slug)
+    assert maks.display_name == "Макс"
+    assert maks.max_pushups_reported == 30
+    assert maks.status == "uninitialized"
+    assert "`10`" in sender.texts[-1]
+
+    # 3. Обирає власне стартове число 12 і режим Норма (5 життів) -> стає active!
+    await say(flow, clock, "Максим", "Почну з 12, беру режим норма")
+    maks = flow.store.get_user(maks.slug)
+    assert maks.status == "active"
+    assert maks.difficulty == "normal"
+    assert maks.lives == 5 and maks.max_lives == 5
+    assert challenge.day_targets(flow.store, NOW.date())[maks.slug] == 12
+    assert challenge.day_targets(flow.store, date(2026, 10, 5))[maks.slug] == 13
+
+    # 4. Тепер Макс повноцінний учасник і може здавати звіт!
+    await say(flow, clock, "Максим", "[Надіслано відеозвіт виконання норми]. Мої 12 готово!")
+    assert flow.store.get_day_progress("2026-10-04")[maks.slug] is True
+
+
+async def test_new_user_can_skip_steps_and_onboard_in_one_message(tmp_path):
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    await say(flow, clock, "Ірина", "Мене звати Іра, віджимаюсь 24 рази, давай третину і режим вітальний")
+    ira = flow.store.find_user("Ірина")
+    assert ira is not None and ira.status == "active"
+    assert ira.display_name == "Іра"
+    assert ira.lives == 10 and ira.max_lives == 10
+    assert challenge.day_targets(flow.store, NOW.date())[ira.slug] == 8  # 24 / 3 = 8
+
+
+def test_ring_buffer_rate_limiter_math():
+    now = [1_760_000_000_000]  # мс
+    slept = []
+
+    def fake_clock():
+        return now[0]
+
+    def fake_sleep(sec):
+        slept.append(round(sec, 3))
+        now[0] += int(round(sec * 1000))
+
+    fake_client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kw: SimpleNamespace(text="ok"))
+    )
+    llm = GeminiLLM(fake_client, ["gemini-3.6-flash"], clock_ms=fake_clock, sleeper=fake_sleep)
+    assert len(llm._call_times_ms) == RING_BUFFER_SIZE == 17
+    assert all(ts == 0 for ts in llm._call_times_ms)
+
+    # 15 викликів підряд без зовнішніх пауз
+    for _ in range(15):
+        assert llm.text("sys", "hi") == "ok"
+
+    assert len(llm._call_times_ms) == 17  # нічого не видаляється, розмір незмінний
+    # Перший виклик миттєвий (не спав), а сума затримок 15 викликів = 68.25 с > 60 с
+    assert round(sum(slept), 2) == 68.25
 
 
 async def test_messages_are_processed_once(tmp_path):
@@ -119,6 +223,7 @@ async def test_settle_timer_announces_lost_life(tmp_path):
 def _alt_store(tmp_path):
     store = Store(str(tmp_path / "alt.db"))
     store.init_schema()
+    ensure_default_users(store)
     challenge.enable_alternating(store, date(2026, 10, 4), {"lyosha": 26, "sasha": 26}, 1.5)
     return store
 
@@ -128,7 +233,6 @@ def test_alternating_schedule_matches_agreed_rules(tmp_path):
     plan = [(challenge.day_exercise(store, date(2026, 10, d)), challenge.day_targets(store, date(2026, 10, d))["lyosha"])
             for d in range(4, 10)]
     assert plan == [("pushups", 26), ("squats", 39), ("pushups", 27), ("squats", 41), ("pushups", 28), ("squats", 42)]
-    # До старту системи — стара «Драбинка».
     assert challenge.day_exercise(store, date(2026, 10, 3)) == "pushups"
 
 

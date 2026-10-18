@@ -8,7 +8,7 @@ $vm = @("sportnerd-bot-vm", "--project=gen-lang-client-0185250272", "--zone=us-c
 $bundle = Join-Path $env:TEMP "sportnerd_deploy.tgz"
 
 Set-Location $PSScriptRoot
-tar -czf $bundle .env bot.py prompts.py migrate_prompts.py enable_alternating.py core/*.py database/*.py agents/*.py app/*.py
+tar -czf $bundle .env bot.py prompts.py migrate_prompts.py migrate_users.py enable_alternating.py core/*.py database/*.py agents/*.py app/*.py
 if ($LASTEXITCODE -ne 0) { throw "tar failed" }
 
 & $gcloud compute scp $bundle "$($vm[0]):sportnerd_deploy.tgz" $vm[1] $vm[2] --quiet
@@ -32,6 +32,7 @@ sudo tar -xzf ~/sportnerd_deploy.tgz -C /opt/sportnerdbot
 sudo rm -rf /opt/sportnerdbot/services /opt/sportnerdbot/agents/admin_pipeline.py
 cd /opt/sportnerdbot
 sudo PYTHONIOENCODING=utf-8 venv/bin/python migrate_prompts.py /opt/sportnerdbot/challenge.db
+sudo PYTHONIOENCODING=utf-8 venv/bin/python migrate_users.py /opt/sportnerdbot/challenge.db
 sudo PYTHONIOENCODING=utf-8 venv/bin/python enable_alternating.py /opt/sportnerdbot/challenge.db
 sudo chmod 600 /opt/sportnerdbot/.env
 sudo venv/bin/python -c "import bot; bot.build_app(); print('smoke build ok')"
