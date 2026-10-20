@@ -1,0 +1,22 @@
+[Unit]
+Description=SportNerdBot Telegram Polling Service
+After=network.target
+
+[Service]
+Type=simple
+User=sportnerd
+Group=sportnerd
+WorkingDirectory=/opt/sportnerdbot/current
+EnvironmentFile=/etc/sportnerdbot/env
+ExecStart=/opt/sportnerdbot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sportnerdbot /opt/sportnerdbot
+MemoryMax=550M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

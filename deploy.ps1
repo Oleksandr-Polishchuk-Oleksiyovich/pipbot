@@ -1,47 +1,71 @@
-# Деплой SportNerdBot на GCP VM: бекап → заміна коду → міграція промптів → smoke-імпорт → рестарт.
-# Разом із кодом копіює локальний .env (BOT_TOKEN, CHAT_ID, GEMINI_API_KEY).
-# Якщо smoke-перевірка (імпорт + build_app) падає — автоматично відкочується на бекап.
-# Запуск: powershell -ExecutionPolicy Bypass -File deploy.ps1
+<#
+.SYNOPSIS
+  SportNerdBot deploy helper.
+  Triggers pull-based deployment via sportnerd-gateway (/deploy) or SSH.
+  Does NOT copy .env (managed securely on VM: /etc/sportnerdbot/env).
+  Does NOT invoke ad-hoc migration scripts (handled by versioned migrations in deploy.sh).
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Sha,
+
+    [string]$GatewayUrl = $env:GATEWAY_URL,
+    [string]$HmacSecret = $env:GATEWAY_HMAC_SECRET,
+
+    [switch]$UseSsh,
+    [string]$VmInstance = "sportnerd-bot-vm",
+    [string]$GcpProject = "gen-lang-client-0185250272",
+    [string]$GcpZone = "us-central1-a"
+)
+
 $ErrorActionPreference = "Stop"
-$gcloud = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
-$vm = @("sportnerd-bot-vm", "--project=gen-lang-client-0185250272", "--zone=us-central1-a")
-$bundle = Join-Path $env:TEMP "sportnerd_deploy.tgz"
 
-Set-Location $PSScriptRoot
-tar -czf $bundle .env bot.py prompts.py migrate_prompts.py migrate_users.py enable_alternating.py core/*.py database/*.py agents/*.py app/*.py
-if ($LASTEXITCODE -ne 0) { throw "tar failed" }
-
-& $gcloud compute scp $bundle "$($vm[0]):sportnerd_deploy.tgz" $vm[1] $vm[2] --quiet
-if ($LASTEXITCODE -ne 0) { throw "scp failed" }
-
-$remote = @'
-set -e
-TS=$(date +%Y%m%d_%H%M%S)
-BACKUP=/opt/sportnerdbot_backup_$TS.tgz
-sudo tar -czf $BACKUP --exclude=venv --exclude=bot.log -C /opt sportnerdbot
-echo "Backup: $BACKUP"
-sudo systemctl stop sportnerdbot
-rollback() {
-  echo "!!! Deploy failed — restoring $BACKUP"
-  sudo tar -xzf $BACKUP -C /opt
-  sudo systemctl start sportnerdbot
-  exit 1
+if (-not $Sha) {
+    try {
+        $Sha = (git rev-parse HEAD).Trim()
+    } catch {
+        Write-Error "Could not determine git HEAD commit SHA. Please pass -Sha explicitly."
+        exit 1
+    }
 }
-trap rollback ERR
-sudo tar -xzf ~/sportnerd_deploy.tgz -C /opt/sportnerdbot
-sudo rm -rf /opt/sportnerdbot/services /opt/sportnerdbot/agents/admin_pipeline.py
-cd /opt/sportnerdbot
-sudo PYTHONIOENCODING=utf-8 venv/bin/python migrate_prompts.py /opt/sportnerdbot/challenge.db
-sudo PYTHONIOENCODING=utf-8 venv/bin/python migrate_users.py /opt/sportnerdbot/challenge.db
-sudo PYTHONIOENCODING=utf-8 venv/bin/python enable_alternating.py /opt/sportnerdbot/challenge.db
-sudo chmod 600 /opt/sportnerdbot/.env
-sudo venv/bin/python -c "import bot; bot.build_app(); print('smoke build ok')"
-trap - ERR
-sudo systemctl start sportnerdbot
-sleep 8
-systemctl is-active sportnerdbot
-sudo journalctl -u sportnerdbot -n 25 --no-pager
-'@
-$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remote.Replace("`r`n", "`n")))
-& $gcloud compute ssh $vm[0] $vm[1] $vm[2] --command="echo $b64 | base64 -d | bash; rm -f ~/sportnerd_deploy.tgz"
-Remove-Item $bundle
+
+Write-Host "Target deployment SHA: $Sha"
+
+if ($GatewayUrl -and $HmacSecret) {
+    Write-Host "Triggering deployment via sportnerd-gateway at $GatewayUrl/deploy..."
+    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $requestId = [Guid]::NewGuid().ToString()
+
+    $payloadObj = [ordered]@{
+        contract_version = "1.0"
+        request_id       = $requestId
+        sha              = $Sha
+        ts               = $ts
+    }
+    $bodyJson = $payloadObj | ConvertTo-Json -Compress
+
+    # HMAC-SHA256 signature
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($HmacSecret)
+    $msgToSign = [System.Text.Encoding]::UTF8.GetBytes("$bodyJson$ts")
+    $sigBytes = $hmac.ComputeHash($msgToSign)
+    $signature = [BitConverter]::ToString($sigBytes).Replace("-", "").ToLower()
+
+    $payloadObj["signature"] = $signature
+    $finalJson = $payloadObj | ConvertTo-Json -Compress
+
+    $response = Invoke-RestMethod -Uri "$GatewayUrl/deploy" -Method Post -Body $finalJson -ContentType "application/json"
+    Write-Host "Gateway response:" ($response | ConvertTo-Json)
+} elseif ($UseSsh) {
+    Write-Host "Triggering deployment on $VmInstance via gcloud compute ssh..."
+    $gcloud = "gcloud"
+    & $gcloud compute ssh $VmInstance --project=$GcpProject --zone=$GcpZone --command="sudo -u sportnerd /usr/local/bin/sportnerd-deploy.sh $Sha"
+} else {
+    Write-Host "To deploy via Gateway, set GATEWAY_URL and GATEWAY_HMAC_SECRET or pass -GatewayUrl and -HmacSecret."
+    Write-Host "To deploy via SSH, pass -UseSsh."
+    Write-Host "Example:"
+    Write-Host "  .\deploy.ps1 -GatewayUrl https://example.com:8443 -HmacSecret <secret>"
+    Write-Host "  .\deploy.ps1 -UseSsh"
+}

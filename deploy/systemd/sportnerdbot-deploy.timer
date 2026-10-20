@@ -1,0 +1,11 @@
+[Unit]
+Description=SportNerdBot Safety-Net Git Fetch and Deploy Timer
+After=network.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

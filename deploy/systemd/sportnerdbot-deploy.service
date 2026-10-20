@@ -1,0 +1,12 @@
+[Unit]
+Description=SportNerdBot Safety-Net Pull Deploy Execution
+After=network.target
+
+[Service]
+Type=oneshot
+User=sportnerd
+Group=sportnerd
+EnvironmentFile=/etc/sportnerdbot/env
+ExecStart=/usr/local/bin/sportnerd-deploy.sh origin/main
+StandardOutput=journal
+StandardError=journal

@@ -16,6 +16,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "challenge.db"))
 BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
 
+# sportnerd-gateway (aiohttp) конфігурація
+GATEWAY_HMAC_SECRET = os.getenv("GATEWAY_HMAC_SECRET", "")
+GATEWAY_HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
+GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8443"))
+DEPLOY_SCRIPT_PATH = os.getenv("DEPLOY_SCRIPT_PATH", os.path.join(BASE_DIR, "deploy", "deploy.sh"))
+DEPLOY_STATUS_DIR = os.getenv("DEPLOY_STATUS_DIR", os.path.join(os.path.dirname(DB_PATH), "deploy_status"))
+
 TIMEZONE = pytz.timezone("Europe/Kyiv")
 START_DATE = date(2026, 8, 31)
 
