@@ -1,63 +1,125 @@
 # 🏋️‍♂️ SportNerdBot («Спорт Зануда»)
 
-Telegram AI-бот для відстеження щоденного спортивного челенджу з відтискань між **Сашею (батьком)** та **Льошею (сином)**.
+Telegram AI-бот для відстеження щоденного спортивного челенджу з відтискань та присідань між **Сашею (батьком)** та **Льошею (сином)**, побудований на базі моделі Google Gemini, автоматичного комп'ютерного зору (MediaPipe Pose + Gemini Vision) та дворівневої системи адміністрування.
 
 ---
 
 ## 📌 Основна інформація
 
-* **Bot Username**: `@SportNerdBot` (ID: `8637170983`)
-* **Цільовий чат**: `Котяки-Віджимаки💪🏿` (ID: `-1004481392380`)
-* **AI Модель**: Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.5-flash`, `gemini-3.6-flash`) з Automatic Function Calling (AFC).
-* **Хостинг**: Google Cloud Platform (GCP Compute Engine `e2-micro`, 24/7).
+* **Bot Username:** `@SportNerdBot` (ID: `8637170983`)
+* **Цільовий чат:** `Котяки-Віджимаки💪🏿` (ID: `-1004481392380`)
+* **AI Модель:** Google Gemini (`gemini-2.5-flash-lite`, `gemini-2.5-flash`) з Automatic Function Calling (AFC) та ring-buffer rate limiter.
+* **Хостинг:** Google Cloud Platform (Compute Engine `e2-micro`, Ubuntu 24.04 LTS, 24/7).
+* **Системний користувач:** `sportnerd` (non-root, systemd hardening).
 
 ---
 
-## 👥 Учасники челенджу та нормативи
+## 👥 Учасники челенджу та правила
 
-1. **Саша (Oleksandr Polishchuk)**:
-   * Норматив: **14 відтискань** на день (або 1 відео / чітке підтвердження).
-2. **Льоша (Олексій)**:
-   * Норматив: **25 відтискань** на день (або 1 відео / чітке підтвердження).
-
----
-
-## ⚙️ Архітектура: 3 тригери та повний контекст дня
-
-1. **Тригер 1: Таймер (Планові нагадування)**:
-   * **Розклад**: `08:30`, `15:00`, `19:00` (Kyiv Time).
-   * **Логіка**: Перевіряє базу даних. Якщо обидва учасники вже закрили норматив на сьогодні — нагадування **мовчки скіпається**. Якщо хтось не зробив — бот генерує дотепне нагадування.
-2. **Тригер 2: Push (Нове повідомлення в чаті)**:
-   * **Логіка**: При отриманні нового повідомлення (текст, відео, кружечок, відповідь на повідомлення) бот бере **всі повідомлення за сьогодні** як контекст і відправляє в Gemini. AI-агент самостійно викликає функцію `mark_participant_done(participant, date, note)` та оновлює статус у базі даних.
-3. **Тригер 3: Нічний фінал (23:30)**:
-   * **Логіка**: За 30 хвилин до півночі. Якщо норматив виконано обома — мовчить. Якщо ні — жартівливо-драматично нагадує, що залишилось 30 хвилин.
+* **Саша (Oleksandr Polishchuk):** денна норма 14 відтискань (або альтернативна вправа / відеозвіт).
+* **Льоша (Олексій):** денна норма 25 відтискань (або альтернативна вправа / відеозвіт).
+* **Чергування вправ:** система підтримує чергування днів (відтискання / присідання).
+* **Система життів:** учасники мають ліміт життів, які списуються опівночі (`settle_lives`) у разі невиконання норми.
 
 ---
 
-## 🗄️ Структура бази даних (`challenge.db`)
+## ⚙️ Архітектура системи
 
-* **`progress`**: Відмітки про виконання нормативу (`date`, `participant`, `done`, `source`, `updated_at`).
-* **`chat_history`**: Повна історія повідомлень у групі (`id`, `chat_id`, `user_id`, `user_name`, `role`, `text`, `timestamp`).
-* **`bot_state`**: Збереження часової мітки останнього обробленого повідомлення (`key`, `value`).
+Система складається з чотирьох ключових компонентів на VM та агента на Grok Bot Box:
+
+```
+                                +---------------------------+
+                                |      Telegram Bot API     |
+                                +-------------+-------------+
+                                              |
+                     +------------------------+------------------------+
+                     | getUpdates / sendMessage                        | getFile
+                     v                                                 v
++---------------------------------------+             +----------------------------------+
+| sportnerdbot.service                  |             | sportnerd-cv.service             |
+| - aiogram long-polling                |             | - MediaPipe Pose (reps counter)  |
+| - Router (Coach / Admin / Onboarding) |             | - Gemini Vision (exercise filter)|
+| - Ring-buffer rate limiter            |             | - Concurrency=1, MemoryMax=500M  |
++-------------------+-------------------+             +----------------+-----------------+
+                    |                                                  |
+                    | (enqueue / read result)                          | (update video_checks)
+                    v                                                  v
++----------------------------------------------------------------------------------------+
+| SQLite WAL Database: /var/lib/sportnerdbot/challenge.db                                |
+| Tables: users, user_progress, chat_history, video_checks, pending_replies, admin_audit |
++----------------------------------------------------------------------------------------+
+                    ^                                                  ^
+                    | (trigger release deploy)                         | (callback)
++-------------------+-------------------+             +----------------+-----------------+
+| sportnerd-gateway.service             |             | Grok Bot Box                     |
+| - aiohttp API (:8443)                 | <---------  | - admin_dev offload agent        |
+| - /deploy, /callback, /healthz        |  HMAC-SHA256| - Automated tests & git push     |
++---------------------------------------+             +----------------------------------+
+```
+
+### 1. Сервіси на віртуальній машині:
+* **`sportnerdbot.service`:** Основний процес опитування Telegram (long-polling), запущений з атомарного symlink `/opt/sportnerdbot/current`.
+* **`sportnerd-cv.service`:** Окремий асинхронний сервіс черги комп'ютерного зору (MediaPipe), що аналізує відеозвіти з обмеженням оперативної пам'яті (`MemoryMax=500M`).
+* **`sportnerd-gateway.service`:** Легкий HTTP aiohttp-шлюз на порту `:8443` для прийому вебхуків деплою (`/deploy`) та результатів зовнішньої обробки (`/callback`).
+* **`sportnerdbot-deploy.timer`:** Резервний periodic safety-net таймер, що перевіряє оновлення в `origin/main`.
+
+### 2. Відокремлена база даних (`/var/lib/sportnerdbot/challenge.db`):
+* База даних винесена за межі коду релізів.
+* Працює в режимі **SQLite WAL** (`busy_timeout=5000`, `foreign_keys=ON`).
+* Версіоновані міграції через `python -m database.migrate` з онлайн-бекапом перед кожною зміною.
 
 ---
 
-## ☁️ Хмарне розгортання (GCP Compute Engine)
+## 📹 Конвеєр верифікації відеозвітів
 
-Повна інструкція та параметри доступу описані у файлі [CLOUD_DEPLOYMENT.md](CLOUD_DEPLOYMENT.md).
+Бот реалізує повний захист від фальсифікацій (anti-cheat) для відео та кружечків:
+1. **Вхідний фільтр (Gate):** Відхилення GIF/animation, перевірка тривалості (`duration >= 5s`), ліміту розміру Telegram (`<= 20MB`) та дедуплікація за `file_unique_id`.
+2. **Асинхронна черга (`video_checks`):** Бот негайно відповідає учаснику в чаті у стилі тренера («Беру попкорну і йду дивитись відео») та передає завдання CV-воркеру.
+3. **Класифікація вправи (Gemini Vision):** Аналіз 3–4 ключових кадрів стабільного сегмента відео для виявлення спаму, мемів або невідповідної вправи.
+4. **Підрахунок повторень (MediaPipe Pose):** Розрахунок амплітуди повторень. Для відтискань з фронтальної камери відстежується вертикальне зміщення плечей та носа (замість кутів ліктів).
+5. **Узгодження та вердикт (`ReportJudgeAgent`):** Якщо класи збігаються, кількість повторень відповідає нормативу і впевненість `confidence >= 0.6` — норма автоматично зараховується з персоналізованою відповіддю тренера.
 
-* **GCP Project**: `gen-lang-client-0185250272` (`Gemini Voice PoC`)
-* **VM Name**: `sportnerd-bot-vm` (Zone: `us-central1-a`, e2-micro Always Free)
-* **IP**: `35.254.7.29`
-* **Каталог на сервері**: `/opt/sportnerdbot/`
-* **Служба**: `sportnerdbot.service` (`systemd`)
+---
 
-### Швидкі команди:
-* **Логи в реальному часі:**
-  ```powershell
-  & "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" compute ssh sportnerd-bot-vm --project=gen-lang-client-0185250272 --zone=us-central1-a --command="sudo journalctl -u sportnerdbot -f"
+## 🛡️ Адміністрування та Guardrails
+
+* **`admin_quick` (In-Bot):** Миттєва зміна параметрів челенджу (життя, норми, розклад) через виклики функцій всередині бота.
+* **`admin_dev` (Offload на Box):** Складні запити (зміна коду, структури БД чи системних промптів) автоматично офлоадяться на Grok Bot Box через підписаний HMAC вебхук. Агент готує зміни, проганяє тести, робить коміт у git та ініціює деплой.
+* **Захищені зони (Forbidden Zones):** Будь-які зміни конфігурації `.env`, deploy-скриптів, systemd-юнітів або деструктивні міграції вимагають підтвердження від адміністратора через Telegram-команду:
+  ```text
+  /approve <request_id>
   ```
-* **Перезапуск бота:**
-  ```powershell
-  & "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd" compute ssh sportnerd-bot-vm --project=gen-lang-client-0185250272 --zone=us-central1-a --command="sudo systemctl restart sportnerdbot"
+* **Аварійний відкат:** Адміністратор може ініціювати відкат на попередній реліз безпосередньо з чату:
+  ```text
+  /rollback
   ```
+
+---
+
+## 🚀 Деплой та експлуатація
+
+Деплой виконується за принципом **pull-based release directories with atomic symlink**:
+
+```powershell
+# Деплой через локальний PowerShell-скрипт (викликає Gateway API)
+.\deploy.ps1 -GatewayUrl https://35.254.7.29:8443 -HmacSecret "СЕКРЕТ"
+
+# Або запуск на сервері через SSH:
+sudo -u sportnerd /usr/local/bin/sportnerd-deploy.sh origin/main
+```
+
+Детальні інструкції щодо розгортання, моніторингу та бекапів:
+* [Інфраструктура та доступ до GCP](CLOUD_DEPLOYMENT.md)
+* [Runbook з експлуатації та відновлення](docs/RUNBOOK.md)
+* [Цільова архітектура системи](docs/ARCHITECTURE.md)
+
+---
+
+## 🧪 Локальне тестування
+
+Проєкт покритий повним набором офлайн юніт-тестів, які не потребують підключення до Telegram або зовнішніх мереж:
+
+```bash
+# Запуск офлайн-тестів
+.venv/bin/python -m pytest -q --ignore=tests/integration
+```
