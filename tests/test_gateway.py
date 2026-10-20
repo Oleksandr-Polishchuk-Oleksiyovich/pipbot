@@ -218,3 +218,77 @@ async def test_gateway_deploy_status_not_found(test_setup):
         assert data["error"] == "not_found"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_callback_valid_video(test_setup):
+    """POST /callback з валідним video-результатом оновлює video_checks і повертає 202."""
+    app = test_setup["app"]
+    store = test_setup["store"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        req_id = "cb-test-req-001"
+        store.create_video_check(
+            request_id=req_id,
+            chat_id=-100123,
+            message_id=456,
+            user_slug="lyosha",
+        )
+
+        payload = {
+            "contract_version": "1.0",
+            "request_id": req_id,
+            "type": "video",
+            "status": "done",
+            "result": {
+                "exercise": "pushup",
+                "reps": 35,
+                "confidence": 0.9,
+                "flags": ["front_camera"],
+                "valid": True,
+            },
+            "reply_text": "Норму зараховано!",
+            "ts": int(time.time()),
+        }
+        sig = sign_payload(payload, TEST_SECRET)
+        payload["signature"] = sig
+
+        resp = await client.post("/callback", json=payload)
+        assert resp.status == 202
+        data = await resp.json()
+        assert data["status"] == "accepted"
+        assert data["request_id"] == req_id
+
+        # Перевіряємо що video_checks оновлено
+        updated = store.get_video_check(req_id)
+        assert updated is not None
+        assert updated.status == "done"
+        assert updated.exercise == "pushup"
+        assert updated.reps == 35
+        assert updated.valid is True
+
+        # Перевіряємо збереження reply_text у pending_replies
+        replies = store.list_pending_replies()
+        assert any(r.text == "Норму зараховано!" and r.reply_to_message_id == 456 for r in replies)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_callback_bad_hmac(test_setup):
+    """POST /callback з неправильним HMAC повертає 401."""
+    app = test_setup["app"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        payload = {
+            "contract_version": "1.0",
+            "request_id": "bad-hmac-req",
+            "ts": int(time.time()),
+            "signature": "bad_signature_value",
+        }
+        resp = await client.post("/callback", json=payload)
+        assert resp.status == 401
+    finally:
+        await client.close()

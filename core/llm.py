@@ -82,7 +82,7 @@ class GeminiLLM:
             self._models.remove(model)
             self._models.insert(0, model)
 
-    def _run(self, contents: str, config: types.GenerateContentConfig, accept: Callable) -> object:
+    def _run(self, contents: object, config: types.GenerateContentConfig, accept: Callable) -> object:
         errors = []
         for model in list(self._models):
             try:
@@ -131,6 +131,38 @@ class GeminiLLM:
                 return schema.model_validate(json.loads(_strip_fences(resp.text or "")))
 
         return self._run(prompt, config, accept)
+
+    def vision_json(
+        self,
+        system: str,
+        prompt: str,
+        images: Sequence[bytes],
+        schema: Type[T],
+        *,
+        temperature: float = 0.1,
+    ) -> T:
+        """Виклик Gemini з зображеннями (JPEG bytes) та валідацією через Pydantic-схему."""
+        parts: list = []
+        for img_bytes in images:
+            parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+        parts.append(prompt)
+
+        config = types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=temperature,
+            response_mime_type="application/json",
+            response_schema=schema,
+        )
+
+        def accept(resp) -> T:
+            if isinstance(getattr(resp, "parsed", None), schema):
+                return resp.parsed
+            try:
+                return schema.model_validate_json(resp.text or "")
+            except ValidationError:
+                return schema.model_validate(json.loads(_strip_fences(resp.text or "")))
+
+        return self._run(parts, config, accept)
 
 
 def _strip_fences(text: str) -> str:

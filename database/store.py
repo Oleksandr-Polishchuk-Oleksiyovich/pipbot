@@ -71,6 +71,28 @@ class PendingReply:
 
 
 @dataclass
+class VideoCheck:
+    id: int
+    request_id: str
+    chat_id: int
+    message_id: int
+    user_slug: Optional[str] = None
+    file_id: Optional[str] = None
+    file_unique_id: Optional[str] = None
+    duration_s: Optional[float] = None
+    exercise: Optional[str] = None
+    reps: Optional[int] = None
+    confidence: Optional[float] = None
+    flags: List[str] = field(default_factory=list)
+    valid: bool = False
+    status: str = "queued"
+    analyzer_version: Optional[str] = None
+    location: Optional[str] = None
+    created_at: str = ""
+    finished_at: Optional[str] = None
+
+
+@dataclass
 class User:
     slug: str
     telegram_id: Optional[int] = None
@@ -131,6 +153,45 @@ _USER_COLS = (
     "base_pushups, ladder_offset, alt_pushups, max_pushups_reported, "
     "max_squats_reported, joined_date"
 )
+
+_VIDEO_CHECK_COLS = (
+    "id, request_id, chat_id, message_id, user_slug, file_id, file_unique_id, "
+    "duration_s, exercise, reps, confidence, flags, valid, status, analyzer_version, "
+    "location, created_at, finished_at"
+)
+
+
+def _row_to_video_check(row: Tuple) -> VideoCheck:
+    flags_val = row[11]
+    if isinstance(flags_val, str):
+        try:
+            flags = json.loads(flags_val)
+        except Exception:
+            flags = []
+    elif isinstance(flags_val, list):
+        flags = flags_val
+    else:
+        flags = []
+    return VideoCheck(
+        id=row[0],
+        request_id=row[1],
+        chat_id=row[2],
+        message_id=row[3],
+        user_slug=row[4],
+        file_id=row[5],
+        file_unique_id=row[6],
+        duration_s=row[7],
+        exercise=row[8],
+        reps=row[9],
+        confidence=row[10],
+        flags=flags,
+        valid=bool(row[12]),
+        status=row[13],
+        analyzer_version=row[14],
+        location=row[15],
+        created_at=row[16] or "",
+        finished_at=row[17],
+    )
 
 
 class Store:
@@ -221,6 +282,28 @@ class Store:
                     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_pending_replies_status ON pending_replies(status);
+                CREATE TABLE IF NOT EXISTS video_checks (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id       TEXT UNIQUE,
+                    chat_id          INTEGER NOT NULL,
+                    message_id       INTEGER NOT NULL,
+                    user_slug        TEXT,
+                    file_id          TEXT,
+                    file_unique_id   TEXT,
+                    duration_s       REAL,
+                    exercise         TEXT,
+                    reps             INTEGER,
+                    confidence       REAL,
+                    flags            TEXT,
+                    valid            INTEGER DEFAULT 0,
+                    status           TEXT NOT NULL DEFAULT 'queued',
+                    analyzer_version TEXT,
+                    location         TEXT,
+                    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    finished_at      TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_checks_status ON video_checks(status);
+                CREATE INDEX IF NOT EXISTS idx_video_checks_file_unique_id ON video_checks(file_unique_id);
             """)
 
     # --- USERS ---
@@ -635,6 +718,149 @@ class Store:
                     status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END
                 WHERE request_id = ?
             """, (max_attempts, request_id))
+
+    # --- VIDEO CHECKS ---
+    def create_video_check(
+        self,
+        request_id: str,
+        chat_id: int,
+        message_id: int,
+        user_slug: Optional[str] = None,
+        file_id: Optional[str] = None,
+        file_unique_id: Optional[str] = None,
+        duration_s: Optional[float] = None,
+        exercise: Optional[str] = None,
+        reps: Optional[int] = None,
+        confidence: Optional[float] = None,
+        flags: Optional[List[str]] = None,
+        valid: bool = False,
+        status: str = "queued",
+        analyzer_version: Optional[str] = None,
+        location: Optional[str] = "vm",
+    ) -> VideoCheck:
+        flags_json = json.dumps(flags or [], ensure_ascii=False)
+        with self._connect() as con:
+            cur = con.execute("""
+                INSERT INTO video_checks (
+                    request_id, chat_id, message_id, user_slug, file_id, file_unique_id,
+                    duration_s, exercise, reps, confidence, flags, valid, status,
+                    analyzer_version, location, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                request_id, chat_id, message_id, user_slug, file_id, file_unique_id,
+                duration_s, exercise, reps, confidence, flags_json, 1 if valid else 0, status,
+                analyzer_version, location,
+            ))
+            row_id = cur.lastrowid
+        res = self.get_video_check_by_id(row_id)
+        if res is None:
+            raise RuntimeError(f"Failed to create video_check for request_id={request_id}")
+        return res
+
+    def get_video_check(self, request_id: str) -> Optional[VideoCheck]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return _row_to_video_check(row) if row else None
+
+    def get_video_check_by_id(self, check_id: int) -> Optional[VideoCheck]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks WHERE id = ?",
+                (check_id,),
+            ).fetchone()
+        return _row_to_video_check(row) if row else None
+
+    def get_video_check_by_file_unique_id(self, file_unique_id: str) -> Optional[VideoCheck]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks WHERE file_unique_id = ? ORDER BY id DESC LIMIT 1",
+                (file_unique_id,),
+            ).fetchone()
+        return _row_to_video_check(row) if row else None
+
+    def claim_next_video_check(self) -> Optional[VideoCheck]:
+        """Атомарно переводить один найстаріший запис зі status='queued' у status='running' (concurrency=1)."""
+        with self._connect() as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT id FROM video_checks
+                WHERE status = 'queued'
+                ORDER BY id ASC LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+            check_id = row[0]
+            cur.execute("""
+                UPDATE video_checks
+                SET status = 'running'
+                WHERE id = ? AND status = 'queued'
+            """, (check_id,))
+            if cur.rowcount == 0:
+                return None
+            row_updated = cur.execute(
+                f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks WHERE id = ?",
+                (check_id,),
+            ).fetchone()
+            return _row_to_video_check(row_updated) if row_updated else None
+
+    def update_video_check(
+        self,
+        request_id: str,
+        *,
+        status: Optional[str] = None,
+        exercise: Optional[str] = None,
+        reps: Optional[int] = None,
+        confidence: Optional[float] = None,
+        flags: Optional[List[str]] = None,
+        valid: Optional[bool] = None,
+        analyzer_version: Optional[str] = None,
+        finished: bool = False,
+    ) -> None:
+        updates = []
+        params = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if exercise is not None:
+            updates.append("exercise = ?")
+            params.append(exercise)
+        if reps is not None:
+            updates.append("reps = ?")
+            params.append(reps)
+        if confidence is not None:
+            updates.append("confidence = ?")
+            params.append(confidence)
+        if flags is not None:
+            updates.append("flags = ?")
+            params.append(json.dumps(flags, ensure_ascii=False))
+        if valid is not None:
+            updates.append("valid = ?")
+            params.append(1 if valid else 0)
+        if analyzer_version is not None:
+            updates.append("analyzer_version = ?")
+            params.append(analyzer_version)
+        if finished:
+            updates.append("finished_at = datetime('now')")
+        if not updates:
+            return
+        params.append(request_id)
+        with self._connect() as con:
+            con.execute(f"UPDATE video_checks SET {', '.join(updates)} WHERE request_id = ?", tuple(params))
+
+    def list_video_checks(self, status: Optional[str] = None) -> List[VideoCheck]:
+        query = f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks"
+        params: tuple = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY id ASC"
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [_row_to_video_check(r) for r in rows]
 
 
 def format_ts(dt: datetime) -> str:

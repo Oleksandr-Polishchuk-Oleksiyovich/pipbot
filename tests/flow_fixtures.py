@@ -17,9 +17,12 @@ class FakeSender:
     def __init__(self):
         self.texts = []
         self.videos = []
+        self.replies = []
 
-    async def send_text(self, chat_id, text):
+    async def send_text(self, chat_id, text, reply_to_message_id=None, **kwargs):
         self.texts.append(text)
+        if reply_to_message_id is not None:
+            self.replies.append((reply_to_message_id, text))
 
     async def send_video(self, chat_id, path):
         self.videos.append(path)

@@ -19,6 +19,21 @@ class JudgeVerdict(BaseModel):
     reports: List[ParticipantReport]
 
 
+class VideoFact(BaseModel):
+    exercise: str
+    reps: int
+    target: int
+    confidence: float
+    valid: bool
+    flags: List[str] = []
+
+
+class VideoVerdict(BaseModel):
+    done: bool
+    reason: str
+    category: str  # "success" | "near_miss" | "far_below" | "bad_quality" | "wrong_exercise"
+
+
 _REPORT_MARKERS = [
     "відео", "відос", "[надіслано", "video", "зробив", "зробила",
     "закр", "готово", "відтис", "віджав", "присів", "присіла",
@@ -75,3 +90,65 @@ class ReportJudgeAgent(PromptAgent):
             if participant and not done.get(participant):
                 reports.append(ParticipantReport(participant=participant, done=True, evidence=m.text[:80]))
         return JudgeVerdict(reports=reports)
+
+    @staticmethod
+    def judge_video_fact(fact: VideoFact) -> VideoVerdict:
+        """
+        T-34: Judge оцінює структурований факт {exercise, reps, target, confidence, valid, flags}.
+        done = True якщо valid і reps >= target і confidence >= 0.6.
+        """
+        flags_set = set(fact.flags)
+
+        if (
+            fact.confidence < 0.6
+            or "low_body_visibility" in flags_set
+            or "small_pushup_range" in flags_set
+            or "small_squat_range" in flags_set
+            or "empty_video" in flags_set
+        ):
+            return VideoVerdict(
+                done=False,
+                reason="Низька якість або недостатня видимість рухів",
+                category="bad_quality",
+            )
+
+        if (
+            fact.exercise == "none"
+            or "class_mismatch" in flags_set
+            or "not_exercise" in flags_set
+            or "junk_video" in flags_set
+        ):
+            return VideoVerdict(
+                done=False,
+                reason="Відео не відповідає потрібній спортивній вправі",
+                category="wrong_exercise",
+            )
+
+        if not fact.valid:
+            return VideoVerdict(
+                done=False,
+                reason="Відео визнано невалідним",
+                category="bad_quality",
+            )
+
+        if fact.reps >= fact.target:
+            return VideoVerdict(
+                done=True,
+                reason=f"Норму виконано: {fact.reps} з {fact.target} повторень",
+                category="success",
+            )
+
+        if fact.target - fact.reps <= 2 or (fact.target > 0 and fact.reps >= fact.target * 0.85):
+            missing = fact.target - fact.reps
+            return VideoVerdict(
+                done=False,
+                reason=f"Не вистачає {missing} повтор(ів)",
+                category="near_miss",
+            )
+
+        return VideoVerdict(
+            done=False,
+            reason=f"Зроблено лише {fact.reps} з {fact.target} повторень",
+            category="far_below",
+        )
+

@@ -195,6 +195,39 @@ def build_app():
 
         user = message.from_user
         sender = (user.full_name or user.first_name) if user else "Користувач"
+
+        is_anim = bool(getattr(message, "animation", None))
+        vid = getattr(message, "video", None)
+        vnote = getattr(message, "video_note", None)
+        is_video = bool(vid or vnote)
+
+        if is_anim or is_video:
+            media_obj = getattr(message, "animation", None) or vid or vnote
+            file_id = getattr(media_obj, "file_id", None)
+            file_unique_id = getattr(media_obj, "file_unique_id", None)
+            duration = getattr(media_obj, "duration", None)
+            file_size = getattr(media_obj, "file_size", None)
+
+            user_record = flow.record_user_message(
+                message.chat.id,
+                sender,
+                describe_message(message),
+                msg_dt,
+                telegram_id=user.id if user else None,
+                username=user.username if user else None,
+            )
+            await flow.handle_video(
+                message.chat.id,
+                user_record,
+                message.message_id,
+                is_animation=is_anim,
+                file_id=file_id,
+                file_unique_id=file_unique_id,
+                duration=float(duration) if duration is not None else None,
+                file_size=file_size,
+            )
+            return
+
         flow.record_user_message(
             message.chat.id,
             sender,

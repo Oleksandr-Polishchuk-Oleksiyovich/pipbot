@@ -31,6 +31,7 @@ DEPLOY_SCRIPT_KEY = web.AppKey("deploy_script", str)
 STATUS_DIR_KEY = web.AppKey("status_dir", str)
 ENV_OVERRIDE_KEY = web.AppKey("env_override", Optional[Dict[str, str]])
 TASKS_KEY = web.AppKey("background_tasks", Set[Any])
+FLOW_CALLBACK_KEY = web.AppKey("flow_callback", Optional[Any])
 
 
 async def run_deploy_subprocess(
@@ -236,12 +237,83 @@ async def handle_get_deploy_status(request: web.Request) -> web.Response:
         return web.json_response({"error": "read_error", "detail": str(e)}, status=500)
 
 
+async def handle_post_callback(request: web.Request) -> web.Response:
+    """
+    POST /callback
+    Contract 8.2: box / worker -> gateway /callback
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    if not isinstance(data, dict):
+        return web.json_response({"error": "invalid_payload"}, status=400)
+
+    for req_field in ("request_id", "ts", "signature"):
+        if req_field not in data:
+            return web.json_response(
+                {"error": "missing_required_fields", "detail": f"Field '{req_field}' is required"},
+                status=400,
+            )
+
+    request_id = str(data["request_id"])
+    secret = request.app[SECRET_KEY]
+
+    valid, reason = verify_payload(data, secret=secret, max_age_seconds=300)
+    if not valid:
+        logger.warning("Callback auth failed for request_id=%s: %s", request_id, reason)
+        return web.json_response({"error": "unauthorized", "detail": reason}, status=401)
+
+    store: Store = request.app[STORE_KEY]
+    status_val = data.get("status", "done")
+    result = data.get("result", {})
+
+    # Оновлення таблиці video_checks якщо це відео-результат
+    if data.get("type") == "video" or (isinstance(result, dict) and "exercise" in result):
+        store.update_video_check(
+            request_id,
+            status=status_val,
+            exercise=result.get("exercise"),
+            reps=result.get("reps"),
+            confidence=result.get("confidence"),
+            flags=result.get("flags"),
+            valid=result.get("valid"),
+            analyzer_version=result.get("analyzer_version"),
+            finished=True,
+        )
+
+    # Якщо надано reply_text — зберігаємо в pending_replies
+    reply_text = data.get("reply_text")
+    check = store.get_video_check(request_id)
+    if reply_text and check:
+        store.add_pending_reply(
+            request_id=f"cb_{request_id}",
+            chat_id=check.chat_id,
+            text=str(reply_text),
+            reply_to_message_id=check.message_id,
+        )
+
+    # Якщо підключено flow callback — запускаємо його
+    flow_cb = request.app.get(FLOW_CALLBACK_KEY)
+    if callable(flow_cb):
+        try:
+            res = flow_cb(request_id)
+            if asyncio.iscoroutine(res):
+                asyncio.create_task(res)
+        except Exception as e:
+            logger.error("Error executing flow_callback for %s: %s", request_id, e)
+
+    return web.json_response({"status": "accepted", "request_id": request_id}, status=202)
+
+
 def create_app(
     store: Optional[Store] = None,
     secret: Optional[str] = None,
     deploy_script: Optional[str] = None,
     status_dir: Optional[str] = None,
     env_override: Optional[Dict[str, str]] = None,
+    flow_callback: Optional[Any] = None,
 ) -> web.Application:
     """Створює екземпляр aiohttp Application для sportnerd-gateway."""
     app = web.Application()
@@ -252,10 +324,12 @@ def create_app(
     app[STATUS_DIR_KEY] = status_dir if status_dir is not None else DEPLOY_STATUS_DIR
     app[ENV_OVERRIDE_KEY] = env_override
     app[TASKS_KEY] = set()
+    app[FLOW_CALLBACK_KEY] = flow_callback
 
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_post("/deploy", handle_post_deploy)
     app.router.add_get("/deploy/{request_id}", handle_get_deploy_status)
+    app.router.add_post("/callback", handle_post_callback)
 
     return app
 

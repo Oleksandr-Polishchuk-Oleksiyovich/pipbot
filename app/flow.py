@@ -14,21 +14,27 @@ import glob
 import logging
 import os
 import random
+import uuid
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Protocol
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 from agents.admin import AdminAgent
 from agents.coach import CoachAgent
 from agents.onboarding import OnboardingAgent
 from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptMergerAgent, PromptVerifierAgent
-from agents.report_judge import JudgeVerdict, ReportJudgeAgent
+from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from core import challenge
 from core.config import OBEY_MEDIA_DIR, TIMEZONE
 from core.llm import GeminiLLM, LLMUnavailable
 from database.store import ChatMessage, Store, User, format_ts
 from migrate_users import ensure_default_users, migrate_dynamic_prompt
-from prompts import DEFAULT_PROMPTS, FALLBACK_ADMIN_MESSAGE, FALLBACK_GEMINI_MESSAGE
+from prompts import (
+    COACH_VIDEO_PERSONA_FALLBACKS,
+    DEFAULT_PROMPTS,
+    FALLBACK_ADMIN_MESSAGE,
+    FALLBACK_GEMINI_MESSAGE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,142 @@ class ChatFlow:
     async def _say(self, chat_id: int, text: str) -> None:
         self.store.save_message(chat_id, COACH_NAME, "coach", text, format_ts(self.now()))
         await self.sender.send_text(chat_id, text)
+
+    async def _say_reply(self, chat_id: int, text: str, reply_to_message_id: Optional[int] = None) -> None:
+        self.store.save_message(chat_id, COACH_NAME, "coach", text, format_ts(self.now()))
+        try:
+            if reply_to_message_id is not None:
+                await self.sender.send_text(chat_id, text, reply_to_message_id=reply_to_message_id)
+            else:
+                await self.sender.send_text(chat_id, text)
+        except TypeError:
+            await self.sender.send_text(chat_id, text)
+
+    async def handle_video(
+        self,
+        chat_id: int,
+        user: User,
+        message_id: int,
+        *,
+        is_animation: bool = False,
+        file_id: Optional[str] = None,
+        file_unique_id: Optional[str] = None,
+        duration: Optional[float] = None,
+        file_size: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Gate для вхідного відео/GIF (T-30):
+        1. reject animation/GIF
+        2. reject duration < 5s
+        3. reject file_size > 20MB
+        4. dedup by file_unique_id
+        5. passed -> INSERT video_checks(status='queued'), ack «Беру попкорну і йду дивитись відео»
+        """
+        if is_animation:
+            reply = "Це гіфка або анімація, а не відеозвіт! Зніми нормальне відео підходу."
+            await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+            return False, reply
+
+        if duration is not None and duration < 5:
+            reply = "Відео занадто коротке (менше 5 секунд) — треба показати нормальний підхід!"
+            await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+            return False, reply
+
+        if file_size is not None and file_size > 20 * 1024 * 1024:
+            reply = "Відео більше 20MB — Telegram не дасть завантажити, стисни будь ласка!"
+            await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+            return False, reply
+
+        if file_unique_id:
+            existing = self.store.get_video_check_by_file_unique_id(file_unique_id)
+            if existing is not None:
+                reply = "Це відео вже надсилали (дублікат). Спробуй зняти свіжий підхід!"
+                await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+                return False, reply
+
+        request_id = str(uuid.uuid4())
+        self.store.create_video_check(
+            request_id=request_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            user_slug=user.slug,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            duration_s=float(duration) if duration is not None else None,
+            status="queued",
+            location="vm",
+        )
+        reply = "Беру попкорну і йду дивитись відео"
+        await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+        return True, reply
+
+    async def handle_video_callback(self, request_id: str) -> Optional[str]:
+        """
+        T-34: Обробка результату video_checks:
+        1. Читає video_checks з БД.
+        2. Отримує норму (target) для користувача на сьогодні.
+        3. ReportJudgeAgent.judge_video_fact(fact).
+        4. Якщо verdict.done -> store.set_done(user_slug, True, today).
+        5. Формує persona-відповідь тренера.
+        6. Надсилає реплаєм на оригінальне відео (check.message_id) або кладе в pending_replies.
+        """
+        check = self.store.get_video_check(request_id)
+        if check is None:
+            logger.warning("Video check %s not found in database", request_id)
+            return None
+
+        today = self.now().date()
+        user_slug = check.user_slug or "lyosha"
+        targets = challenge.day_targets(self.store, today)
+        target = targets.get(user_slug, 10)
+
+        fact = VideoFact(
+            exercise=check.exercise or "none",
+            reps=check.reps or 0,
+            target=target,
+            confidence=check.confidence or 0.0,
+            valid=check.valid,
+            flags=check.flags or [],
+        )
+
+        verdict = ReportJudgeAgent.judge_video_fact(fact)
+        logger.info(
+            "Video fact judged for %s: done=%s category=%s (%s)",
+            user_slug, verdict.done, verdict.category, verdict.reason
+        )
+
+        if verdict.done:
+            self.store.set_done(user_slug, True, today.isoformat())
+
+        # Persona reply
+        if verdict.category == "success":
+            reply_text = COACH_VIDEO_PERSONA_FALLBACKS["success"].format(reps=check.reps, target=target)
+        else:
+            reply_text = COACH_VIDEO_PERSONA_FALLBACKS.get(
+                verdict.category,
+                "Відео переглянуто, але зарахувати не можу."
+            )
+
+        chat_id = check.chat_id
+        reply_to_msg_id = check.message_id
+
+        # Async доставка: реплаєм на відео; при недоступності — через pending_replies
+        try:
+            if reply_to_msg_id is not None:
+                await self.sender.send_text(chat_id, reply_text, reply_to_message_id=reply_to_msg_id)
+            else:
+                await self.sender.send_text(chat_id, reply_text)
+            self.store.save_message(chat_id, COACH_NAME, "coach", reply_text, format_ts(self.now()))
+        except Exception as e:
+            logger.warning("Failed to send video reply directly (%s) — queuing in pending_replies", e)
+            self.store.add_pending_reply(
+                request_id=f"vid_rep_{request_id}",
+                chat_id=chat_id,
+                text=reply_text,
+                reply_to_message_id=reply_to_msg_id,
+            )
+
+        return reply_text
 
     async def _refresh_chat_members(self, chat_id: int) -> None:
         fetch_fn = getattr(self.sender, "fetch_chat_members", None)

@@ -1,0 +1,3 @@
+"""
+SportNerdBot CV worker package.
+"""
