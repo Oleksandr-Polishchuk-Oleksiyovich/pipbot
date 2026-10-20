@@ -59,6 +59,17 @@ class ChatMessage:
         return f"[{self.created_at}] {sender}: {self.text}"
 
 
+@dataclass(frozen=True)
+class PendingReply:
+    request_id: str
+    chat_id: int
+    reply_to_message_id: Optional[int]
+    text: str
+    status: str = "pending"
+    attempts: int = 0
+    created_at: str = ""
+
+
 @dataclass
 class User:
     slug: str
@@ -127,7 +138,11 @@ class Store:
         self.db_path = db_path
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA busy_timeout=5000;")
+        con.execute("PRAGMA foreign_keys=ON;")
+        return con
 
     # --- СХЕМА ---
     def init_schema(self) -> None:
@@ -196,6 +211,16 @@ class Store:
                     updated_by TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS pending_replies (
+                    request_id          TEXT PRIMARY KEY,
+                    chat_id             INTEGER NOT NULL,
+                    reply_to_message_id INTEGER,
+                    text                TEXT NOT NULL,
+                    status              TEXT NOT NULL DEFAULT 'pending',
+                    attempts            INTEGER DEFAULT 0,
+                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_replies_status ON pending_replies(status);
             """)
 
     # --- USERS ---
@@ -392,9 +417,13 @@ class Store:
             rows = dict(
                 con.execute("SELECT user_slug, done FROM user_progress WHERE date = ?", (date_iso,)).fetchall()
             )
-            legacy_row = con.execute(
-                "SELECT lyosha_done, sasha_done FROM progress WHERE date = ?", (date_iso,)
-            ).fetchone()
+            legacy_row = None
+            try:
+                legacy_row = con.execute(
+                    "SELECT lyosha_done, sasha_done FROM progress WHERE date = ?", (date_iso,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                pass
         legacy = {"lyosha": bool(legacy_row[0]), "sasha": bool(legacy_row[1])} if legacy_row else {}
         result: Dict[str, bool] = {}
         for u in active:
@@ -412,10 +441,13 @@ class Store:
             if row is not None:
                 return bool(row[0])
             if slug in ("lyosha", "sasha"):
-                l_row = con.execute(
-                    f"SELECT {slug}_done FROM progress WHERE date = ?", (date_iso,)
-                ).fetchone()
-                return bool(l_row[0]) if l_row else False
+                try:
+                    l_row = con.execute(
+                        f"SELECT {slug}_done FROM progress WHERE date = ?", (date_iso,)
+                    ).fetchone()
+                    return bool(l_row[0]) if l_row else False
+                except sqlite3.OperationalError:
+                    pass
         return False
 
     def get_progress(self, date_iso: str) -> Tuple[bool, ...]:
@@ -423,17 +455,20 @@ class Store:
         day_map = self.get_day_progress(date_iso)
         if not day_map:
             with self._connect() as con:
-                row = con.execute(
-                    "SELECT lyosha_done, sasha_done FROM progress WHERE date = ?", (date_iso,)
-                ).fetchone()
-            return (bool(row[0]), bool(row[1])) if row else (False, False)
+                try:
+                    row = con.execute(
+                        "SELECT lyosha_done, sasha_done FROM progress WHERE date = ?", (date_iso,)
+                    ).fetchone()
+                    return (bool(row[0]), bool(row[1])) if row else (False, False)
+                except sqlite3.OperationalError:
+                    return (False, False)
         return tuple(day_map.values())
 
     def set_done(self, participant: str, done: bool, date_iso: str) -> None:
         user = self.get_user(participant) or self.find_user(participant)
-        slug = user.slug if user else participant
-        if user is None and slug not in ("lyosha", "sasha"):
+        if user is None:
             raise ValueError(f"Unknown participant: {participant}")
+        slug = user.slug
         val = 1 if done else 0
         with self._connect() as con:
             con.execute("""
@@ -441,9 +476,6 @@ class Store:
                 VALUES (?, ?, ?, datetime('now'))
                 ON CONFLICT(date, user_slug) DO UPDATE SET done = excluded.done, updated_at = datetime('now')
             """, (date_iso, slug, val))
-            if slug in ("lyosha", "sasha"):
-                con.execute("INSERT OR IGNORE INTO progress (date) VALUES (?)", (date_iso,))
-                con.execute(f"UPDATE progress SET {slug}_done = ? WHERE date = ?", (val, date_iso))
 
     # --- CHAT HISTORY ---
     def save_message(self, chat_id: int, user_name: str, role: str, text: str, created_at: str) -> int:
@@ -550,6 +582,59 @@ class Store:
                 self.save_prompt(key, content, "seed")
                 seeded.append(key)
         return seeded
+
+    # --- PENDING REPLIES ---
+    def add_pending_reply(
+        self,
+        request_id: str,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        """Зберігає відповідь для гарантованої доставки після перезапуску (ідемпотентно за request_id)."""
+        with self._connect() as con:
+            con.execute("""
+                INSERT INTO pending_replies (request_id, chat_id, reply_to_message_id, text, status, attempts, created_at)
+                VALUES (?, ?, ?, ?, 'pending', 0, datetime('now'))
+                ON CONFLICT(request_id) DO NOTHING
+            """, (request_id, chat_id, reply_to_message_id, text))
+
+    def list_pending_replies(self, status: str = "pending") -> List[PendingReply]:
+        with self._connect() as con:
+            rows = con.execute("""
+                SELECT request_id, chat_id, reply_to_message_id, text, status, attempts, created_at
+                FROM pending_replies
+                WHERE status = ?
+                ORDER BY created_at ASC, rowid ASC
+            """, (status,)).fetchall()
+        return [
+            PendingReply(
+                request_id=r[0],
+                chat_id=r[1],
+                reply_to_message_id=r[2],
+                text=r[3],
+                status=r[4],
+                attempts=r[5],
+                created_at=r[6] or "",
+            )
+            for r in rows
+        ]
+
+    def mark_reply_sent(self, request_id: str) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE pending_replies SET status = 'sent' WHERE request_id = ?",
+                (request_id,),
+            )
+
+    def increment_reply_attempts(self, request_id: str, max_attempts: int = 3) -> None:
+        with self._connect() as con:
+            con.execute("""
+                UPDATE pending_replies
+                SET attempts = attempts + 1,
+                    status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END
+                WHERE request_id = ?
+            """, (max_attempts, request_id))
 
 
 def format_ts(dt: datetime) -> str:

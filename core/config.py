@@ -11,7 +11,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = int(os.getenv("CHAT_ID") or 0)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Шлях до БД: локально за замовчуванням у BASE_DIR, на сервері через env
+# (наприклад, DB_PATH=/var/lib/sportnerdbot/challenge.db поза release-каталогом)
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "challenge.db"))
+BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
 
 TIMEZONE = pytz.timezone("Europe/Kyiv")
 START_DATE = date(2026, 8, 31)

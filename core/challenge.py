@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from core.config import START_DATE
 from database.store import DIFFICULTY_LIVES, Store, User
-from migrate_users import LYOSHA_ALIASES, SASHA_ALIASES, ensure_default_users
+from migrate_users import ensure_default_users
 
 EXERCISES = {
     "pushups": {"name": "віджимання", "genitive": "віджимань", "emoji": "💪"},
@@ -75,7 +75,7 @@ def rules_text(store: Store) -> str:
 
 
 def normalize_participant(raw: str, store: Optional[Store] = None) -> Optional[str]:
-    """Розпізнає учасника за ім'ям, ніком, slug або псевдонімом із БД."""
+    """Розпізнає учасника за ім'ям, ніком, slug або псевдонімом із БД (users)."""
     value = (raw or "").lower().strip()
     if not value:
         return None
@@ -84,10 +84,6 @@ def normalize_participant(raw: str, store: Optional[Store] = None) -> Optional[s
         user = store.find_user(raw)
         if user is not None:
             return user.slug
-    # Фолбек без store (для сумісності зі старими викликами)
-    for key, aliases in (("sasha", SASHA_ALIASES), ("lyosha", LYOSHA_ALIASES)):
-        if value == key or any(alias in value for alias in aliases):
-            return key
     return None
 
 

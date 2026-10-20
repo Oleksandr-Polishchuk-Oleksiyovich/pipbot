@@ -36,7 +36,7 @@ COACH_NAME = "Спорт Зануда"
 
 
 class Sender(Protocol):
-    async def send_text(self, chat_id: int, text: str) -> None: ...
+    async def send_text(self, chat_id: int, text: str, **kwargs) -> None: ...
     async def send_video(self, chat_id: int, path: str) -> None: ...
 
 
@@ -117,9 +117,37 @@ class ChatFlow:
         self.store.save_message(chat_id, user_name, "user", text, format_ts(dt))
         return user
 
+    async def drain_pending_replies(self, max_attempts: int = 3) -> int:
+        """Надсилає накопичені відповіді з pending_replies (наприклад після перезапуску бота)."""
+        pending = self.store.list_pending_replies(status="pending")
+        sent_count = 0
+        for item in pending:
+            if item.attempts >= max_attempts:
+                continue
+            try:
+                if item.reply_to_message_id is not None:
+                    try:
+                        await self.sender.send_text(item.chat_id, item.text, reply_to_message_id=item.reply_to_message_id)
+                    except TypeError:
+                        await self.sender.send_text(item.chat_id, item.text)
+                else:
+                    await self.sender.send_text(item.chat_id, item.text)
+
+                self.store.save_message(item.chat_id, COACH_NAME, "coach", item.text, format_ts(self.now()))
+                self.store.mark_reply_sent(item.request_id)
+                sent_count += 1
+                logger.info("Sent pending reply %s to chat %s", item.request_id, item.chat_id)
+            except Exception as e:
+                logger.warning("Failed to send pending reply %s: %s", item.request_id, e)
+                self.store.increment_reply_attempts(item.request_id, max_attempts=max_attempts)
+        return sent_count
+
     # --- головна точка входу ---
     async def process(self, chat_id: int, trigger: str = "push", job: str = "") -> None:
         async with self._lock:
+            if trigger == "startup":
+                await self.drain_pending_replies()
+
             last_ts = self.store.get_state("last_processed_timestamp") or self._yesterday_cutoff()
             last_id_raw = self.store.get_state("last_processed_id")
             last_id = int(last_id_raw) if (last_id_raw is not None and last_id_raw != "") else None

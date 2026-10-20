@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 try:
     from aiogram import Bot, Dispatcher
@@ -40,16 +41,19 @@ class TelegramSender:
     def __init__(self, bot: Bot):
         self.bot = bot
 
-    async def send_text(self, chat_id: int, text: str) -> None:
+    async def send_text(self, chat_id: int, text: str, reply_to_message_id: Optional[int] = None) -> None:
         """Спершу Markdown; якщо Telegram не розпарсив розмітку — відправляємо чистим текстом."""
         if not text:
             return
         clean = text.replace("***", "— — —")
+        kwargs = {}
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
         try:
-            await self.bot.send_message(chat_id, clean, parse_mode="Markdown")
+            await self.bot.send_message(chat_id, clean, parse_mode="Markdown", **kwargs)
         except Exception as e:
             logging.warning("Markdown send failed (%s), retrying as plain text", e)
-            await self.bot.send_message(chat_id, clean, parse_mode=None)
+            await self.bot.send_message(chat_id, clean, parse_mode=None, **kwargs)
 
     async def send_video(self, chat_id: int, path: str) -> None:
         await self.bot.send_video(chat_id, FSInputFile(path))
@@ -218,6 +222,7 @@ async def main():
     logging.info("Scheduler started (00:05 settle, 08:30, 15:00, 19:00, 23:30 Kyiv).")
 
     try:
+        await flow.drain_pending_replies()
         await flow.process(CHAT_ID, trigger="startup")
     except Exception as e:
         logging.warning("Startup processing failed: %s", e)
