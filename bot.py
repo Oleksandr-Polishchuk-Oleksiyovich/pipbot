@@ -251,6 +251,8 @@ async def main():
                               ("evening", 19, 0), ("night", 23, 30)):
         scheduler.add_job(flow.process, "cron", hour=hour, minute=minute,
                           args=[CHAT_ID], kwargs={"trigger": "timer", "job": job}, id=job)
+    scheduler.add_job(flow.check_expired_offload_requests, "interval", minutes=1,
+                      args=[CHAT_ID], id="check_offload_expiry")
     scheduler.start()
     logging.info("Scheduler started (00:05 settle, 08:30, 15:00, 19:00, 23:30 Kyiv).")
 

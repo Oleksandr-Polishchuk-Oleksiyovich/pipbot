@@ -292,3 +292,174 @@ async def test_gateway_callback_bad_hmac(test_setup):
         assert resp.status == 401
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_callback_expired_ts(test_setup):
+    """POST /callback з протермінованим timestamp повертає 401."""
+    app = test_setup["app"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        expired_ts = int(time.time()) - 400
+        payload = {
+            "contract_version": "1.0",
+            "request_id": "expired-cb-req",
+            "ts": expired_ts,
+        }
+        sig = sign_payload(payload, TEST_SECRET)
+        payload["signature"] = sig
+        resp = await client.post("/callback", json=payload)
+        assert resp.status == 401
+        data = await resp.json()
+        assert data["detail"] == "expired_ts"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_callback_valid_admin(test_setup):
+    """
+    POST /callback з admin-результатом (T-41):
+    - Оновлює offload_requests (status='done', commit_sha)
+    - Записує reply_text у pending_replies
+    - Повертає 202
+    """
+    app = test_setup["app"]
+    store: Store = test_setup["store"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        req_id = "admin-req-test-41"
+        store.create_offload_request(
+            request_id=req_id,
+            type="admin",
+            chat_id=-100777,
+            message_id=888,
+            reply_to_message_id=777,
+            author_slug="lyosha",
+            payload={"directive": "Змінити промпт"},
+            status="sent",
+        )
+
+        payload = {
+            "contract_version": "1.0",
+            "request_id": req_id,
+            "type": "admin",
+            "status": "done",
+            "commit_sha": "a1b2c3d4e5f6",
+            "reply_text": "Промпт тренера успішно оновлено! Закомічено в main.",
+            "ts": int(time.time()),
+        }
+        sig = sign_payload(payload, TEST_SECRET)
+        payload["signature"] = sig
+
+        resp = await client.post("/callback", json=payload)
+        assert resp.status == 202
+        data = await resp.json()
+        assert data["status"] == "accepted"
+        assert data["request_id"] == req_id
+
+        # Перевірка оновлення offload_requests
+        offload_req = store.get_offload_request(req_id)
+        assert offload_req is not None
+        assert offload_req.status == "done"
+        assert offload_req.commit_sha == "a1b2c3d4e5f6"
+
+        # Перевірка pending_replies
+        replies = store.list_pending_replies()
+        assert any(
+            r.request_id == f"cb_{req_id}"
+            and r.chat_id == -100777
+            and r.reply_to_message_id == 777
+            and "Промпт тренера успішно оновлено" in r.text
+            for r in replies
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_callback_idempotency(test_setup):
+    """Повторний POST /callback для того самого request_id є no-op і повертає 202 already_processed."""
+    app = test_setup["app"]
+    store: Store = test_setup["store"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        req_id = "idem-cb-001"
+        store.create_offload_request(
+            request_id=req_id,
+            type="admin",
+            chat_id=-100888,
+            message_id=999,
+            status="sent",
+        )
+
+        payload = {
+            "contract_version": "1.0",
+            "request_id": req_id,
+            "type": "admin",
+            "status": "done",
+            "commit_sha": "commit111",
+            "reply_text": "Виконано!",
+            "ts": int(time.time()),
+        }
+        sig = sign_payload(payload, TEST_SECRET)
+        payload["signature"] = sig
+
+        # Перший виклик
+        resp1 = await client.post("/callback", json=payload)
+        assert resp1.status == 202
+
+        # Перевіряємо кількість pending_replies
+        initial_replies_count = len(store.list_pending_replies())
+        assert initial_replies_count == 1
+
+        # Другий виклик (повтор/replay)
+        resp2 = await client.post("/callback", json=payload)
+        assert resp2.status == 202
+        data2 = await resp2.json()
+        assert data2.get("message") == "already_processed"
+
+        # Кількість pending_replies не повинна зрости
+        assert len(store.list_pending_replies()) == initial_replies_count
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_get_offload_status(test_setup):
+    """GET /offload/<request_id> повертає 200 зі статусом або 404 якщо не знайдено (T-42)."""
+    app = test_setup["app"]
+    store: Store = test_setup["store"]
+    client = test_utils.TestClient(test_utils.TestServer(app))
+    await client.start_server()
+    try:
+        # Невідомий request_id -> 404
+        resp404 = await client.get("/offload/unknown-offload-id")
+        assert resp404.status == 404
+
+        # Існуючий request_id -> 200
+        req_id = "status-api-req-001"
+        store.create_offload_request(
+            request_id=req_id,
+            type="admin",
+            chat_id=-100999,
+            message_id=321,
+            author_slug="sasha",
+            payload={"task": "fix bug"},
+            status="sent",
+        )
+
+        resp200 = await client.get(f"/offload/{req_id}")
+        assert resp200.status == 200
+        data = await resp200.json()
+        assert data["request_id"] == req_id
+        assert data["type"] == "admin"
+        assert data["status"] == "sent"
+        assert data["chat_id"] == -100999
+        assert data["author_slug"] == "sasha"
+        assert data["payload"] == {"task": "fix bug"}
+    finally:
+        await client.close()

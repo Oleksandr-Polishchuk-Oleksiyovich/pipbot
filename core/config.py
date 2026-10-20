@@ -23,6 +23,12 @@ GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8443"))
 DEPLOY_SCRIPT_PATH = os.getenv("DEPLOY_SCRIPT_PATH", os.path.join(BASE_DIR, "deploy", "deploy.sh"))
 DEPLOY_STATUS_DIR = os.getenv("DEPLOY_STATUS_DIR", os.path.join(os.path.dirname(DB_PATH), "deploy_status"))
 
+# Grok Bot box routine webhook offload конфігурація
+ROUTINE_WEBHOOK_URL = os.getenv("ROUTINE_WEBHOOK_URL", "")
+ROUTINE_SENDER_KEY = os.getenv("ROUTINE_SENDER_KEY", "")
+ROUTINE_SHARED_SECRET = os.getenv("ROUTINE_SHARED_SECRET", "")
+ROUTINE_TIMEOUT_SECONDS = int(os.getenv("ROUTINE_TIMEOUT_SECONDS", "900"))  # 15 хвилин за замовчуванням
+
 TIMEZONE = pytz.timezone("Europe/Kyiv")
 START_DATE = date(2026, 8, 31)
 

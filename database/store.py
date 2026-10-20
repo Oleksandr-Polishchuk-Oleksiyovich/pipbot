@@ -9,7 +9,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,23 @@ class VideoCheck:
     location: Optional[str] = None
     created_at: str = ""
     finished_at: Optional[str] = None
+
+
+@dataclass
+class OffloadRequest:
+    request_id: str
+    type: str
+    chat_id: Optional[int] = None
+    message_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None
+    author_slug: Optional[str] = None
+    payload: Optional[str] = None
+    status: str = "sent"
+    commit_sha: Optional[str] = None
+    attempts: int = 0
+    expires_at: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -191,6 +208,31 @@ def _row_to_video_check(row: Tuple) -> VideoCheck:
         location=row[15],
         created_at=row[16] or "",
         finished_at=row[17],
+    )
+
+
+_OFFLOAD_REQUEST_COLS = (
+    "request_id, type, chat_id, message_id, reply_to_message_id, "
+    "author_slug, payload, status, commit_sha, attempts, "
+    "expires_at, created_at, updated_at"
+)
+
+
+def _row_to_offload_request(row: Tuple) -> OffloadRequest:
+    return OffloadRequest(
+        request_id=row[0],
+        type=row[1],
+        chat_id=row[2],
+        message_id=row[3],
+        reply_to_message_id=row[4],
+        author_slug=row[5],
+        payload=row[6],
+        status=row[7],
+        commit_sha=row[8],
+        attempts=row[9],
+        expires_at=row[10],
+        created_at=row[11] or "",
+        updated_at=row[12] or "",
     )
 
 
@@ -304,6 +346,22 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_video_checks_status ON video_checks(status);
                 CREATE INDEX IF NOT EXISTS idx_video_checks_file_unique_id ON video_checks(file_unique_id);
+                CREATE TABLE IF NOT EXISTS offload_requests (
+                    request_id          TEXT PRIMARY KEY,
+                    type                TEXT NOT NULL,
+                    chat_id             INTEGER,
+                    message_id          INTEGER,
+                    reply_to_message_id INTEGER,
+                    author_slug         TEXT,
+                    payload             TEXT,
+                    status              TEXT NOT NULL DEFAULT 'sent',
+                    commit_sha          TEXT,
+                    attempts            INTEGER DEFAULT 0,
+                    expires_at          TIMESTAMP,
+                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_offload_requests_status ON offload_requests(status);
             """)
 
     # --- USERS ---
@@ -861,6 +919,131 @@ class Store:
         with self._connect() as con:
             rows = con.execute(query, params).fetchall()
         return [_row_to_video_check(r) for r in rows]
+
+    # --- OFFLOAD REQUESTS ---
+    def create_offload_request(
+        self,
+        request_id: str,
+        type: str,
+        chat_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+        author_slug: Optional[str] = None,
+        payload: Optional[Union[str, dict]] = None,
+        status: str = "sent",
+        commit_sha: Optional[str] = None,
+        expires_at: Optional[Union[str, datetime]] = None,
+    ) -> OffloadRequest:
+        payload_str = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else payload
+        expires_at_str = (
+            expires_at.strftime(TS_FORMAT) if isinstance(expires_at, datetime) else expires_at
+        )
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO offload_requests (
+                    request_id, type, chat_id, message_id, reply_to_message_id,
+                    author_slug, payload, status, commit_sha, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                ON CONFLICT(request_id) DO NOTHING
+                """,
+                (
+                    request_id,
+                    type,
+                    chat_id,
+                    message_id,
+                    reply_to_message_id,
+                    author_slug,
+                    payload_str,
+                    status,
+                    commit_sha,
+                    expires_at_str,
+                ),
+            )
+        req = self.get_offload_request(request_id)
+        if req is None:
+            raise RuntimeError(f"Failed to create or retrieve offload_request for request_id={request_id}")
+        return req
+
+    def get_offload_request(self, request_id: str) -> Optional[OffloadRequest]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {_OFFLOAD_REQUEST_COLS} FROM offload_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return _row_to_offload_request(row) if row else None
+
+    def update_offload_request(
+        self,
+        request_id: str,
+        *,
+        status: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        attempts: Optional[int] = None,
+        expires_at: Optional[Union[str, datetime]] = None,
+        payload: Optional[Union[str, dict]] = None,
+    ) -> None:
+        updates: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if commit_sha is not None:
+            updates.append("commit_sha = ?")
+            params.append(commit_sha)
+        if attempts is not None:
+            updates.append("attempts = ?")
+            params.append(attempts)
+        if expires_at is not None:
+            expires_at_str = (
+                expires_at.strftime(TS_FORMAT) if isinstance(expires_at, datetime) else expires_at
+            )
+            updates.append("expires_at = ?")
+            params.append(expires_at_str)
+        if payload is not None:
+            updates.append("payload = ?")
+            params.append(json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else payload)
+
+        updates.append("updated_at = datetime('now')")
+        if not updates:
+            return
+        params.append(request_id)
+
+        with self._connect() as con:
+            con.execute(
+                f"UPDATE offload_requests SET {', '.join(updates)} WHERE request_id = ?",
+                tuple(params),
+            )
+
+    def list_offload_requests(self, status: Optional[str] = None) -> List[OffloadRequest]:
+        query = f"SELECT {_OFFLOAD_REQUEST_COLS} FROM offload_requests"
+        params: tuple = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY created_at ASC"
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [_row_to_offload_request(r) for r in rows]
+
+    def get_expired_offload_requests(
+        self, now_ts: Optional[Union[str, datetime]] = None
+    ) -> List[OffloadRequest]:
+        if now_ts is None:
+            now_str = datetime.now().strftime(TS_FORMAT)
+        elif isinstance(now_ts, datetime):
+            now_str = now_ts.strftime(TS_FORMAT)
+        else:
+            now_str = str(now_ts)
+
+        query = (
+            f"SELECT {_OFFLOAD_REQUEST_COLS} FROM offload_requests "
+            "WHERE status IN ('sent', 'acked') AND expires_at IS NOT NULL AND expires_at < ? "
+            "ORDER BY created_at ASC"
+        )
+        with self._connect() as con:
+            rows = con.execute(query, (now_str,)).fetchall()
+        return [_row_to_offload_request(r) for r in rows]
 
 
 def format_ts(dt: datetime) -> str:

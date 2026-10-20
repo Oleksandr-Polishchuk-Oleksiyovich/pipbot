@@ -284,6 +284,41 @@ class ChatFlow:
                 self.store.increment_reply_attempts(item.request_id, max_attempts=max_attempts)
         return sent_count
 
+    async def check_expired_offload_requests(self, default_chat_id: Optional[int] = None) -> List[str]:
+        """
+        T-42: Періодична перевірка прострочених offload_requests.
+        Знаходить записи зі статусом 'sent' або 'acked', у яких expires_at < now.
+        Позначає їх як 'expired' та повідомляє користувача у persona-стилі.
+        """
+        expired = self.store.get_expired_offload_requests(now_ts=self.now())
+        if not expired:
+            return []
+
+        expired_ids: List[str] = []
+        for req in expired:
+            self.store.update_offload_request(req.request_id, status="expired")
+            expired_ids.append(req.request_id)
+            logger.info("Marked offload request %s as expired", req.request_id)
+
+            if req.type == "video":
+                notice = (
+                    "⏱️ **Час очікування аналізу відео вичерпано.**\n"
+                    "Сервер обробки не відповів вчасно. Будь ласка, надішліть відео повторно "
+                    "або повідомте тренера!"
+                )
+            else:
+                notice = (
+                    f"⚠️ **Запит на зміну конфігурації (ID: `{req.request_id}`) прострочено.**\n"
+                    "Grok Box не відповів за виділений ліміт часу. Спробуйте повторити запит пізніше."
+                )
+
+            target_chat = req.chat_id or default_chat_id
+            if target_chat is not None:
+                reply_to_id = req.reply_to_message_id or req.message_id
+                await self._say_reply(target_chat, notice, reply_to_message_id=reply_to_id)
+
+        return expired_ids
+
     # --- головна точка входу ---
     async def process(self, chat_id: int, trigger: str = "push", job: str = "") -> None:
         async with self._lock:
@@ -305,7 +340,10 @@ class ChatFlow:
                 self.store.set_state("last_processed_id", str(pending[-1].id))
 
             if trigger == "timer":
-                await self._handle_timer(chat_id, job)
+                if job == "offload_expiry":
+                    await self.check_expired_offload_requests(chat_id)
+                else:
+                    await self._handle_timer(chat_id, job)
 
     async def _handle_pending(self, chat_id: int, pending: List[ChatMessage]) -> None:
         today_iso = self.now().date().isoformat()

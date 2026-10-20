@@ -241,6 +241,9 @@ async def handle_post_callback(request: web.Request) -> web.Response:
     """
     POST /callback
     Contract 8.2: box / worker -> gateway /callback
+    Handles both 'video' and 'admin' results with HMAC validation,
+    idempotency by request_id, updates to offload_requests/video_checks,
+    and pending_replies storage for user-facing responses.
     """
     try:
         data = await request.json()
@@ -266,33 +269,98 @@ async def handle_post_callback(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized", "detail": reason}, status=401)
 
     store: Store = request.app[STORE_KEY]
+    offload_req = store.get_offload_request(request_id)
+    video_check = store.get_video_check(request_id)
+
+    # Idempotency check: якщо запит уже завершений (done / failed / expired)
+    if offload_req and offload_req.status in ("done", "failed"):
+        logger.info("Idempotent duplicate callback for offload request %s (status=%s)", request_id, offload_req.status)
+        return web.json_response(
+            {"status": "accepted", "request_id": request_id, "message": "already_processed"},
+            status=202,
+        )
+    if video_check and video_check.status in ("done", "failed") and not offload_req:
+        logger.info("Idempotent duplicate callback for video check %s (status=%s)", request_id, video_check.status)
+        return web.json_response(
+            {"status": "accepted", "request_id": request_id, "message": "already_processed"},
+            status=202,
+        )
+
     status_val = data.get("status", "done")
     result = data.get("result", {})
-
-    # Оновлення таблиці video_checks якщо це відео-результат
-    if data.get("type") == "video" or (isinstance(result, dict) and "exercise" in result):
-        store.update_video_check(
-            request_id,
-            status=status_val,
-            exercise=result.get("exercise"),
-            reps=result.get("reps"),
-            confidence=result.get("confidence"),
-            flags=result.get("flags"),
-            valid=result.get("valid"),
-            analyzer_version=result.get("analyzer_version"),
-            finished=True,
-        )
-
-    # Якщо надано reply_text — зберігаємо в pending_replies
+    commit_sha = data.get("commit_sha")
     reply_text = data.get("reply_text")
-    check = store.get_video_check(request_id)
-    if reply_text and check:
-        store.add_pending_reply(
-            request_id=f"cb_{request_id}",
-            chat_id=check.chat_id,
-            text=str(reply_text),
-            reply_to_message_id=check.message_id,
-        )
+
+    # Визначення типу callback: video або admin
+    req_type = data.get("type")
+    if not req_type:
+        if offload_req:
+            req_type = offload_req.type
+        elif (isinstance(result, dict) and "exercise" in result) or video_check:
+            req_type = "video"
+        else:
+            req_type = "admin"
+
+    if req_type == "video":
+        # Оновлення таблиці video_checks
+        if video_check or (isinstance(result, dict) and "exercise" in result):
+            store.update_video_check(
+                request_id,
+                status=status_val,
+                exercise=result.get("exercise") if isinstance(result, dict) else None,
+                reps=result.get("reps") if isinstance(result, dict) else None,
+                confidence=result.get("confidence") if isinstance(result, dict) else None,
+                flags=result.get("flags") if isinstance(result, dict) else None,
+                valid=result.get("valid") if isinstance(result, dict) else None,
+                analyzer_version=result.get("analyzer_version") if isinstance(result, dict) else None,
+                finished=True,
+            )
+
+        if offload_req:
+            store.update_offload_request(request_id, status=status_val, commit_sha=commit_sha)
+
+        # Якщо надано reply_text — зберігаємо в pending_replies
+        if reply_text:
+            check = store.get_video_check(request_id)
+            chat_id = check.chat_id if check else (offload_req.chat_id if offload_req else data.get("chat_id"))
+            reply_to = check.message_id if check else (
+                offload_req.reply_to_message_id or offload_req.message_id if offload_req else data.get("reply_to_message_id")
+            )
+            if chat_id is not None:
+                store.add_pending_reply(
+                    request_id=f"cb_{request_id}",
+                    chat_id=int(chat_id),
+                    text=str(reply_text),
+                    reply_to_message_id=int(reply_to) if reply_to is not None else None,
+                )
+
+    else:
+        # req_type == "admin"
+        if offload_req:
+            store.update_offload_request(request_id, status=status_val, commit_sha=commit_sha)
+        else:
+            store.create_offload_request(
+                request_id=request_id,
+                type="admin",
+                chat_id=data.get("chat_id"),
+                message_id=data.get("message_id"),
+                reply_to_message_id=data.get("reply_to_message_id"),
+                status=status_val,
+                commit_sha=commit_sha,
+            )
+
+        if reply_text:
+            chat_id = data.get("chat_id") or (offload_req.chat_id if offload_req else None)
+            reply_to = data.get("reply_to_message_id") or (
+                offload_req.reply_to_message_id or offload_req.message_id if offload_req else None
+            )
+            if chat_id is not None:
+                store.add_pending_reply(
+                    request_id=f"cb_{request_id}",
+                    chat_id=int(chat_id),
+                    text=str(reply_text),
+                    reply_to_message_id=int(reply_to) if reply_to is not None else None,
+                )
 
     # Якщо підключено flow callback — запускаємо його
     flow_cb = request.app.get(FLOW_CALLBACK_KEY)
@@ -305,6 +373,44 @@ async def handle_post_callback(request: web.Request) -> web.Response:
             logger.error("Error executing flow_callback for %s: %s", request_id, e)
 
     return web.json_response({"status": "accepted", "request_id": request_id}, status=202)
+
+
+async def handle_get_offload_status(request: web.Request) -> web.Response:
+    """
+    GET /offload/<request_id>
+    Повертає поточний стан офлоад-запиту з таблиці offload_requests.
+    """
+    request_id = request.match_info.get("request_id", "")
+    store: Store = request.app[STORE_KEY]
+    offload_req = store.get_offload_request(request_id)
+    if not offload_req:
+        return web.json_response({"error": "not_found", "request_id": request_id}, status=404)
+
+    payload_data = None
+    if offload_req.payload:
+        try:
+            payload_data = json.loads(offload_req.payload)
+        except Exception:
+            payload_data = offload_req.payload
+
+    return web.json_response(
+        {
+            "request_id": offload_req.request_id,
+            "type": offload_req.type,
+            "status": offload_req.status,
+            "commit_sha": offload_req.commit_sha,
+            "attempts": offload_req.attempts,
+            "chat_id": offload_req.chat_id,
+            "message_id": offload_req.message_id,
+            "reply_to_message_id": offload_req.reply_to_message_id,
+            "author_slug": offload_req.author_slug,
+            "payload": payload_data,
+            "expires_at": offload_req.expires_at,
+            "created_at": offload_req.created_at,
+            "updated_at": offload_req.updated_at,
+        },
+        status=200,
+    )
 
 
 def create_app(
@@ -329,6 +435,7 @@ def create_app(
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_post("/deploy", handle_post_deploy)
     app.router.add_get("/deploy/{request_id}", handle_get_deploy_status)
+    app.router.add_get("/offload/{request_id}", handle_get_offload_status)
     app.router.add_post("/callback", handle_post_callback)
 
     return app
