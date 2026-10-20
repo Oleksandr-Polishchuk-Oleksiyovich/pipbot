@@ -26,3 +26,12 @@ __pycache__/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# plan artifacts
+optionToConsider/cv_test/.venv/
+optionToConsider/cv_test/videos/
+*.task
+*.mov
+*.mp4
+*.db
+.env

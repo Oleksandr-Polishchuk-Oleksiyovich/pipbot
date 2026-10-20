@@ -1,0 +1,99 @@
+# MediaPipe limits benchmark (2026-10-20)
+Setup: `cv_test/rep_counter.py` via `bench.py`, lite model (full only as sanity column), `taskset` 2 cores, 4 videos in parallel on an 8-core box (timings ±30% noisy). fps = target sampling (step = round(src/target), so 30→20 gives effective 15 on 30fps sources). Resolution = `max_side` (LONG side). Scratch: `/workspace/cvbench` (logs `log_*.jsonl`, contact sheets `sheets/`). Exercise identified from keyframes.
+
+| Video | Exercise (visual) | Dur | Native fps / res | Baseline lite (full) | Min stable fps | fps where changed | Min stable res (long side) | Res where changed | Fastest OK time / config | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| TCS52R .mp4 | pushups, front camera | 42.8 s | 25 / 592x1280 | none 0 (full: squat 29) | 10 | 8 → squat 16 | 720 | 640 → pushup 10 | 9.0–10 s, 10fps/720 | Baseline WRONG: front-facing pushups not recognised |
+| VX8JN6 .mp4 | squats, side view | 93.3 s | 24.9 / 592x1280 | squat 46 (45) | 20 (eff. 25) | 15 (eff. 12.5) → 44 | 1280 (native) | 960 → 48 | 40.1 s, native | Unstable ±2 reps |
+| WBYCSB .mp4 | squats, high/rear camera | 82.7 s | 30 / 1280x720 | squat 21 (full 8) | 20 (eff. 30) | 15 → 18 | 1280 (native) | 960 → 18 | 39.5 s, native | Baseline unreliable (lite≠full), bad camera angle |
+| WZCRRZ .mov | pushups, front camera | 42.1 s | 30 / 1072x1920 | squat 13 (full 7) | 20 (eff. 30) | 15 → 19 | 1280 | 960 → 17 | 23.8 s, native | Baseline WRONG: classified as squat |
+| 123TYQS .mov | pushups, front camera | 112.7 s | 30 / 1072x1920 | squat 57 (56) | 30 (native) | 20 (eff. 15) → 33 | 1920 (native) | 1280 → 52 | 89.9 s, native | Labelled squat; count may be plausible but untrusted |
+| 1247W .mp4 | squats, side view | 75.4 s | 120 / 592x1280 | squat 50 (49) | 12 (eff. 12) | 10 → 49 | 400 | 320 → 51 | ~16.5 s, 12fps/640 | Only clean case; robust |
+| Q80ZAQ .mp4 | junk (person sitting) | 1.9 s | 10 / 480x480 | squat 1 (1) | 3 | – | 96 | – | 0.4 s, 3fps/any | FALSE POSITIVE squat 1 → needs min-duration gate |
+| VC2PWP .mp4 | junk (meme face) | 3.2 s | 10 / 640x640 | none 0 | 3 | – | 96 | – | 0.5 s, 3fps/≤720 | Correct none |
+| RZE8 .mp4 | junk (game cutscene) | 10.0 s | 24 / 1280x720 | none 0 | 3 | – | 96 | – | ~1.7–2.6 s, 3fps/low | Correct none |
+
+## Conclusions
+- Only side-view squats (1247W, and old video 1) are stable down to ~10-12 fps / 256-400 px. Front-camera pushups are misclassified (squat/none) and change count at every step → classifier/angle logic for pushups must be fixed before any fps/res tuning.
+- Junk: 3 fps / 128 px is enough to reject; add duration <5 s gate (Q80ZAQ false rep).
+- Recommendation for e2-micro: lite, 12 fps, long side 480 (≈0.3–0.4× realtime on 2 cores); for gate pass 3 fps/160 px.
+
+## Sequential re-run: 1247W, decode vs inference (2026-10-20 ~20:15 Europe/Kiev)
+Strictly sequential, `taskset -c 0,1`, lite model, script `/workspace/cvbench/split.py`. Note: the file is VFR, container says 120 fps but real ≈29.6 fps (2235 frames). OpenCV reports ≈29.6, so step = round(29.6/target): 30 and 20 → every frame (29.6), 15 and 12 → 14.8, 10 → 9.9. The ffmpeg path uses `fps=<same effective fps>` + `scale=…:flags=area` → rawvideo rgb24 pipe (`-threads 2`).
+
+| Config (target → eff. fps / long side) | cv2 decode s | cv2 infer s | cv2 total s | cv2 reps | ffmpeg decode s | ffmpeg infer s | ffmpeg total s | ffmpeg reps |
+|---|---|---|---|---|---|---|---|---|
+| native (29.6) / 1280 | 2.6 | 24.1 | 26.9 | 50 | 12.9* | 100.9* | 114.5* | 50 |
+| 30 → 29.6 / 1280 | 2.6 | 23.8 | 26.5 | 50 | 4.1 | 27.5 | 31.9 | 51 |
+| 20 → 29.6 / 1280 | 2.6 | 23.0 | 25.7 | 50 | 3.9 | 26.2 | 30.3 | 51 |
+| 15 → 14.8 / 1280 | 3.1 | 11.8 | 14.9 | 50 | 2.0 | 12.7 | 14.8 | 50 |
+| 12 → 14.8 / 1280 | 2.8 | 11.8 | 14.6 | 50 | 2.1 | 13.5 | 15.7 | 50 |
+| 10 → 9.9 / 1280 | 2.5 | 7.8 | 10.3 | 49 | 1.4 | 9.0 | 10.5 | 50 |
+| 12 → 14.8 / 640 | 2.6 | 10.8 | 13.5 | 50 | 0.4 | 12.6 | 13.2 | 50 |
+| 12 → 14.8 / 480 | 4.0 | 11.2 | 15.2 | 50 | 0.3 | 12.0 | 12.5 | 50 |
+| 12 → 14.8 / 400 | 5.1 | 11.3 | 16.4 | 51 | 0.2 | 12.8 | 13.3 | 51 |
+\* ffmpeg without a filter emits CFR 120 fps (9046 duplicated frames), so the native ffmpeg row is an artifact.
+
+Findings: the 60.7 s at 20 fps in the parallel run was CPU contention; sequentially it takes 25.7 s. Inference time is ~0.010–0.011 s/frame and barely depends on input resolution (the lite model rescales internally to 256), so the only real lever is the number of frames (fps). Decode is a small share (≤ 5 s). With ffmpeg the decode for scaled input drops to 0.2–0.4 s (in cv2 the resize costs more than it saves). Overall ffmpeg gains only ~1–2.5 s at 12 fps/≤640.
+
+## Sequential (strict, taskset -c 0,1, lite, 3 runs per point, median and min–max)
+
+### VX8JN6 (squats, side view, 93.3 s, VFR)
+The container reports 24.9 fps, but OpenCV reads 2741 frames (≈29.4 fps real), while ffmpeg without a filter outputs CFR 24.9 (2325 frames, drops some). That is why the native baseline differs: cv2 46, ffmpeg 47. Each sweep stops at the first point where reps change.
+
+| target fps / side | eff fps | side | method | decode s (med) | infer s (med) | total s med (min–max) | reps ×3 |
+|---|---|---|---|---|---|---|---|
+| native / native | 29.4 | native | cv2 | 3.1 | 27.6 | 30.9 (30.8–31.3) | 46/46/46 |
+| 15 / native | 14.7 | native | cv2 | 3.3 | 14.1 | 17.4 (17.4–17.6) | 44/44/44 |
+| native / 1280 | 29.4 | 1280 | cv2 | 2.9 | 27.3 | 30.4 (30.0–30.5) | 46/46/46 |
+| native / 960 | 29.4 | 960 | cv2 | 9.2 | 26.4 | 35.7 (34.5–35.8) | 48/48/48 |
+| native / native | 24.9 | native | ffmpeg | 3.6 | 25.1 | 28.9 (28.7–29.4) | 47/47/47 |
+| native / 1280 | 24.9 | 1280 | ffmpeg | 3.7 | 25.2 | 29.2 (29.1–29.5) | 47/47/47 |
+| 15 / native | 14.7 | native | ffmpeg | 2.5 | 16.1 | 18.7 (18.1–18.9) | 43/43/43 |
+| native / 960 | 24.9 | 960 | ffmpeg | 2.1 | 27.8 | 30.5 (28.3–30.6) | 45/45/45 |
+
+1247W:
+
+| target fps / side | eff fps | side | method | decode s (med) | infer s (med) | total s med (min–max) | reps ×3 |
+|---|---|---|---|---|---|---|---|
+| 12 / 640 | 14.8 | 640 | cv2 | 2.5 | 10.6 | 13.1 (12.9–13.1) | 50/50/50 |
+| 12 / 480 | 14.8 | 480 | cv2 | 4.2 | 11.4 | 15.6 (14.0–260.1) | 50/50/50 |
+| 12 / 640 | 14.8 | 640 | ffmpeg | 0.4 | 12.9 | 13.5 (13.4–14.2) | 50/50/50 |
+| 12 / 480 | 14.8 | 480 | ffmpeg | 0.3 | 12.2 | 12.7 (12.6–12.8) | 50/50/50 |
+
+Boundary: fps is unstable already at 15 (eff. 14.7): cv2 46→44, ffmpeg 47→43. Resolution: 1280 OK, 960 changes (cv2 →48, ffmpeg →45). Fastest correct: ffmpeg native/native 28.9 s (count 47); for cv2 (=46) native/1280 30.4 s. This video does not tolerate downsampling: unstable within ±2–4 reps; ground truth is unknown.
+1247W 1 of 3 cv2 12/480 runs took an outlier of 260.1 s (a stall on the box); the median is 15.6 s. Medians: ffmpeg 12/480 = 12.7 s is the fastest; spreads are ≤1 s, so a 0.5–1 s difference between the configs is at the noise level.
+
+### WBYCSB (squats, camera top/back, 82.7 s, CFR 30 fps, 1280x720)
+Full model native ×1: cv2 8 reps (35.2 s: decode 2.9 / infer 32.2), ffmpeg 8 reps (40.2 s: decode 4.7 / infer 35.3).
+
+| target fps | eff fps | side | method | decode s | infer s | total s med (min–max) | reps ×3 |
+|---|---|---|---|---|---|---|---|
+| native | 30.0 | native | cv2 | 2.9 | 26.1 | 29.1 (28.4–29.7) | 21/21/21 |
+| 15 | 15.0 | native | cv2 | 3.6 | 12.9 | 16.6 (16.3–16.8) | 18/18/18 |
+| native | 30.0 | 1280 | cv2 | 2.9 | 24.9 | 27.9 (27.9–28.5) | 21/21/21 |
+| native | 30.0 | 960 | cv2 | 10.6 | 26.0 | 36.7 (36.1–37.2) | 18/18/18 |
+| native | 30.0 | native | ffmpeg | 5.0 | 29.3 | 34.6 (32.9–34.6) | 21/21/21 |
+| 15 | 15.0 | native | ffmpeg | 2.5 | 14.7 | 17.3 (16.9–17.5) | 19/19/19 |
+| native | 30.0 | 1280 | ffmpeg | 4.7 | 28.1 | 33.0 (32.3–34.0) | 21/21/21 |
+| native | 30.0 | 960 | ffmpeg | 1.6 | 27.6 | 30.1 (29.6–31.6) | 19/19/19 |
+
+Boundary: fps 15 → 18 (cv2) / 19 (ffmpeg); side 960 → 18/19. Formally the fastest correct (=lite baseline 21) is cv2 native/1280 at 27.9 s. BUT baseline is unreliable: lite 21 vs full 8, a factor of ~2.6; the true count is unknown. The top/back camera angle is unsuitable for counting, so treat it as "ask to re-record" rather than a tuning case.
+
+### TCS52R (pushups, front camera, 42.8 s, 25 fps, 592x1280)
+rep_counter has no exercise override → a copy `/workspace/cvbench/rc_force.py` with env `FORCE_EX=pushup` (the bot code is untouched). Each run computes both modes on the same landmarks. Sweep criterion = forced-pushup count. Times are median of 3 (spread ≤1.5 s); counts were identical across all 3 runs.
+
+| config | eff fps | side | method | total s med | auto (ex / reps) | forced pushup reps (peaks) |
+|---|---|---|---|---|---|---|
+| full, native | 25.0 | native | cv2 | 14.9 (×1) | squat 29 | 18 (29) |
+| full, native | 25.0 | native | ffmpeg | 16.2 (×1) | squat 29 | 18 (29) |
+| native | 25.0 | native | cv2 | 12.3 | none 0 | 5 (10) |
+| 15 | 12.5 | native | cv2 | 6.8 | none 0 | **7** (10) |
+| native | 25.0 | 1280 | cv2 | 11.5 | none 0 | 5 (10) |
+| native | 25.0 | 960 | cv2 | 14.3 | squat 22 | **10** (15) |
+| native | 25.0 | native | ffmpeg | 13.3 | none 0 | 5 (10) |
+| 15 | 12.5 | native | ffmpeg | 7.2 | none 0 | **6** (9) |
+| native | 25.0 | 1280 | ffmpeg | 13.7 | none 0 | 5 (10) |
+| native | 25.0 | 960 | ffmpeg | 13.4 | squat 28 | **6** (10) |
+
+Boundary: forced-pushup count changes already at 15 fps and at 960. Lite gives 5, full gives 18, peaks range 9–29 → no stable baseline; the "fastest correct" config is undefined. From a front camera the elbow angle is foreshortened and lite barely tracks it. Pushups need a side camera, or a different signal (e.g. vertical motion of shoulders/nose) — that is logic work, not fps/res tuning. Ground truth needs a manual count.

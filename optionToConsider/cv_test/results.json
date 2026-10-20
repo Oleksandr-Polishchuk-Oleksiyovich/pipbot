@@ -1,0 +1,91 @@
+[
+  {
+    "file": "01M5CZNMND14ESWWE462ZV1FJB.mov",
+    "duration_s": 154.2,
+    "fps": 29.97,
+    "resolution": "720x1280",
+    "rotation": 0,
+    "frames": 4622,
+    "exercise": "squat",
+    "torso_angle_median": 60.7,
+    "side": "left",
+    "reps": 50,
+    "partial_reps": 0,
+    "peak_count": 50,
+    "thresholds": [
+      110,
+      160
+    ],
+    "angle_range": [
+      31.4,
+      179.6
+    ],
+    "pose_detected_frac": 1.0,
+    "angle_valid_frac": 1.0,
+    "confidence": "high",
+    "notes": [],
+    "plot": "/workspace/pipbot/optionToConsider/cv_test/plots/01M5CZNMND14ESWWE462ZV1FJB_angle.png",
+    "processing_s": 78.8
+  },
+  {
+    "file": "01M5CZR0CBCTX2C2HSQVV33CMB.mp4",
+    "duration_s": 3.2,
+    "fps": 10.0,
+    "resolution": "640x640",
+    "rotation": 0,
+    "frames": 32,
+    "exercise": "squat",
+    "torso_angle_median": 88.4,
+    "side": "left",
+    "reps": 0,
+    "partial_reps": 0,
+    "peak_count": 0,
+    "thresholds": [
+      110,
+      160
+    ],
+    "angle_range": [
+      3.9,
+      179.2
+    ],
+    "pose_detected_frac": 1.0,
+    "angle_valid_frac": 0.0,
+    "confidence": "low",
+    "notes": [
+      "joint visibility <0.3 in most frames; using ungated landmarks (occluded/out-of-frame joints)"
+    ],
+    "plot": "/workspace/pipbot/optionToConsider/cv_test/plots/01M5CZR0CBCTX2C2HSQVV33CMB_angle.png",
+    "processing_s": 1.0
+  },
+  {
+    "file": "01M5CZR0CJ9PP1SJ747JEDED7Q.mp4",
+    "duration_s": 10.01,
+    "fps": 24.0,
+    "resolution": "1280x720",
+    "rotation": 0,
+    "frames": 240,
+    "exercise": "squat",
+    "torso_angle_median": 81.8,
+    "side": "right",
+    "reps": 3,
+    "partial_reps": 0,
+    "peak_count": 2,
+    "thresholds": [
+      134.3,
+      161.0
+    ],
+    "angle_range": [
+      110.9,
+      177.7
+    ],
+    "pose_detected_frac": 0.521,
+    "angle_valid_frac": 0.504,
+    "confidence": "medium",
+    "notes": [
+      "signal range 111-178 deg does not span default thresholds 110/160; adapted to 134/161",
+      "peak count (2) differs from hysteresis count (3)"
+    ],
+    "plot": "/workspace/pipbot/optionToConsider/cv_test/plots/01M5CZR0CJ9PP1SJ747JEDED7Q_angle.png",
+    "processing_s": 4.0
+  }
+]
