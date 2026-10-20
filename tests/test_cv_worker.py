@@ -203,14 +203,14 @@ def test_cv_worker_config_and_analyzer_parameters(tmp_path):
         downloader=lambda t, f, dest: open(dest, "wb").write(b"video"),
         analyzer=mock_analyzer,
     )
-    assert worker.target_fps == 12
+    assert worker.target_fps == 15
     assert worker.max_side == 480
     assert worker.model == "lite"
 
     claimed = worker.claim_one()
     worker.process_one(claimed)
 
-    assert captured_kwargs["target_fps"] == 12
+    assert captured_kwargs["target_fps"] == 15
     assert captured_kwargs["max_side"] == 480
     assert captured_kwargs["model"] == "lite"
     assert captured_kwargs["request_id"] == "req-cfg"

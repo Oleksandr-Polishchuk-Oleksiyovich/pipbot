@@ -24,7 +24,7 @@ DEPLOY_SCRIPT_PATH = os.getenv("DEPLOY_SCRIPT_PATH", os.path.join(BASE_DIR, "dep
 DEPLOY_STATUS_DIR = os.getenv("DEPLOY_STATUS_DIR", os.path.join(os.path.dirname(DB_PATH), "deploy_status"))
 
 # CV Worker конфігурація (Phase 3 / mediapipe_limits Sequential benchmark)
-CV_TARGET_FPS = int(os.getenv("CV_TARGET_FPS", "12"))
+CV_TARGET_FPS = int(os.getenv("CV_TARGET_FPS", "15"))
 CV_MAX_SIDE = int(os.getenv("CV_MAX_SIDE", "480"))
 CV_MODEL = os.getenv("CV_MODEL", "lite")
 

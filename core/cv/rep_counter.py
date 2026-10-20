@@ -39,7 +39,7 @@ except ImportError:
     find_peaks = None
     savgol_filter = None
 
-DEFAULT_CFG = dict(target_fps=12, max_side=480, model="lite")
+DEFAULT_CFG = dict(target_fps=15, max_side=640, model="lite")
 # landmark ids: (shoulder, elbow, wrist, hip, knee, ankle)
 SIDES = {"left": (11, 13, 15, 23, 25, 27), "right": (12, 14, 16, 24, 26, 28)}
 DEFAULTS = {"pushup": (100, 150), "squat": (110, 160)}
@@ -192,6 +192,11 @@ def analyze_video(
             logger.warning("Target fps %s is below 10 fps: high risk of undercounting reps", target_fps)
     if max_side is not None:
         cfg["max_side"] = max_side
+    # Якість важливіша за швидкість: fps не нижче 12, довга сторона 480-720
+    if cfg["target_fps"] < 12:
+        logger.warning("Target fps %s raised to minimum 12", cfg["target_fps"])
+        cfg["target_fps"] = 12
+    cfg["max_side"] = min(720, max(480, int(cfg["max_side"])))
     if model is not None:
         cfg["model"] = model
 
@@ -291,8 +296,8 @@ def _run_pose(
     path: str,
     meta: dict,
     model_path: str,
-    target_fps: int = 12,
-    max_side: int = 480,
+    target_fps: int = 15,
+    max_side: int = 640,
     model: str = "lite",
 ) -> Tuple[Any, Any, float]:
     """Runs pose landmarker: tries ffmpeg pre-decode first; falls back to cv2.VideoCapture."""
@@ -310,8 +315,8 @@ def _run_pose_ffmpeg(
     path: str,
     meta: dict,
     model_path: str,
-    target_fps: int = 12,
-    max_side: int = 480,
+    target_fps: int = 15,
+    max_side: int = 640,
 ) -> Optional[Tuple[Any, Any, float]]:
     orig_w = meta.get("width", 640)
     orig_h = meta.get("height", 480)
@@ -368,8 +373,8 @@ def _run_pose_cv2(
     path: str,
     meta: dict,
     model_path: str,
-    target_fps: int = 12,
-    max_side: int = 480,
+    target_fps: int = 15,
+    max_side: int = 640,
 ) -> Tuple[Any, Any, float]:
     cap = cv2.VideoCapture(path)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or meta.get("fps", 25.0)
