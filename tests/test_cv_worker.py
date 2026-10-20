@@ -169,3 +169,48 @@ def test_cv_worker_process_one_error_handling(tmp_path):
     # 3. Тимчасовий файл все одно прибрано
     assert len(observed_files) == 1
     assert not os.path.exists(observed_files[0])
+
+
+def test_cv_worker_config_and_analyzer_parameters(tmp_path):
+    """Тест конфігурації CV worker: default ~12 fps, 480px, lite model передаються в analyzer."""
+    store = Store(str(tmp_path / "cv.db"))
+    store.init_schema()
+
+    vc = store.create_video_check(
+        request_id="req-cfg",
+        chat_id=-100,
+        message_id=40,
+        user_slug="lyosha",
+        file_id="fid_cfg",
+    )
+
+    captured_kwargs = {}
+
+    def mock_analyzer(path, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {
+            "exercise": "pushup",
+            "reps": 30,
+            "confidence": 0.9,
+            "flags": [],
+            "valid": True,
+        }
+
+    # Worker із дефолтним конфігом
+    worker = CVWorker(
+        store=store,
+        bot_token="fake_token",
+        downloader=lambda t, f, dest: open(dest, "wb").write(b"video"),
+        analyzer=mock_analyzer,
+    )
+    assert worker.target_fps == 12
+    assert worker.max_side == 480
+    assert worker.model == "lite"
+
+    claimed = worker.claim_one()
+    worker.process_one(claimed)
+
+    assert captured_kwargs["target_fps"] == 12
+    assert captured_kwargs["max_side"] == 480
+    assert captured_kwargs["model"] == "lite"
+    assert captured_kwargs["request_id"] == "req-cfg"

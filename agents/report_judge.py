@@ -99,6 +99,13 @@ class ReportJudgeAgent(PromptAgent):
         """
         flags_set = set(fact.flags)
 
+        if "low_camera_angle" in flags_set or "unreliable_camera_angle" in flags_set:
+            return VideoVerdict(
+                done=False,
+                reason="Ненадійний ракурс камери: зйомка знизу/з підлоги",
+                category="low_camera_angle",
+            )
+
         if (
             fact.confidence < 0.6
             or "low_body_visibility" in flags_set

@@ -9,6 +9,7 @@ import os
 import subprocess
 import time
 import uuid
+import warnings
 from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ except ImportError:
     find_peaks = None
     savgol_filter = None
 
-DEFAULT_CFG = dict(target_fps=8, max_side=256, model="lite")
+DEFAULT_CFG = dict(target_fps=12, max_side=480, model="lite")
 # landmark ids: (shoulder, elbow, wrist, hip, knee, ankle)
 SIDES = {"left": (11, 13, 15, 23, 25, 27), "right": (12, 14, 16, 24, 26, 28)}
 DEFAULTS = {"pushup": (100, 150), "squat": (110, 160)}
@@ -187,6 +188,8 @@ def analyze_video(
     cfg = dict(DEFAULT_CFG)
     if target_fps is not None:
         cfg["target_fps"] = target_fps
+        if target_fps < 10:
+            logger.warning("Target fps %s is below 10 fps: high risk of undercounting reps", target_fps)
     if max_side is not None:
         cfg["max_side"] = max_side
     if model is not None:
@@ -210,7 +213,164 @@ def analyze_video(
     return _analyze_landmarks(P, V, eff_fps, meta, req_id, fuid, t0)
 
 
-def _run_pose(path: str, meta: dict, model_path: str, target_fps: int = 8, max_side: int = 256, model: str = "lite") -> Tuple[Any, Any, float]:
+def count_pushups_vy(P: Any, fps: float) -> Tuple[int, List[int], float]:
+    """
+    Computes pushup reps using vertical-motion signal vy
+    (peaks of mean nose + shoulders y normalized by shoulder width),
+    per mediapipe_limits.md and cvbench/split.py.
+    Returns (reps, peak_indices, range).
+    """
+    if np is None or len(P) == 0:
+        return 0, [], 0.0
+
+    # Nose (0) + mid-shoulder (11, 12) vertical position (y in frame)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        y_raw = np.nanmean(P[:, [0, 11, 12], 1], axis=1)
+        sw = float(np.nanmedian(np.abs(P[:, 11, 0] - P[:, 12, 0])))
+    if np.isnan(y_raw).all() or not sw or np.isnan(sw) or sw < 1.0:
+        return 0, [], 0.0
+
+    y_norm = interp_nan(y_raw) / sw
+    win = max(5, int(round(fps * 0.3)) | 1)
+    if savgol_filter is not None and len(y_norm) > win:
+        y_sm = savgol_filter(y_norm, win, 2)
+    else:
+        y_sm = y_norm
+
+    rng = float(np.percentile(y_sm, 97) - np.percentile(y_sm, 3))
+    min_dist = max(1, int(round(fps * 0.6)))
+    prominence = max(0.15, 0.4 * rng)
+    if find_peaks is not None:
+        pk, _ = find_peaks(y_sm, prominence=prominence, distance=min_dist)
+        return int(len(pk)), list(pk), rng
+    return 0, [], rng
+
+
+def is_unreliable_camera_angle(
+    P: Any,
+    V: Any,
+    meta: dict,
+    sh_y_frac: Optional[float] = None,
+    lower_vis: Optional[float] = None,
+    knee_vis: Optional[float] = None,
+    sw_rel_rng: Optional[float] = None,
+) -> bool:
+    """
+    Detects floor-level / low camera angles (camera from below, e.g. hoodie case in QZJQY9W)
+    where lower body is cut off and perspective motion toward lens makes rep counting unreliable.
+    """
+    if np is None or len(P) == 0:
+        return False
+
+    h = meta.get("height", 0) or 480
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        if sh_y_frac is None:
+            sh_y = np.nanmean(P[:, [11, 12], 1], axis=1)
+            sh_y_frac = float(np.nanmedian(sh_y) / h) if h > 0 else 0.0
+
+        if lower_vis is None:
+            lower_vis = float(np.mean(V[:, [23, 24, 25, 26, 27, 28]].max(1) > 0.4))
+
+        if knee_vis is None:
+            knee_vis = float(np.nanmean(V[:, [25, 26]]))
+
+        if sw_rel_rng is None:
+            sw_series = np.abs(P[:, 11, 0] - P[:, 12, 0])
+            sw_med = float(np.nanmedian(sw_series))
+            sw_rel_rng = float((np.nanpercentile(sw_series, 95) - np.nanpercentile(sw_series, 5)) / sw_med) if sw_med > 5.0 else 0.0
+
+    return bool(
+        (sh_y_frac > 0.52 and (knee_vis < 0.25 or lower_vis < 0.48))
+        or (sw_rel_rng > 1.8 and lower_vis < 0.50)
+    )
+
+
+def _run_pose(
+    path: str,
+    meta: dict,
+    model_path: str,
+    target_fps: int = 12,
+    max_side: int = 480,
+    model: str = "lite",
+) -> Tuple[Any, Any, float]:
+    """Runs pose landmarker: tries ffmpeg pre-decode first; falls back to cv2.VideoCapture."""
+    try:
+        res = _run_pose_ffmpeg(path, meta, model_path, target_fps=target_fps, max_side=max_side)
+        if res is not None and len(res[0]) > 0:
+            return res
+    except Exception as e:
+        logger.debug("ffmpeg pre-decode fallback to cv2 due to: %s", e)
+
+    return _run_pose_cv2(path, meta, model_path, target_fps=target_fps, max_side=max_side)
+
+
+def _run_pose_ffmpeg(
+    path: str,
+    meta: dict,
+    model_path: str,
+    target_fps: int = 12,
+    max_side: int = 480,
+) -> Optional[Tuple[Any, Any, float]]:
+    orig_w = meta.get("width", 640)
+    orig_h = meta.get("height", 480)
+    rot = meta.get("rotation", 0)
+    w, h = (orig_h, orig_w) if rot in (90, 270, -90, -270) else (orig_w, orig_h)
+    src_fps = meta.get("fps", 25.0)
+    step = max(1, int(round(src_fps / target_fps))) if target_fps else 1
+    efps = src_fps / step
+    s = min(1.0, max_side / max(w, h)) if max_side else 1.0
+    w2, h2 = (int(w * s) // 2 * 2, int(h * s) // 2 * 2) if s < 1.0 else (w // 2 * 2, h // 2 * 2)
+
+    vf = [f"fps={efps}", f"scale={w2}:{h2}:flags=area"]
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error", "-threads", "2",
+        "-i", path, "-vf", ",".join(vf),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"
+    ]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
+    frame_bytes = w2 * h2 * 3
+
+    opts = vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=1,
+    )
+    pts, vis, idx = [], [], 0
+    try:
+        with vision.PoseLandmarker.create_from_options(opts) as lm:
+            while True:
+                b = p.stdout.read(frame_bytes)
+                if len(b) < frame_bytes:
+                    break
+                rgb = np.frombuffer(b, np.uint8).reshape(h2, w2, 3)
+                img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                r = lm.detect_for_video(img, int(idx * 1000 / efps))
+                idx += 1
+                if r.pose_landmarks:
+                    L = r.pose_landmarks[0]
+                    pts.append([[pt.x * w, pt.y * h] for pt in L])
+                    vis.append([pt.visibility for pt in L])
+                else:
+                    pts.append([[np.nan, np.nan]] * 33)
+                    vis.append([0.0] * 33)
+    finally:
+        p.stdout.close()
+        p.wait()
+
+    if idx == 0:
+        return None
+    return np.array(pts, float), np.array(vis, float), efps
+
+
+def _run_pose_cv2(
+    path: str,
+    meta: dict,
+    model_path: str,
+    target_fps: int = 12,
+    max_side: int = 480,
+) -> Tuple[Any, Any, float]:
     cap = cv2.VideoCapture(path)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or meta.get("fps", 25.0)
     step = max(1, int(round(src_fps / target_fps))) if target_fps else 1
@@ -261,8 +421,12 @@ def _analyze_landmarks(
     duration_s = meta.get("duration", 0.0)
     flags: List[str] = []
 
+    if fps < 10.0:
+        logger.warning("Sampling fps %.1f is below 10 fps: high risk of undercounting reps", fps)
+        flags.append("low_fps_undercount_risk")
+
     if n == 0:
-        return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.0, ["empty_video"], False, time.time() - t0)
+        return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.0, flags + ["empty_video"], False, time.time() - t0)
 
     detected = float(np.mean(V.max(1) > 0))
     if detected < 0.4:
@@ -270,71 +434,80 @@ def _analyze_landmarks(
         return _make_result(request_id, file_unique_id, duration_s, "none", 0, round(detected, 2), flags, False, time.time() - t0)
 
     # 1. Torso orientation & geometry
-    sh = P[:, [11, 12]].mean(1)
-    hp = P[:, [23, 24]].mean(1)
-    d = hp - sh
-    torso = np.degrees(np.arctan2(np.abs(d[:, 1]), np.abs(d[:, 0])))
-    torso_med = float(np.nanmedian(torso))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        sh = P[:, [11, 12]].mean(1)
+        hp = P[:, [23, 24]].mean(1)
+        d = hp - sh
+        torso = np.degrees(np.arctan2(np.abs(d[:, 1]), np.abs(d[:, 0])))
+        torso_med = float(np.nanmedian(torso))
 
-    # 2. Vertical shoulder/nose motion signal (for front-camera & side-camera pushups)
-    # Nose (0) + mid-shoulder (11, 12) vertical position (y in frame)
-    y_raw = np.nanmean(P[:, [0, 11, 12], 1], axis=1)
-    sw = float(np.nanmedian(np.abs(P[:, 11, 0] - P[:, 12, 0])))
-    if not sw or np.isnan(sw) or sw < 5.0:
-        sw = 100.0  # fallback normalization
+        # Lower body visibility (hips, knees, ankles)
+        lower_vis = float(np.mean(V[:, [23, 24, 25, 26, 27, 28]].max(1) > 0.4))
+        knee_vis = float(np.nanmean(V[:, [25, 26]]))
+        sh_y_frac = float(np.nanmedian(sh[:, 1]) / meta.get("height", 1.0)) if meta.get("height") else 0.0
 
-    # Inverted vertical signal: higher value = arms extended (top), lower value = chest to floor (bottom)
-    vert_sig = - (y_raw / sw)
-    vert_sig_clean = interp_nan(vert_sig)
-    win = max(5, int(round(fps * 0.3)) | 1)
-    vert_sm = savgol_filter(vert_sig_clean, win, 2) if len(vert_sig_clean) > win else vert_sig_clean
-    v_smin, v_smax = float(np.percentile(vert_sm, 3)), float(np.percentile(vert_sm, 97))
-    vert_rng = v_smax - v_smin
+        sw_series = np.abs(P[:, 11, 0] - P[:, 12, 0])
+        sw_med = float(np.nanmedian(sw_series))
+        sw_rel_rng = float((np.nanpercentile(sw_series, 95) - np.nanpercentile(sw_series, 5)) / sw_med) if sw_med > 5.0 else 0.0
 
-    # Lower body visibility (hips, knees, ankles)
-    lower_vis = float(np.mean(V[:, [23, 24, 25, 26, 27, 28]].max(1) > 0.4))
+    # Camera angle gate: detect floor-level / low camera angles (from below, e.g. hoodie)
+    if is_unreliable_camera_angle(P, V, meta, sh_y_frac=sh_y_frac, lower_vis=lower_vis, knee_vis=knee_vis, sw_rel_rng=sw_rel_rng):
+        flags.append("low_camera_angle")
+        return _make_result(
+            request_id=request_id,
+            file_unique_id=file_unique_id,
+            duration_s=duration_s,
+            exercise="pushup" if (torso_med < 55 or lower_vis < 0.5) else "none",
+            reps=0,
+            confidence=0.35,
+            flags=flags,
+            valid=False,
+            elapsed_s=time.time() - t0,
+        )
+
+    # 2. Vertical shoulder/nose motion signal (vy)
+    reps_vy, pk_vy, vert_rng = count_pushups_vy(P, fps)
 
     # Knee angle range for squat check
     side_vis_leg = {s: float(np.nanmean(V[:, [ids[k] for k in (3, 4, 5)]])) for s, ids in SIDES.items()}
     side_leg = max(side_vis_leg, key=side_vis_leg.get)
     knee_raw = angle(P[:, SIDES[side_leg][3]], P[:, SIDES[side_leg][4]], P[:, SIDES[side_leg][5]])
     knee_sig = interp_nan(knee_raw)
+    win = max(5, int(round(fps * 0.3)) | 1)
     knee_sm = savgol_filter(knee_sig, win, 2) if len(knee_sig) > win else knee_sig
     knee_rng = float(np.percentile(knee_sm, 97) - np.percentile(knee_sm, 3))
 
     # 3. Exercise classification
     # Pushup criteria:
     # a) Horizontal torso (side-view pushup, torso < 45 deg)
-    # b) OR vertical shoulder/nose amplitude >= 0.20 with lower body behind shoulders (front-camera pushup)
+    # b) OR vertical shoulder/nose amplitude >= 0.15 with knees occluded/behind body or low knee range (front pushup)
     # Squat criteria:
-    # a) Upright torso (torso >= 45 deg) AND knee range >= 35 deg AND good lower body visibility
-    is_front_pushup = (vert_rng >= 0.20 and (knee_rng < 35 or lower_vis < 0.60))
+    # a) Upright torso (torso >= 45 deg) AND knee range >= 35 deg AND visible knees (knee_vis >= 0.40)
+    is_front_pushup = (vert_rng >= 0.15 and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60))
     is_side_pushup = (torso_med < 45)
 
     if is_side_pushup or is_front_pushup:
         exercise = "pushup"
-    elif knee_rng >= 35 and torso_med >= 45:
+    elif knee_rng >= 35 and torso_med >= 45 and knee_vis >= 0.40:
         exercise = "squat"
     else:
         # Check if any significant motion exists
-        if vert_rng < 0.15 and knee_rng < 25:
+        if vert_rng < 0.15 and (knee_rng < 25 or knee_vis < 0.40):
             flags.append("low_amplitude_motion")
             return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.9, flags, False, time.time() - t0)
-        exercise = "squat" if torso_med >= 55 else "pushup"
+        exercise = "squat" if (torso_med >= 55 and knee_vis >= 0.40) else "pushup"
 
-    # 4. Counting reps with hysteresis
+    # 4. Counting reps
     if exercise == "pushup":
-        # Always use vertical shoulder/nose signal for pushup counting (robust for both front and side camera)
-        if vert_rng < 0.18:
+        # Always use vertical-motion signal vy (nose+shoulders y peaks normalized by shoulder width)
+        if vert_rng < 0.15:
             flags.append("small_pushup_range")
             return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.2, flags, False, time.time() - t0)
 
-        lo = v_smin + 0.35 * vert_rng
-        hi = v_smax - 0.25 * vert_rng
-        reps, partial, events = count_hysteresis(vert_sm, lo, hi)
-        pk, _ = find_peaks(-vert_sm, prominence=max(0.10, 0.25 * vert_rng), distance=max(1, int(fps * 0.5)))
-        peaks = len(pk)
-        primary_rng = vert_rng
+        reps = reps_vy
+        peaks = reps_vy
+        events = pk_vy
     else:
         # Squat: count via knee angle
         if knee_rng < 30:
@@ -348,13 +521,12 @@ def _analyze_landmarks(
         reps, partial, events = count_hysteresis(knee_sm, lo, hi)
         pk, _ = find_peaks(-knee_sm, prominence=max(15, 0.35 * knee_rng), distance=max(1, int(fps * 0.5)))
         peaks = len(pk)
-        primary_rng = knee_rng
 
     # Confidence score calculation (0.0 to 1.0)
     confidence = 0.85
     if detected > 0.8:
         confidence += 0.05
-    if abs(peaks - reps) > 3:
+    if exercise == "squat" and abs(peaks - reps) > 3:
         confidence -= 0.15
         flags.append("peak_hysteresis_divergence")
     if reps == 0:

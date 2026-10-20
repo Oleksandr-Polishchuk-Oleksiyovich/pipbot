@@ -9,13 +9,18 @@ System dependencies for full MediaPipe execution:
 import math
 import os
 import pytest
+import numpy as np
 
 from core.cv.rep_counter import (
     count_hysteresis,
+    count_pushups_vy,
+    is_unreliable_camera_angle,
+    _analyze_landmarks,
     is_cv_available,
     probe,
     analyze_video,
     _make_result,
+    DEFAULT_CFG,
 )
 
 # Шляхи до ground-truth відео (якщо змонтовані/доступні локально)
@@ -95,26 +100,27 @@ def test_analyze_video_handles_missing_deps(monkeypatch):
 @pytest.mark.skipif(not is_cv_available(), reason="MediaPipe/CV dependencies not installed in this environment")
 @pytest.mark.skipif(not os.path.isfile(VIDEO_7XRAS), reason="Ground truth video 7XRAS not present")
 def test_ground_truth_pushup_7xras():
-    """T-31: pushup front-camera відео 7XRAS → 30–34 reps."""
-    res = analyze_video(VIDEO_7XRAS, target_fps=8, max_side=256)
+    """T-31/Sequential benchmark: pushup front-camera video 7XRAS → 30–34 reps via vy signal."""
+    res = analyze_video(VIDEO_7XRAS, target_fps=12, max_side=480)
     assert res["exercise"] == "pushup"
     assert 30 <= res["reps"] <= 34
+    assert res["valid"] is True
 
 
 @pytest.mark.skipif(not is_cv_available(), reason="MediaPipe/CV dependencies not installed in this environment")
 @pytest.mark.skipif(not os.path.isfile(VIDEO_7XQZJ), reason="Ground truth video 7XQZJ not present")
 def test_ground_truth_pushup_7xqzj():
-    """T-31: 7XQZJ → ~29 reps (з паузами) у межах ±2 (27-31)."""
-    res = analyze_video(VIDEO_7XQZJ, target_fps=8, max_side=256)
-    assert res["exercise"] == "pushup"
-    assert 27 <= res["reps"] <= 31
+    """T-31/Sequential benchmark: 7XQZJ (floor camera from below, hoodie) is gated as unreliable low camera angle."""
+    res = analyze_video(VIDEO_7XQZJ, target_fps=12, max_side=480)
+    assert res["valid"] is False
+    assert "low_camera_angle" in res["flags"]
 
 
 @pytest.mark.skipif(not is_cv_available(), reason="MediaPipe/CV dependencies not installed in this environment")
 @pytest.mark.skipif(not os.path.isfile(VIDEO_SQUAT_50), reason="Ground truth squat video not present")
 def test_ground_truth_squat_50():
     """T-31: squat side-view (154s/75s) → 50 reps."""
-    res = analyze_video(VIDEO_SQUAT_50, target_fps=8, max_side=256)
+    res = analyze_video(VIDEO_SQUAT_50, target_fps=12, max_side=480)
     assert res["exercise"] == "squat"
     assert 48 <= res["reps"] <= 52
 
@@ -123,7 +129,178 @@ def test_ground_truth_squat_50():
 @pytest.mark.skipif(not os.path.isfile(VIDEO_MEME), reason="Meme video not present")
 def test_ground_truth_meme_rejected():
     """T-31: meme/cutscene кліпи → none, 0."""
-    res = analyze_video(VIDEO_MEME, target_fps=8, max_side=256)
+    res = analyze_video(VIDEO_MEME, target_fps=12, max_side=480)
     assert res["exercise"] == "none"
     assert res["reps"] == 0
     assert res["valid"] is False
+
+
+# =========================================================================
+# Офлайн unit-тести із синтетичними рядами landmark-точок (без mediapipe)
+# =========================================================================
+
+def make_synthetic_landmarks(
+    num_reps: int = 10,
+    fps: float = 12.0,
+    duration_s: float = 20.0,
+    amplitude: float = 60.0,
+    sw: float = 100.0,
+    base_y: float = 300.0,
+    low_camera: bool = False,
+    nan_ratio: float = 0.0,
+    noise_std: float = 0.0,
+    torso_angle: float = 20.0,
+):
+    """
+    Генерує синтетичні масиви P (координати [N, 33, 2]) та V (видимість [N, 33]).
+    Nose (0) та shoulders (11, 12) здійснюють коливання по осі y.
+    У системі координат зображення більший y = ближче до підлоги (нижня точка віджимання).
+    """
+    n_frames = int(round(fps * duration_s))
+    t = np.linspace(0, duration_s, n_frames, endpoint=False)
+
+    # Вертикальні коливання (y збільшується на опусканні до підлоги)
+    if num_reps > 0:
+        freq = num_reps / duration_s
+        y_motion = base_y + amplitude * np.sin(2 * np.pi * freq * t - np.pi / 2)
+    else:
+        y_motion = np.full(n_frames, base_y)
+
+    if noise_std > 0:
+        y_motion += np.random.normal(0, noise_std, size=n_frames)
+
+    P = np.zeros((n_frames, 33, 2), dtype=float)
+    V = np.ones((n_frames, 33), dtype=float)
+
+    # Shoulders: 11 (left, x=200), 12 (right, x=300) -> shoulder width sw = 100
+    P[:, 11, 0] = 200.0
+    P[:, 12, 0] = 200.0 + sw
+    P[:, 11, 1] = y_motion
+    P[:, 12, 1] = y_motion
+
+    # Nose: 0
+    P[:, 0, 0] = 200.0 + sw / 2.0
+    P[:, 0, 1] = y_motion - 20.0  # трохи вище плечей
+
+    # Hips (23, 24): відстань визначається кутом torso_angle
+    # d = hp - sh; tan(torso) = dy / dx
+    rad = np.radians(torso_angle)
+    torso_len = 200.0
+    dx = torso_len * np.cos(rad)
+    dy = torso_len * np.sin(rad)
+    P[:, 23, 0] = P[:, 11, 0] + dx
+    P[:, 24, 0] = P[:, 12, 0] + dx
+    P[:, 23, 1] = P[:, 11, 1] + dy
+    P[:, 24, 1] = P[:, 12, 1] + dy
+
+    # Knees (25, 26) and Ankles (27, 28)
+    P[:, 25, 0] = P[:, 23, 0] + 150.0
+    P[:, 26, 0] = P[:, 24, 0] + 150.0
+    P[:, 25, 1] = P[:, 23, 1]
+    P[:, 26, 1] = P[:, 24, 1]
+
+    if low_camera:
+        # Камера знизу з підлоги: плечі в нижній частині кадру, нижня частина тіла обрізана
+        P[:, :, 1] += 150.0  # зсув у нижню половину кадру
+        V[:, [23, 24, 25, 26, 27, 28]] = 0.1  # ноги та таз не видно
+    else:
+        V[:, [23, 24, 25, 26, 27, 28]] = 0.9
+
+    if nan_ratio > 0:
+        mask = np.random.rand(n_frames) < nan_ratio
+        P[mask, :, :] = np.nan
+
+    return P, V
+
+
+def test_count_pushups_vy_synthetic_perfect_series():
+    """Тест підрахунку повторень vy на синтетичному ідеальному сигналі (10 віджимань)."""
+    P, _ = make_synthetic_landmarks(num_reps=10, fps=12.0, duration_s=20.0, amplitude=60.0, sw=100.0)
+    reps, pk, rng = count_pushups_vy(P, fps=12.0)
+    assert reps == 10
+    assert len(pk) == 10
+    assert rng > 0.5
+
+
+def test_count_pushups_vy_synthetic_various_cadences():
+    """Тест різної кількості віджимань (5, 12, 18 повторень)."""
+    for expected in [5, 12, 18]:
+        P, _ = make_synthetic_landmarks(num_reps=expected, fps=12.0, duration_s=30.0, amplitude=50.0, sw=100.0)
+        reps, pk, _ = count_pushups_vy(P, fps=12.0)
+        assert reps == expected
+        assert len(pk) == expected
+
+
+def test_count_pushups_vy_synthetic_robust_to_nans_and_noise():
+    """Тест стійкості vy до шумів та випадіння 10% кадрів (NaN)."""
+    np.random.seed(42)
+    P, _ = make_synthetic_landmarks(
+        num_reps=8,
+        fps=12.0,
+        duration_s=20.0,
+        amplitude=60.0,
+        sw=100.0,
+        nan_ratio=0.10,
+        noise_std=3.0,
+    )
+    reps, pk, rng = count_pushups_vy(P, fps=12.0)
+    assert reps == 8
+    assert len(pk) == 8
+
+
+def test_count_pushups_vy_synthetic_low_amplitude_rejected():
+    """Тест: якщо амплітуда надто мала (людина майже не рухається), vy дає 0 повторень."""
+    P, _ = make_synthetic_landmarks(num_reps=10, fps=12.0, duration_s=20.0, amplitude=4.0, sw=100.0)
+    reps, pk, rng = count_pushups_vy(P, fps=12.0)
+    assert reps == 0
+    assert len(pk) == 0
+    assert rng < 0.15
+
+
+def test_is_unreliable_camera_angle_synthetic():
+    """Тест детекції ненадійного ракурсу (камера знизу/з підлоги)."""
+    meta = {"width": 640, "height": 480}
+
+    # 1. Нормальний ракурс: плечі в середині, ноги видно
+    P_norm, V_norm = make_synthetic_landmarks(num_reps=5, fps=12.0, low_camera=False, base_y=200.0)
+    assert is_unreliable_camera_angle(P_norm, V_norm, meta) is False
+
+    # 2. Камера на підлозі знизу: плечі низько (>0.52 кадру), ноги обрізані
+    P_low, V_low = make_synthetic_landmarks(num_reps=5, fps=12.0, low_camera=True, base_y=300.0)
+    assert is_unreliable_camera_angle(P_low, V_low, meta) is True
+
+
+def test_analyze_landmarks_synthetic_pushup_valid():
+    """Тест _analyze_landmarks на синтетичному валідному віджиманні."""
+    P, V = make_synthetic_landmarks(num_reps=7, fps=12.0, duration_s=15.0, low_camera=False, base_y=180.0)
+    meta = {"duration": 15.0, "width": 640, "height": 480, "fps": 12.0}
+
+    res = _analyze_landmarks(P, V, fps=12.0, meta=meta, request_id="syn-1", file_unique_id="fuid-1", t0=0.0)
+    assert res["exercise"] == "pushup"
+    assert res["reps"] == 7
+    assert res["valid"] is True
+    assert "low_camera_angle" not in res["flags"]
+    assert "low_fps_undercount_risk" not in res["flags"]
+
+
+def test_analyze_landmarks_synthetic_low_camera_angle_gated():
+    """Тест _analyze_landmarks: ракурс з підлоги знизу блокується прапорцем low_camera_angle і valid=False."""
+    P, V = make_synthetic_landmarks(num_reps=8, fps=12.0, duration_s=16.0, low_camera=True, base_y=300.0)
+    meta = {"duration": 16.0, "width": 640, "height": 480, "fps": 12.0}
+
+    res = _analyze_landmarks(P, V, fps=12.0, meta=meta, request_id="syn-low", file_unique_id="fuid-low", t0=0.0)
+    assert res["valid"] is False
+    assert "low_camera_angle" in res["flags"]
+    assert res["confidence"] <= 0.5
+
+
+def test_sampling_fps_below_10_warns_and_flags(caplog):
+    """Тест: sampling fps < 10 викликає попередження про undercount risk та прапорець low_fps_undercount_risk."""
+    P, V = make_synthetic_landmarks(num_reps=6, fps=8.0, duration_s=15.0, low_camera=False, base_y=180.0)
+    meta = {"duration": 15.0, "width": 640, "height": 480, "fps": 8.0}
+
+    with caplog.at_level("WARNING"):
+        res = _analyze_landmarks(P, V, fps=8.0, meta=meta, request_id="syn-fps8", file_unique_id="fuid-fps8", t0=0.0)
+
+    assert "low_fps_undercount_risk" in res["flags"]
+    assert any("below 10 fps" in r.message for r in caplog.records)

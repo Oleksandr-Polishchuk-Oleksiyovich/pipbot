@@ -23,6 +23,11 @@ GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8443"))
 DEPLOY_SCRIPT_PATH = os.getenv("DEPLOY_SCRIPT_PATH", os.path.join(BASE_DIR, "deploy", "deploy.sh"))
 DEPLOY_STATUS_DIR = os.getenv("DEPLOY_STATUS_DIR", os.path.join(os.path.dirname(DB_PATH), "deploy_status"))
 
+# CV Worker конфігурація (Phase 3 / mediapipe_limits Sequential benchmark)
+CV_TARGET_FPS = int(os.getenv("CV_TARGET_FPS", "12"))
+CV_MAX_SIDE = int(os.getenv("CV_MAX_SIDE", "480"))
+CV_MODEL = os.getenv("CV_MODEL", "lite")
+
 # Grok Bot box routine webhook offload конфігурація
 ROUTINE_WEBHOOK_URL = os.getenv("ROUTINE_WEBHOOK_URL", "")
 ROUTINE_SENDER_KEY = os.getenv("ROUTINE_SENDER_KEY", "")

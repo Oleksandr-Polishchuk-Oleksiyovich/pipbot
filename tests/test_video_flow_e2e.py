@@ -51,6 +51,12 @@ def test_judge_video_fact_scenarios():
     assert v_mismatch.done is False
     assert v_mismatch.category == "wrong_exercise"
 
+    # 7. Ненадійний ракурс камери (камера знизу/з підлоги)
+    low_cam_fact = VideoFact(exercise="pushup", reps=30, target=target, confidence=0.35, valid=False, flags=["low_camera_angle"])
+    v_low_cam = ReportJudgeAgent.judge_video_fact(low_cam_fact)
+    assert v_low_cam.done is False
+    assert v_low_cam.category == "low_camera_angle"
+
 
 @pytest.mark.asyncio
 async def test_flow_video_callback_success(tmp_path):
@@ -184,6 +190,36 @@ async def test_flow_video_callback_wrong_exercise(tmp_path):
     assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
     assert "не по темі" in reply.lower() or "думав, там" in reply.lower()
     assert sender.replies[-1][0] == 559
+
+
+@pytest.mark.asyncio
+async def test_flow_video_callback_low_camera_angle(tmp_path):
+    """Сценарій: ненадійний ракурс камери знизу/з підлоги -> відхилення + прохання перезняти збоку."""
+    flow, sender, _ = make_flow(tmp_path, llm=None)
+
+    check = flow.store.create_video_check(
+        request_id="req-e2e-low-cam",
+        chat_id=CHAT,
+        message_id=560,
+        user_slug="lyosha",
+        duration_s=42.0,
+        exercise="pushup",
+        reps=0,
+        confidence=0.35,
+        valid=False,
+        status="done",
+        flags=["low_camera_angle"],
+    )
+
+    reply = await flow.handle_video_callback("req-e2e-low-cam")
+
+    # Норму НЕ зараховано
+    assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
+    # Coach persona reply українською з проханням перезняти збоку
+    assert "збоку" in reply.lower()
+    assert "знизу" in reply.lower() or "підлоги" in reply.lower()
+    # Реплай на повідомлення з відео
+    assert sender.replies[-1][0] == 560
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,17 @@ from typing import Any, Callable, Dict, List, Optional
 import urllib.request
 import urllib.error
 
-from core.config import BOT_TOKEN, DB_PATH, GEMINI_API_KEY, CANDIDATE_MODELS, GATEWAY_PORT, GATEWAY_HMAC_SECRET
+from core.config import (
+    BOT_TOKEN,
+    DB_PATH,
+    GEMINI_API_KEY,
+    CANDIDATE_MODELS,
+    GATEWAY_PORT,
+    GATEWAY_HMAC_SECRET,
+    CV_TARGET_FPS,
+    CV_MAX_SIDE,
+    CV_MODEL,
+)
 from core.cv import rep_counter
 from core.llm import GeminiLLM
 from core.signing import sign_payload
@@ -62,6 +72,9 @@ class CVWorker:
         analyzer: Optional[Callable[..., Dict[str, Any]]] = None,
         callback_handler: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         secret: Optional[str] = None,
+        target_fps: Optional[int] = None,
+        max_side: Optional[int] = None,
+        model: Optional[str] = None,
     ):
         self.store = store
         self.bot_token = bot_token
@@ -71,6 +84,9 @@ class CVWorker:
         self.analyzer = analyzer or rep_counter.analyze_video
         self.callback_handler = callback_handler
         self.secret = secret or GATEWAY_HMAC_SECRET
+        self.target_fps = target_fps or CV_TARGET_FPS
+        self.max_side = max_side or CV_MAX_SIDE
+        self.model = model or CV_MODEL
         self.running = False
 
     def claim_one(self) -> Optional[VideoCheck]:
@@ -105,6 +121,9 @@ class CVWorker:
                 tmp_path,
                 request_id=check.request_id,
                 file_unique_id=check.file_unique_id or "",
+                target_fps=self.target_fps,
+                max_side=self.max_side,
+                model=self.model,
             )
 
             # 3. Gemini vision classification & reconcile (T-33)
