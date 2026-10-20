@@ -5,9 +5,12 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+try:
+    from aiogram import Bot, Dispatcher
+    from aiogram.filters import Command
+    from aiogram.types import FSInputFile, Message
+except ImportError:
+    Bot = Dispatcher = Command = FSInputFile = Message = None  # type: ignore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.flow import ChatFlow
@@ -71,24 +74,30 @@ class TelegramSender:
 def describe_message(message: Message) -> str:
     """Текстове представлення повідомлення для журналу (медіа, підписи, контекст reply)."""
     reply_context = ""
-    if message.reply_to_message:
+    if getattr(message, "reply_to_message", None):
         orig = message.reply_to_message
-        orig_sender = (orig.from_user.full_name or orig.from_user.first_name) if orig.from_user else "Користувач"
-        orig_text = orig.text or orig.caption or ""
+        orig_user = getattr(orig, "from_user", None)
+        orig_sender = (orig_user.full_name or orig_user.first_name) if orig_user else "Користувач"
+        orig_text = getattr(orig, "text", None) or getattr(orig, "caption", None) or ""
         if not orig_text:
-            if orig.video or orig.video_note or orig.animation:
+            if getattr(orig, "animation", None):
+                orig_text = "[Анімація/GIF]"
+            elif getattr(orig, "video", None) or getattr(orig, "video_note", None):
                 orig_text = "[Відеозвіт]"
-            elif orig.photo:
+            elif getattr(orig, "photo", None):
                 orig_text = "[Фотозвіт]"
             else:
                 orig_text = "[Повідомлення]"
         reply_context = f"[У відповідь на {orig_sender}: «{orig_text}»] "
 
-    if message.video or message.video_note or message.animation:
-        content = f"[Надіслано відеозвіт виконання норми]. {message.caption or ''}".strip()
-    elif message.photo:
-        content = f"[Надіслано фотозвіт]. {message.caption or ''}".strip()
-    elif message.text:
+    caption = getattr(message, "caption", "") or ""
+    if getattr(message, "animation", None):
+        content = f"[Надіслано GIF/анімацію — не є відеозвітом]. {caption}".strip()
+    elif getattr(message, "video", None) or getattr(message, "video_note", None):
+        content = f"[Надіслано відеозвіт виконання норми]. {caption}".strip()
+    elif getattr(message, "photo", None):
+        content = f"[Надіслано фотозвіт]. {caption}".strip()
+    elif getattr(message, "text", None):
         content = message.text.strip()
     else:
         content = "[Повідомлення]"
@@ -119,6 +128,7 @@ def build_app():
         store.save_message(message.chat.id, "Спорт Зануда", "coach", text,
                            flow.now().strftime("%Y-%m-%d %H:%M:%S"))
         store.set_state("last_processed_timestamp", flow.now().strftime("%Y-%m-%d %H:%M:%S"))
+        store.set_state("last_processed_id", str(store.get_last_message_id(message.chat.id)))
         await message.reply(text, parse_mode="Markdown" if markdown else None)
 
     @dp.message(Command("start", "help"))

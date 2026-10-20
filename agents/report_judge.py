@@ -51,6 +51,13 @@ class ReportJudgeAgent(PromptAgent):
         for r in raw_verdict.reports:
             slug = normalize_participant(r.participant, self.store) or r.participant
             if slug in done:
+                if r.done:
+                    author_msgs = [m for m in pending if normalize_participant(m.user_name, self.store) == slug]
+                    if author_msgs and all(
+                        "не є відеозвітом" in m.text.lower() or "gif/анімаці" in m.text.lower()
+                        for m in author_msgs
+                    ):
+                        continue
                 normalized_reports.append(ParticipantReport(participant=slug, done=r.done, evidence=r.evidence))
         return JudgeVerdict(reports=normalized_reports)
 
@@ -60,6 +67,8 @@ class ReportJudgeAgent(PromptAgent):
         reports = []
         for m in pending:
             text = m.text.lower()
+            if "не є відеозвітом" in text or "gif/анімаці" in text or "анімація/gif" in text:
+                continue
             if not (any(k in text for k in _REPORT_MARKERS) or re.search(r"(^|\s)\+(\s|$)", text)):
                 continue
             participant = normalize_participant(m.user_name, store)

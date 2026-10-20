@@ -69,6 +69,8 @@ class ChatFlow:
         migrate_dynamic_prompt(self.store)
         if not self.store.get_state("last_processed_timestamp"):
             self.store.set_state("last_processed_timestamp", self._yesterday_cutoff())
+        if not self.store.get_state("last_processed_id"):
+            self.store.set_state("last_processed_id", "0")
 
     # --- допоміжне ---
     def _yesterday_cutoff(self) -> str:
@@ -119,13 +121,20 @@ class ChatFlow:
     async def process(self, chat_id: int, trigger: str = "push", job: str = "") -> None:
         async with self._lock:
             last_ts = self.store.get_state("last_processed_timestamp") or self._yesterday_cutoff()
-            pending = self.store.unprocessed_user_messages(chat_id, last_ts, self._day_start())
+            last_id_raw = self.store.get_state("last_processed_id")
+            last_id = int(last_id_raw) if (last_id_raw is not None and last_id_raw != "") else None
+            pending = self.store.unprocessed_user_messages(chat_id, last_ts, self._day_start(), after_id=last_id)
             if pending:
-                logger.info("[%s] %d unprocessed message(s) since %s", trigger, len(pending), last_ts)
+                logger.info(
+                    "[%s] %d unprocessed message(s) since %s (after_id=%s)",
+                    trigger, len(pending), last_ts, last_id,
+                )
                 await self._refresh_chat_members(chat_id)
                 await self._handle_pending(chat_id, pending)
                 self.store.set_state("last_processed_timestamp", pending[-1].created_at)
-            elif trigger == "timer":
+                self.store.set_state("last_processed_id", str(pending[-1].id))
+
+            if trigger == "timer":
                 await self._handle_timer(chat_id, job)
 
     async def _handle_pending(self, chat_id: int, pending: List[ChatMessage]) -> None:
@@ -283,7 +292,6 @@ class ChatFlow:
             logger.warning("Unknown timer job: %s", job)
             return
         await self._say(chat_id, text)
-        self.store.set_state("last_processed_timestamp", format_ts(self.now()))
 
     async def _settle_lives(self, chat_id: int, day) -> None:
         changed = challenge.settle_missed_day(self.store, day)

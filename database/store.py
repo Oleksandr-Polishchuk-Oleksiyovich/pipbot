@@ -446,20 +446,42 @@ class Store:
                 con.execute(f"UPDATE progress SET {slug}_done = ? WHERE date = ?", (val, date_iso))
 
     # --- CHAT HISTORY ---
-    def save_message(self, chat_id: int, user_name: str, role: str, text: str, created_at: str) -> None:
+    def save_message(self, chat_id: int, user_name: str, role: str, text: str, created_at: str) -> int:
         with self._connect() as con:
-            con.execute(
+            cur = con.execute(
                 "INSERT INTO chat_history (chat_id, user_name, role, text, created_at) VALUES (?, ?, ?, ?, ?)",
                 (chat_id, user_name, role, text, created_at),
             )
+            return cur.lastrowid or 0
 
-    def unprocessed_user_messages(self, chat_id: int, after_ts: str, day_start_ts: str) -> List[ChatMessage]:
+    def get_last_message_id(self, chat_id: Optional[int] = None) -> int:
         with self._connect() as con:
-            rows = con.execute("""
-                SELECT id, user_name, role, text, created_at FROM chat_history
-                WHERE chat_id = ? AND role = 'user' AND created_at > ? AND created_at >= ?
-                ORDER BY id ASC
-            """, (chat_id, after_ts, day_start_ts)).fetchall()
+            if chat_id is not None:
+                row = con.execute("SELECT max(id) FROM chat_history WHERE chat_id = ?", (chat_id,)).fetchone()
+            else:
+                row = con.execute("SELECT max(id) FROM chat_history").fetchone()
+            return (row[0] or 0) if row else 0
+
+    def unprocessed_user_messages(
+        self, chat_id: int, after_ts: str, day_start_ts: str, after_id: Optional[int] = None
+    ) -> List[ChatMessage]:
+        with self._connect() as con:
+            if after_id is not None:
+                rows = con.execute("""
+                    SELECT id, user_name, role, text, created_at FROM chat_history
+                    WHERE chat_id = ? AND role = 'user'
+                      AND (created_at > ? OR (created_at = ? AND id > ?))
+                      AND created_at >= ?
+                    ORDER BY created_at ASC, id ASC
+                """, (chat_id, after_ts, after_ts, int(after_id), day_start_ts)).fetchall()
+            else:
+                rows = con.execute("""
+                    SELECT id, user_name, role, text, created_at FROM chat_history
+                    WHERE chat_id = ? AND role = 'user'
+                      AND created_at > ?
+                      AND created_at >= ?
+                    ORDER BY created_at ASC, id ASC
+                """, (chat_id, after_ts, day_start_ts)).fetchall()
         return [ChatMessage(*r) for r in rows]
 
     def messages_since(self, chat_id: int, start_ts: str, limit: int = 200) -> List[ChatMessage]:

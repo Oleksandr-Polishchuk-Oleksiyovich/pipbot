@@ -3,7 +3,9 @@ from datetime import date
 from types import SimpleNamespace
 
 from agents.coach import CoachAgent
+from agents.report_judge import ReportJudgeAgent
 from agents.router import RouteDecision, RouterAgent
+from bot import describe_message
 from core import challenge
 from core.llm import GeminiLLM, RING_BUFFER_SIZE
 from database.store import ChatMessage, Store
@@ -274,3 +276,166 @@ async def test_morning_message_names_exercise(tmp_path):
     challenge.enable_alternating(flow.store, date(2026, 10, 3), {"lyosha": 25, "sasha": 25}, 1.5)
     await flow.process(CHAT, trigger="timer", job="morning")
     assert "ПРИСІДАННЯ" in sender.texts[-1] and "`38`" in sender.texts[-1]
+
+
+# --- T-01: Курсор необроблених повідомлень за (created_at, id) ---
+
+async def test_cursor_with_same_timestamp_messages(tmp_path):
+    """T-01: два user-повідомлення з однаковим created_at обидва потрапляють в обробку рівно один раз."""
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    ts = clock.at(12, 0, 0)
+    # Записуємо 2 повідомлення з абсолютно однаковим timestamp
+    flow.record_user_message(CHAT, SON, "перше повідомлення", created_at=ts)
+    flow.record_user_message(CHAT, DAD, "друге повідомлення", created_at=ts)
+
+    # 1. Перший process обробляє обидва повідомлення
+    await flow.process(CHAT, trigger="push")
+    assert len(sender.texts) == 1
+    last_id = int(flow.store.get_state("last_processed_id"))
+    assert last_id > 1
+
+    # 2. Повторний process не повертає вже оброблені повідомлення
+    await flow.process(CHAT, trigger="push")
+    assert len(sender.texts) == 1
+
+    # 3. Нове повідомлення в ту саму секунду (з більшим id) коректно підхоплюється
+    flow.record_user_message(CHAT, SON, "третє повідомлення", created_at=ts)
+    await flow.process(CHAT, trigger="push")
+    assert len(sender.texts) == 2
+
+
+def test_unprocessed_user_messages_cursor(tmp_path):
+    """T-01: перевірка методу unprocessed_user_messages з after_id."""
+    store = Store(str(tmp_path / "cursor.db"))
+    store.init_schema()
+    ts = "2026-10-04 12:00:00"
+    m1_id = store.save_message(1, "lyosha", "user", "msg1", ts)
+    m2_id = store.save_message(1, "sasha", "user", "msg2", ts)
+    m3_id = store.save_message(1, "lyosha", "user", "msg3", "2026-10-04 12:00:01")
+
+    # Без фільтра після m1: повертаються всі повідомлення
+    all_msgs = store.unprocessed_user_messages(1, "2026-10-04 11:59:00", "2026-10-04 00:00:00", after_id=0)
+    assert [m.id for m in all_msgs] == [m1_id, m2_id, m3_id]
+
+    # З фільтром після m1_id на тому ж ts
+    msgs_after_m1 = store.unprocessed_user_messages(1, ts, "2026-10-04 00:00:00", after_id=m1_id)
+    assert [m.id for m in msgs_after_m1] == [m2_id, m3_id]
+
+    # З фільтром після m2_id на тому ж ts
+    msgs_after_m2 = store.unprocessed_user_messages(1, ts, "2026-10-04 00:00:00", after_id=m2_id)
+    assert [m.id for m in msgs_after_m2] == [m3_id]
+
+
+# --- T-02: Таймер-нагадування не має губитися через pending ---
+
+async def test_timer_reminder_not_lost_when_pending_messages(tmp_path):
+    """T-02: pending + trigger='timer', job='morning' -> і coach reply, і ранкове нагадування спрацьовують."""
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    clock.at(8, 30, 0)
+    # Створюємо pending повідомлення (вітання)
+    flow.record_user_message(CHAT, SON, "Привіт усім!", created_at=clock.value)
+
+    # Запускаємо таймер morning при наявності pending
+    await flow.process(CHAT, trigger="timer", job="morning")
+
+    # Має бути 2 повідомлення: 1) відповідь на pending (coach fallback); 2) ранкове нагадування
+    assert len(sender.texts) == 2
+    assert sender.texts[0] == FALLBACK_GEMINI_MESSAGE
+    assert "☀️ **День" in sender.texts[1]
+    assert "Чекаю на звіти!" in sender.texts[1]
+
+    # Перевіряємо, що курсор коректно збережено і повторний виклик нічого не шле
+    await flow.process(CHAT, trigger="push")
+    assert len(sender.texts) == 2
+
+
+async def test_settle_timer_not_blocked_by_pending_messages(tmp_path):
+    """T-02: settle (00:05) не блокується наявністю pending."""
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    flow.store.set_state("lives_sasha", "1")
+    flow.store.set_state("lives_lyosha", "4")
+    # Льоша здав за вчора (2026-10-03), Саша не здав
+    flow.store.set_done("lyosha", True, "2026-10-03")
+
+    # О 00:05 є pending повідомлення від Саші (не звіт)
+    clock.at(0, 5, 0)
+    flow.record_user_message(CHAT, DAD, "Я спати", created_at=clock.value)
+
+    await flow.process(CHAT, trigger="timer", job="settle")
+
+    # Відповідь на повідомлення + повідомлення про розрахунок/дискваліфікацію
+    assert len(sender.texts) >= 2
+    assert challenge.get_lives(flow.store)["sasha"] == 0
+    assert any("Дискваліфікація" in t for t in sender.texts)
+
+
+# --- T-03: Anti-cheat interim — не зараховувати GIF/animation автоматично ---
+
+def test_describe_message_distinguishes_gif_and_video():
+    """T-03: describe_message для animation ставить плейсхолдер що НЕ є відеозвітом."""
+    anim_msg = SimpleNamespace(
+        reply_to_message=None,
+        animation=SimpleNamespace(file_id="gif123"),
+        video=None,
+        video_note=None,
+        photo=None,
+        text=None,
+        caption="мемчик",
+    )
+    desc_anim = describe_message(anim_msg)
+    assert "[Надіслано GIF/анімацію — не є відеозвітом]." in desc_anim
+    assert "мемчик" in desc_anim
+
+    vid_msg = SimpleNamespace(
+        reply_to_message=None,
+        animation=None,
+        video=SimpleNamespace(file_id="vid123"),
+        video_note=None,
+        photo=None,
+        text=None,
+        caption="звіт",
+    )
+    desc_vid = describe_message(vid_msg)
+    assert "[Надіслано відеозвіт виконання норми]." in desc_vid
+
+    vnote_msg = SimpleNamespace(
+        reply_to_message=None,
+        animation=None,
+        video=None,
+        video_note=SimpleNamespace(file_id="vn123"),
+        photo=None,
+        text=None,
+        caption=None,
+    )
+    desc_vnote = describe_message(vnote_msg)
+    assert "[Надіслано відеозвіт виконання норми]." in desc_vnote
+
+
+def test_report_judge_fallback_rejects_gif(tmp_path):
+    """T-03: ReportJudgeAgent.fallback не ставить done=True на GIF/анімацію."""
+    store = Store(str(tmp_path / "judge.db"))
+    store.init_schema()
+    ensure_default_users(store)
+    not_done = {"lyosha": False, "sasha": False}
+
+    gif_msg = ChatMessage(1, SON, "user", "[Надіслано GIF/анімацію — не є відеозвітом]. Смішний котик", "2026-10-04 12:00:00")
+    verdict = ReportJudgeAgent.fallback([gif_msg], not_done, store)
+    assert len(verdict.reports) == 0
+
+    # Звичайний відеозвіт успішно зараховується
+    video_msg = ChatMessage(2, SON, "user", "[Надіслано відеозвіт виконання відтискань].", "2026-10-04 12:01:00")
+    verdict_vid = ReportJudgeAgent.fallback([video_msg], not_done, store)
+    assert len(verdict_vid.reports) == 1
+    assert verdict_vid.reports[0].participant == "lyosha"
+    assert verdict_vid.reports[0].done is True
+
+
+async def test_flow_offline_gif_does_not_count_as_progress(tmp_path):
+    """T-03: GIF/анімація у flow не призводить до зарахування прогресу."""
+    flow, sender, clock = make_flow(tmp_path, llm=None)
+    await say(flow, clock, SON, "[Надіслано GIF/анімацію — не є відеозвітом]. котик танцює")
+    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": False, "sasha": False}
+
+    # А відеозвіт зараховується
+    await say(flow, clock, SON, "[Надіслано відеозвіт виконання норми].")
+    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": True, "sasha": False}

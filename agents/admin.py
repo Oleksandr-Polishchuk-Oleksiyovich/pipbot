@@ -14,7 +14,7 @@ from database.store import ChatMessage, DIFFICULTY_LIVES
 logger = logging.getLogger(__name__)
 
 # Ключі, які set_counter не має права перезаписувати — для них є окремі тули або це службові дані.
-PROTECTED_KEYS = {"last_processed_timestamp", "lives_settled_through", "custom_system_prompt"}
+PROTECTED_KEYS = {"last_processed_timestamp", "last_processed_id", "lives_settled_through", "custom_system_prompt"}
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
 
 
