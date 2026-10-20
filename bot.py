@@ -168,6 +168,37 @@ def build_app():
         lines.append("\n🎉 **Усі закрили день!** 🥇" if s["done"] and all(s["done"].values()) else "\n⚡ Дотискайте норму, день ще триває!")
         await reply_command(message, "\n".join(lines))
 
+    @dp.message(Command("approve"))
+    async def cmd_approve(message: Message):
+        user = message.from_user
+        name = (user.full_name or user.first_name) if user else "Користувач"
+        u = flow.record_user_message(
+            message.chat.id,
+            name,
+            message.text or "",
+            telegram_id=user.id if user else None,
+            username=user.username if user else None,
+        )
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await reply_command(message, "⚠️ Використання: `/approve <request_id>`")
+            return
+        req_id = parts[1].strip()
+        _, reply = await flow.handle_approve(message.chat.id, req_id, u, reply_to_message_id=message.message_id)
+
+    @dp.message(Command("rollback"))
+    async def cmd_rollback(message: Message):
+        user = message.from_user
+        name = (user.full_name or user.first_name) if user else "Користувач"
+        u = flow.record_user_message(
+            message.chat.id,
+            name,
+            message.text or "",
+            telegram_id=user.id if user else None,
+            username=user.username if user else None,
+        )
+        _, reply = await flow.handle_rollback(message.chat.id, u, reply_to_message_id=message.message_id)
+
     @dp.message()
     async def on_message(message: Message):
         if message.text and message.text.startswith("/"):

@@ -24,8 +24,15 @@ from agents.onboarding import OnboardingAgent
 from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptMergerAgent, PromptVerifierAgent
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
+from app.offload import RoutineOffloadClient
 from core import challenge
 from core.config import OBEY_MEDIA_DIR, TIMEZONE
+from core.guardrails import (
+    check_active_request_limit,
+    check_admin_rate_limit,
+    is_admin_allowed,
+    is_forbidden_path,
+)
 from core.llm import GeminiLLM, LLMUnavailable
 from database.store import ChatMessage, Store, User, format_ts
 from migrate_users import ensure_default_users, migrate_dynamic_prompt
@@ -49,12 +56,14 @@ class Sender(Protocol):
 class ChatFlow:
     def __init__(self, store: Store, llm: Optional[GeminiLLM], sender: Sender,
                  now: Callable[[], datetime] = lambda: datetime.now(TIMEZONE),
-                 obey_media_dir: str = OBEY_MEDIA_DIR):
+                 obey_media_dir: str = OBEY_MEDIA_DIR,
+                 offload_client: Optional[RoutineOffloadClient] = None):
         self.store = store
         self.llm = llm
         self.sender = sender
         self.now = now
         self.obey_media_dir = obey_media_dir
+        self.offload_client = offload_client or RoutineOffloadClient(store, now_fn=self.now)
         self._lock = asyncio.Lock()
         self._chat_members_cache: Dict = {}
 
@@ -64,7 +73,13 @@ class ChatFlow:
         self.coach = CoachAgent(llm, store, chat_members_fetcher=lambda: self._chat_members_cache)
         self.editor = CoachPromptEditor(PromptConflictAgent(llm, store), PromptMergerAgent(llm, store),
                                         PromptVerifierAgent(llm, store))
-        self.admin = AdminAgent(llm, store, self.editor, chat_members_fetcher=lambda: self._chat_members_cache)
+        self.admin = AdminAgent(
+            llm,
+            store,
+            self.editor,
+            chat_members_fetcher=lambda: self._chat_members_cache,
+            offload_client=self.offload_client,
+        )
 
     def init_storage(self) -> None:
         self.store.init_schema()
@@ -365,6 +380,35 @@ class ChatFlow:
         for slug, (user, user_msgs) in uninit_by_slug.items():
             await self._handle_onboarding(chat_id, user, user_msgs, history)
 
+        # Перевірка на команди адміна /approve та /rollback
+        for m in list(active_pending):
+            text_strip = (m.text or "").strip()
+            # Команда /approve <request_id>
+            if text_strip.startswith("/approve") or "/approve" in text_strip.lower():
+                parts = text_strip.split()
+                approve_idx = -1
+                for idx, p in enumerate(parts):
+                    if p.lower() == "/approve" and idx + 1 < len(parts):
+                        approve_idx = idx + 1
+                        break
+                if approve_idx != -1:
+                    target_req_id = parts[approve_idx].strip()
+                    user = self.store.find_user(challenge.normalize_participant(m.user_name, self.store) or m.user_name)
+                    if user is None:
+                        user = self.store.resolve_or_create_user(m.user_name, today_iso)
+                    await self.handle_approve(chat_id, target_req_id, user, reply_to_message_id=m.id)
+                    active_pending.remove(m)
+                    continue
+
+            # Команда /rollback
+            if text_strip.startswith("/rollback") or "/rollback" in text_strip.lower():
+                user = self.store.find_user(challenge.normalize_participant(m.user_name, self.store) or m.user_name)
+                if user is None:
+                    user = self.store.resolve_or_create_user(m.user_name, today_iso)
+                await self.handle_rollback(chat_id, user, reply_to_message_id=m.id)
+                active_pending.remove(m)
+                continue
+
         if not active_pending:
             return
 
@@ -375,8 +419,10 @@ class ChatFlow:
             decision = RouterAgent.fallback(active_pending)
         logger.info("Route decision: %s", decision.model_dump())
 
-        if decision.route == "admin":
-            await self._handle_admin(chat_id, decision, active_pending, history)
+        if decision.is_admin_dev:
+            await self._handle_admin_dev(chat_id, decision, active_pending, history)
+        elif decision.is_admin_quick or decision.is_admin:
+            await self._handle_admin_quick(chat_id, decision, active_pending, history)
         elif decision.route == "coach":
             await self._handle_coach(chat_id, active_pending, history)
 
@@ -395,16 +441,217 @@ class ChatFlow:
             reply = OnboardingAgent.fallback(self.store, user, pending, today)
         await self._say(chat_id, reply)
 
-    async def _handle_admin(self, chat_id: int, decision: RouteDecision, pending: List[ChatMessage],
-                            history: List[ChatMessage]) -> None:
+    async def _handle_admin_dev(
+        self,
+        chat_id: int,
+        decision: RouteDecision,
+        pending: List[ChatMessage],
+        history: List[ChatMessage],
+    ) -> None:
+        last_msg = pending[-1] if pending else None
+        msg_id = last_msg.id if last_msg else None
+        author_slug = challenge.normalize_participant(decision.sender, self.store) or decision.sender
+        user = self.store.find_user(author_slug)
+        telegram_id = user.telegram_id if user else None
+
+        # Guardrail: Allowlist check (T-52)
+        if not is_admin_allowed(telegram_id):
+            reply = (
+                "❌ **Доступ заборонено.**\n"
+                "Ваш Telegram ID не входить до списку дозволених адміністраторів для змін системи."
+            )
+            await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
+            return
+
+        # Guardrail: Rate limit check (T-52)
+        allowed, rate_msg = check_admin_rate_limit(
+            self.store,
+            author_slug=author_slug,
+            author_telegram_id=telegram_id,
+            now=self.now(),
+        )
+        if not allowed:
+            reply = f"⚠️ **Запит відхилено:** {rate_msg}"
+            await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
+            return
+
+        # Guardrail: Active request check (T-52: один активний запит одночасно)
+        allowed_active, active_id = check_active_request_limit(
+            self.store,
+            author_slug=author_slug,
+            author_telegram_id=telegram_id,
+        )
+        if not allowed_active and active_id:
+            reply = (
+                f"⚠️ **Вже є активний запит в обробці** (`{active_id}`). "
+                "Будь ласка, зачекайте завершення попереднього запиту перед створенням нового."
+            )
+            await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
+            return
+
+        # 2. Generate request_id
+        request_id = str(uuid.uuid4())
+
+        # 3. Log to admin_audit
+        self.store.create_admin_audit(
+            request_id=request_id,
+            author_slug=author_slug,
+            author_telegram_id=telegram_id,
+            request=decision.directive or (last_msg.text if last_msg else ""),
+            plan="admin_dev offload to Grok Box",
+            status="planned",
+        )
+
+        # 4. Immediate ack (T-50): «Прийняв, виконую. request_id=…»
+        ack_text = f"Прийняв, виконую. request_id={request_id}"
+        await self._say_reply(chat_id, ack_text, reply_to_message_id=msg_id)
+
+        # 5. Offload to box (Contract 8.1)
+        payload_data = {
+            "directive": decision.directive,
+            "text": last_msg.text if last_msg else "",
+            "recent_messages": [m.render() for m in history[-10:]],
+        }
+        user_info = {
+            "telegram_id": telegram_id,
+            "username": user.username if user else None,
+            "slug": author_slug,
+        }
+        try:
+            await self.offload_client.offload(
+                request_type="admin",
+                request_id=request_id,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_to_message_id=msg_id,
+                user=user_info,
+                payload_data=payload_data,
+                reply_mode="callback",
+            )
+        except Exception as e:
+            logger.error("Failed to offload admin_dev request %s: %s", request_id, e)
+
+    async def _handle_admin_quick(
+        self,
+        chat_id: int,
+        decision: RouteDecision,
+        pending: List[ChatMessage],
+        history: List[ChatMessage],
+    ) -> None:
         await self._send_obey_video(chat_id)
         try:
-            reply, _ = await self._call(self.admin.execute, self.now().date(), decision.directive,
-                                        decision.sender, pending, history)
+            reply, _ = await self._call(
+                self.admin.execute,
+                self.now().date(),
+                decision.directive,
+                decision.sender,
+                pending,
+                history,
+            )
         except LLMUnavailable as e:
             logger.error("Admin agent unavailable: %s", e)
             reply = FALLBACK_ADMIN_MESSAGE
         await self._say(chat_id, reply)
+
+    async def _handle_admin(
+        self,
+        chat_id: int,
+        decision: RouteDecision,
+        pending: List[ChatMessage],
+        history: List[ChatMessage],
+    ) -> None:
+        if decision.is_admin_dev:
+            await self._handle_admin_dev(chat_id, decision, pending, history)
+        else:
+            await self._handle_admin_quick(chat_id, decision, pending, history)
+
+    async def handle_approve(
+        self,
+        chat_id: int,
+        request_id: str,
+        user: User,
+        reply_to_message_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        T-52: Команда /approve <request_id>.
+        Схвалює запит на деплой змін у заборонених зонах (branch auto/<request_id>).
+        """
+        if not is_admin_allowed(user.telegram_id):
+            reply = "❌ **Доступ заборонено.** Тільки дозволені адміністратори можуть схвалювати деплой заборонених зон."
+            await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+            return False, reply
+
+        audit = self.store.get_admin_audit(request_id)
+        if audit is None:
+            reply = f"❌ Запит із `request_id={request_id}` не знайдено в журналі `admin_audit`."
+            await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+            return False, reply
+
+        if audit.status not in ("waiting_approval", "planned"):
+            reply = f"⚠️ Запит `{request_id}` уже має статус `{audit.status}` і не очікує підтвердження."
+            await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+            return False, reply
+
+        self.store.update_admin_audit(request_id, status="approved")
+        self.store.update_offload_request(request_id, status="approved")
+
+        reply = f"✅ **Запит `{request_id}` схвалено!** Дозволено деплой гілки `auto/{request_id}`."
+        await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+        logger.info("Admin %s approved request_id=%s", user.slug, request_id)
+        return True, reply
+
+    async def handle_rollback(
+        self,
+        chat_id: int,
+        user: User,
+        reply_to_message_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        T-52: Команда /rollback.
+        Відкочує реліз на попередній symlink через скрипт деплою або gateway.
+        """
+        if not is_admin_allowed(user.telegram_id):
+            reply = "❌ **Доступ заборонено.** Тільки дозволені адміністратори можуть запускати rollback."
+            await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+            return False, reply
+
+        rollback_id = f"rollback_{uuid.uuid4().hex[:8]}"
+        self.store.create_admin_audit(
+            request_id=rollback_id,
+            author_slug=user.slug,
+            author_telegram_id=user.telegram_id,
+            request="/rollback",
+            plan="Manual rollback to previous release symlink",
+            status="approved",
+        )
+
+        deploy_script = os.getenv("DEPLOY_SCRIPT_PATH", "deploy/deploy.sh")
+        success = True
+        detail = ""
+        if os.path.isfile(deploy_script) and os.access(deploy_script, os.X_OK):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    deploy_script, "rollback",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    success = False
+                    detail = stderr.decode().strip()
+            except Exception as e:
+                logger.warning("Deploy script rollback execution error: %s", e)
+                detail = str(e)
+
+        if success:
+            self.store.update_admin_audit(rollback_id, status="deployed")
+            reply = "⏮️ **Відкат виконано!** Повернуто попередню стабільну версію бота."
+        else:
+            self.store.update_admin_audit(rollback_id, status="failed")
+            reply = f"⚠️ Помилка під час виконання відкату: {detail}"
+
+        await self._say_reply(chat_id, reply, reply_to_message_id=reply_to_message_id)
+        return success, reply
 
     async def _handle_coach(self, chat_id: int, pending: List[ChatMessage], history: List[ChatMessage]) -> None:
         today = self.now().date()

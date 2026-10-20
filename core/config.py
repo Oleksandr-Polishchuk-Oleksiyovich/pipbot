@@ -60,3 +60,13 @@ ADMIN_PASSPHRASE_MARKERS = [
     "осуварі",
     "осувари",
 ]
+
+# Guardrails та allowlist адмінів (T-52):
+# Список дозволених telegram_id адмінів. Якщо порожній, дозволяє доступ за наявності passphrase.
+ADMIN_TELEGRAM_IDS = [
+    int(x.strip())
+    for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
+    if x.strip().isdigit()
+]
+ADMIN_DEV_RATE_LIMIT_HOUR = int(os.getenv("ADMIN_DEV_RATE_LIMIT_HOUR", "5"))
+

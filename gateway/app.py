@@ -144,6 +144,43 @@ async def handle_post_deploy(request: web.Request) -> web.Response:
         logger.warning("Deploy auth failed for request_id=%s: %s", request_id, reason)
         return web.json_response({"error": "unauthorized", "detail": reason}, status=401)
 
+    # T-52 Guardrails: перевірка заборонених зон (.env, deploy/*, systemd, etc.)
+    files_changed = data.get("files", [])
+    branch = data.get("branch", "")
+    requires_approval = data.get("requires_approval", False)
+
+    from core.guardrails import check_changes_forbidden
+    is_forbidden, forbidden_reasons = check_changes_forbidden(files_changed) if files_changed else (False, [])
+
+    if is_forbidden or requires_approval or branch.startswith("auto/"):
+        store: Store = request.app[STORE_KEY]
+        audit = store.get_admin_audit(request_id)
+        if audit is None or audit.status != "approved":
+            logger.warning(
+                "Deploy blocked for request_id=%s: forbidden zone change requires approval (%s)",
+                request_id,
+                forbidden_reasons,
+            )
+            if audit is None:
+                store.create_admin_audit(
+                    request_id=request_id,
+                    request=f"Deploy for sha {sha}",
+                    plan="; ".join(forbidden_reasons),
+                    status="waiting_approval",
+                )
+            else:
+                store.update_admin_audit(request_id, status="waiting_approval")
+            return web.json_response(
+                {
+                    "error": "approval_required",
+                    "request_id": request_id,
+                    "status": "waiting_approval",
+                    "detail": "Changes touch forbidden zones (.env, deploy/*, systemd, etc.) and require /approve <request_id>",
+                    "reasons": forbidden_reasons,
+                },
+                status=403,
+            )
+
     status_dir = request.app[STATUS_DIR_KEY]
     os.makedirs(status_dir, exist_ok=True)
     status_file = os.path.join(status_dir, f"{request_id}.json")
@@ -347,6 +384,19 @@ async def handle_post_callback(request: web.Request) -> web.Response:
                 reply_to_message_id=data.get("reply_to_message_id"),
                 status=status_val,
                 commit_sha=commit_sha,
+            )
+
+        # Оновлення admin_audit (T-52)
+        audit = store.get_admin_audit(request_id)
+        audit_status = "deployed" if status_val == "done" else "failed"
+        if audit:
+            store.update_admin_audit(request_id, status=audit_status, commit_sha=commit_sha)
+        else:
+            store.create_admin_audit(
+                request_id=request_id,
+                request=f"Admin callback ({status_val})",
+                commit_sha=commit_sha,
+                status=audit_status,
             )
 
         if reply_text:

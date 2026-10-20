@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from datetime import date
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from agents.base import PromptAgent, render_messages
 from agents.onboarding import normalize_difficulty
@@ -21,10 +21,27 @@ _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
 class AdminAgent(PromptAgent):
     prompt_key = "admin"
 
-    def __init__(self, llm, store, editor: CoachPromptEditor, chat_members_fetcher: Optional[Callable[[], dict]] = None):
+    def __init__(
+        self,
+        llm,
+        store,
+        editor: CoachPromptEditor,
+        chat_members_fetcher: Optional[Callable[[], dict]] = None,
+        offload_client: Optional[object] = None,
+        box_available: Optional[Union[bool, Callable[[], bool]]] = None,
+    ):
         super().__init__(llm, store)
         self.editor = editor
         self.chat_members_fetcher = chat_members_fetcher
+        self.offload_client = offload_client
+        self._box_available = box_available
+
+    def is_box_available(self) -> bool:
+        if self._box_available is not None:
+            return bool(self._box_available() if callable(self._box_available) else self._box_available)
+        if self.offload_client is not None:
+            return bool(getattr(self.offload_client, "webhook_url", None))
+        return False
 
     def _tools(self, today: date, author: str, actions: List[str]) -> list:
         store, editor, fetcher = self.store, self.editor, self.chat_members_fetcher
@@ -205,23 +222,65 @@ class AdminAgent(PromptAgent):
         def update_coach_prompt(rule: str, original_quote: str, valid_until: str = "") -> str:
             """
             Змінити поведінку, стиль, звертання, титули чи правила спілкування тренера.
+            За замовчуванням (якщо Grok Box доступний) офлоадить на box для створення git-міграції.
+            Якщо box недоступний — аварійний офлайн-fallback у локальну БД (updated_by='bot_fallback').
             :param rule: одне атомарне правило — повне, однозначне, від третьої особи («Льошу називати …»).
             :param original_quote: ДОСЛІВНА цитата наказу з чату (з усіма назвами, титулами й числами як є).
             :param valid_until: '' — постійне правило; або дата YYYY-MM-DD, до якої правило діє включно.
             """
             change = RuleChange(rule=rule, quote=original_quote, until=valid_until,
                                 author=author, issued=today.isoformat())
-            result = editor.apply(change)
-            actions.append(f"update_coach_prompt(strategy={result.strategy}, v{result.version})")
+
+            if self.is_box_available():
+                import uuid
+                request_id = str(uuid.uuid4())
+                payload = {
+                    "action": "update_coach_prompt",
+                    "rule": rule,
+                    "original_quote": original_quote,
+                    "valid_until": valid_until,
+                    "author": author,
+                    "issued": today.isoformat(),
+                }
+                store.create_offload_request(
+                    request_id=request_id,
+                    type="admin",
+                    author_slug=author,
+                    payload=payload,
+                    status="sent",
+                )
+                actions.append(f"update_coach_prompt(offload_to_box, request_id={request_id})")
+                return (
+                    f"Запит на зміну правил тренера передано на Grok Box (admin_dev, request_id={request_id}). "
+                    f"Зміни буде внесено через git-міграцію."
+                )
+
+            # Fallback у разі недоступності box: пишемо в локальну БД з updated_by='bot_fallback'
+            result = editor.apply(change, updated_by="bot_fallback")
+            actions.append(f"update_coach_prompt(fallback=bot_fallback, strategy={result.strategy}, v{result.version})")
             if not result.changed:
                 return f"Правило вже діє, змін не потрібно ({result.reason})."
-            return f"Правила тренера оновлено (стратегія: {result.strategy}, версія {result.version})."
+            return f"Grok Box недоступний — правило застосовано локально (bot_fallback, версія {result.version}). Позначено для reconcile."
 
         def reset_coach_prompt() -> str:
             """Скинути всі динамічні правила тренера до порожніх (лишається тільки базова роль)."""
-            version = editor.reset(author)
-            actions.append(f"reset_coach_prompt(v{version})")
-            return f"Динамічні правила скинуто (версія {version})."
+            if self.is_box_available():
+                import uuid
+                request_id = str(uuid.uuid4())
+                payload = {"action": "reset_coach_prompt", "author": author, "issued": today.isoformat()}
+                store.create_offload_request(
+                    request_id=request_id,
+                    type="admin",
+                    author_slug=author,
+                    payload=payload,
+                    status="sent",
+                )
+                actions.append(f"reset_coach_prompt(offload_to_box, request_id={request_id})")
+                return f"Запит на скидання динамічних правил передано на Grok Box (admin_dev, request_id={request_id})."
+
+            version = editor.reset(author, updated_by="bot_fallback")
+            actions.append(f"reset_coach_prompt(fallback=bot_fallback, v{version})")
+            return f"Grok Box недоступний — динамічні правила скинуто локально (bot_fallback, версія {version})."
 
         def show_coach_prompt() -> str:
             """Показати чинні динамічні правила тренера."""

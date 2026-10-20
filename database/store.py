@@ -110,6 +110,20 @@ class OffloadRequest:
 
 
 @dataclass
+class AdminAudit:
+    id: int
+    request_id: str
+    author_slug: Optional[str] = None
+    author_telegram_id: Optional[int] = None
+    request: Optional[str] = None
+    plan: Optional[str] = None
+    commit_sha: Optional[str] = None
+    status: str = "planned"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
 class User:
     slug: str
     telegram_id: Optional[int] = None
@@ -233,6 +247,27 @@ def _row_to_offload_request(row: Tuple) -> OffloadRequest:
         expires_at=row[10],
         created_at=row[11] or "",
         updated_at=row[12] or "",
+    )
+
+
+_ADMIN_AUDIT_COLS = (
+    "id, request_id, author_slug, author_telegram_id, request, "
+    "plan, commit_sha, status, created_at, updated_at"
+)
+
+
+def _row_to_admin_audit(row: Tuple) -> AdminAudit:
+    return AdminAudit(
+        id=row[0],
+        request_id=row[1],
+        author_slug=row[2],
+        author_telegram_id=row[3],
+        request=row[4],
+        plan=row[5],
+        commit_sha=row[6],
+        status=row[7],
+        created_at=row[8] or "",
+        updated_at=row[9] or "",
     )
 
 
@@ -362,6 +397,20 @@ class Store:
                     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_offload_requests_status ON offload_requests(status);
+                CREATE TABLE IF NOT EXISTS admin_audit (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id          TEXT NOT NULL,
+                    author_slug         TEXT,
+                    author_telegram_id  INTEGER,
+                    request             TEXT,
+                    plan                TEXT,
+                    commit_sha          TEXT,
+                    status              TEXT NOT NULL DEFAULT 'planned',
+                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_admin_audit_request_id ON admin_audit(request_id);
+                CREATE INDEX IF NOT EXISTS idx_admin_audit_status ON admin_audit(status);
             """)
 
     # --- USERS ---
@@ -1045,6 +1094,189 @@ class Store:
             rows = con.execute(query, (now_str,)).fetchall()
         return [_row_to_offload_request(r) for r in rows]
 
+    # --- ADMIN AUDIT (T-52) ---
+    def create_admin_audit(
+        self,
+        request_id: str,
+        *,
+        author_slug: Optional[str] = None,
+        author_telegram_id: Optional[int] = None,
+        request: Optional[str] = None,
+        plan: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        status: str = "planned",
+    ) -> AdminAudit:
+        with self._connect() as con:
+            cur = con.cursor()
+            cur.execute(
+                """
+                INSERT INTO admin_audit (
+                    request_id, author_slug, author_telegram_id, request,
+                    plan, commit_sha, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                """,
+                (
+                    request_id,
+                    author_slug,
+                    author_telegram_id,
+                    request,
+                    plan or "",
+                    commit_sha,
+                    status,
+                ),
+            )
+        audit = self.get_admin_audit(request_id)
+        if audit is None:
+            raise RuntimeError(f"Failed to create admin_audit for request_id={request_id}")
+        return audit
+
+    def get_admin_audit(self, request_id: str) -> Optional[AdminAudit]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {_ADMIN_AUDIT_COLS} FROM admin_audit WHERE request_id = ? ORDER BY id DESC LIMIT 1",
+                (request_id,),
+            ).fetchone()
+        return _row_to_admin_audit(row) if row else None
+
+    def update_admin_audit(
+        self,
+        request_id: str,
+        *,
+        status: Optional[str] = None,
+        plan: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+    ) -> None:
+        updates: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if plan is not None:
+            updates.append("plan = ?")
+            params.append(plan)
+        if commit_sha is not None:
+            updates.append("commit_sha = ?")
+            params.append(commit_sha)
+
+        updates.append("updated_at = datetime('now')")
+        if not updates:
+            return
+        params.append(request_id)
+        with self._connect() as con:
+            con.execute(
+                f"UPDATE admin_audit SET {', '.join(updates)} WHERE request_id = ?",
+                tuple(params),
+            )
+
+    def list_admin_audits(self, status: Optional[str] = None, limit: int = 50) -> List[AdminAudit]:
+        query = f"SELECT {_ADMIN_AUDIT_COLS} FROM admin_audit"
+        params: tuple = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY id DESC LIMIT ?"
+        with self._connect() as con:
+            rows = con.execute(query, (*params, limit)).fetchall()
+        return [_row_to_admin_audit(r) for r in rows]
+
+    def count_recent_admin_audits(
+        self,
+        author_slug: Optional[str] = None,
+        author_telegram_id: Optional[int] = None,
+        since_dt: Optional[datetime] = None,
+    ) -> int:
+        if since_dt is None:
+            cutoff = (datetime.now() - timedelta(hours=1)).strftime(TS_FORMAT)
+        else:
+            cutoff = since_dt.strftime(TS_FORMAT)
+
+        query = "SELECT COUNT(*) FROM admin_audit WHERE created_at >= ?"
+        params: List[Any] = [cutoff]
+        if author_slug is not None:
+            query += " AND author_slug = ?"
+            params.append(author_slug)
+        elif author_telegram_id is not None:
+            query += " AND author_telegram_id = ?"
+            params.append(author_telegram_id)
+
+        with self._connect() as con:
+            row = con.execute(query, tuple(params)).fetchone()
+        return row[0] if row else 0
+
+    def get_active_admin_audit(
+        self,
+        author_slug: Optional[str] = None,
+        author_telegram_id: Optional[int] = None,
+    ) -> Optional[AdminAudit]:
+        active_statuses = ("planned", "waiting_approval", "approved", "running", "sent", "acked")
+        placeholders = ",".join("?" for _ in active_statuses)
+        query = f"SELECT {_ADMIN_AUDIT_COLS} FROM admin_audit WHERE status IN ({placeholders})"
+        params: List[Any] = list(active_statuses)
+        if author_slug is not None:
+            query += " AND author_slug = ?"
+            params.append(author_slug)
+        elif author_telegram_id is not None:
+            query += " AND author_telegram_id = ?"
+            params.append(author_telegram_id)
+        query += " ORDER BY id DESC LIMIT 1"
+        with self._connect() as con:
+            row = con.execute(query, tuple(params)).fetchone()
+        return _row_to_admin_audit(row) if row else None
+
+    # --- RECONCILE PROMPTS (T-53) ---
+    def get_unreconciled_prompts(self) -> List[Dict[str, Any]]:
+        """Знаходить усі активні промпти, оновлені аварійним bot_fallback."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT key, content, version, updated_by, updated_at FROM prompts WHERE updated_by = 'bot_fallback'"
+            ).fetchall()
+        return [
+            {"key": r[0], "content": r[1], "version": r[2], "updated_by": r[3], "updated_at": r[4]}
+            for r in rows
+        ]
+
 
 def format_ts(dt: datetime) -> str:
     return dt.strftime(TS_FORMAT)
+
+
+def apply_prompt_migration(conn: sqlite3.Connection, key: str, content: str, updated_by: str = "git_migration") -> int:
+    """Застосовує міграцію промпту в БД, оновлюючи prompts і архівуючи в prompt_history."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prompts (
+            key         TEXT PRIMARY KEY,
+            content     TEXT NOT NULL,
+            version     INTEGER DEFAULT 1,
+            updated_by  TEXT DEFAULT 'seed',
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prompt_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key         TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            version     INTEGER NOT NULL,
+            updated_by  TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    row = conn.execute("SELECT version FROM prompts WHERE key = ?", (key,)).fetchone()
+    version = (row[0] + 1) if row else 1
+    conn.execute(
+        """
+        INSERT INTO prompts (key, content, version, updated_by, updated_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            content = excluded.content,
+            version = excluded.version,
+            updated_by = excluded.updated_by,
+            updated_at = datetime('now')
+        """,
+        (key, content, version, updated_by),
+    )
+    conn.execute(
+        "INSERT INTO prompt_history (key, content, version, updated_by) VALUES (?, ?, ?, ?)",
+        (key, content, version, updated_by),
+    )
+    return version

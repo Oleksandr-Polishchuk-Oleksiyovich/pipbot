@@ -113,7 +113,7 @@ class CoachPromptEditor:
         self.verifier = verifier
         self.store = conflict.store
 
-    def apply(self, change: RuleChange) -> PromptEditResult:
+    def apply(self, change: RuleChange, updated_by: Optional[str] = None) -> PromptEditResult:
         current = self.store.get_prompt(COACH_DYNAMIC_KEY) or ""
         analysis = self.conflict.analyze(current, change)
         logger.info("Prompt conflict analysis: %s", analysis.model_dump())
@@ -138,8 +138,9 @@ class CoachPromptEditor:
             logger.warning("Saving merged prompt despite review rejection: %s", feedback)
         if not merged or len(merged) > MAX_DYNAMIC_PROMPT_CHARS:
             raise ValueError(f"Merged prompt rejected (length={len(merged)})")
-        version = self.store.save_prompt(COACH_DYNAMIC_KEY, merged, change.author)
+        updater = updated_by or change.author
+        version = self.store.save_prompt(COACH_DYNAMIC_KEY, merged, updater)
         return PromptEditResult(True, analysis.strategy, version, merged, analysis.reason, review)
 
-    def reset(self, author: str) -> int:
-        return self.store.save_prompt(COACH_DYNAMIC_KEY, "", author)
+    def reset(self, author: str, updated_by: Optional[str] = None) -> int:
+        return self.store.save_prompt(COACH_DYNAMIC_KEY, "", updated_by or author)
