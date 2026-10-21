@@ -233,7 +233,7 @@ fi
 
 echo "Running smoke check: build_app..."
 if [ -f "$TARGET_RELEASE/bot.py" ]; then
-    if ! (cd "$TARGET_RELEASE" && PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -c "import bot; bot.build_app(); print('build_app smoke ok')"); then
+    if ! (cd "$TARGET_RELEASE" && DB_PATH="$DB_PATH" PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -c "import bot; bot.build_app(); print('build_app smoke ok')"); then
         echo "ERROR: Bot build_app smoke check failed!" >&2
         write_status "failed" "$SHA" "build_app smoke check failed"
         exit 1
