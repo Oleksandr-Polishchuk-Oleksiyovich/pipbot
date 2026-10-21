@@ -122,7 +122,7 @@ def test_router_keyword_fallback_catches_spelling_variants():
 
 async def test_flow_without_gemini_uses_heuristics(tmp_path):
     flow, sender, clock = make_flow(tmp_path, llm=None)
-    await say(flow, clock, SON, "[Надіслано відеозвіт виконання відтискань].")
+    await say(flow, clock, SON, "Зробив, готово! +")
     assert flow.store.get_day_progress("2026-10-04") == {"lyosha": True, "sasha": False}
     assert "Льоша" in sender.texts[-1]
 
@@ -157,7 +157,7 @@ async def test_new_user_triggers_uninitialized_onboarding_and_activates(tmp_path
     assert challenge.day_targets(flow.store, date(2026, 10, 5))[maks.slug] == 13
 
     # 4. Тепер Макс повноцінний учасник і може здавати звіт!
-    await say(flow, clock, "Максим", "[Надіслано відеозвіт виконання норми]. Мої 12 готово!")
+    await say(flow, clock, "Максим", "Мої 12 готово!")
     assert flow.store.get_day_progress("2026-10-04")[maks.slug] is True
 
 
@@ -501,6 +501,6 @@ async def test_flow_offline_gif_does_not_count_as_progress(tmp_path):
     await say(flow, clock, SON, "[Надіслано GIF/анімацію — не є відеозвітом]. котик танцює")
     assert flow.store.get_day_progress("2026-10-04") == {"lyosha": False, "sasha": False}
 
-    # А відеозвіт зараховується
+    # Відеозвіт у тексті чату НЕ зараховується — відео судить лише CV (handle_video_callback)
     await say(flow, clock, SON, "[Надіслано відеозвіт виконання норми].")
-    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": True, "sasha": False}
+    assert flow.store.get_day_progress("2026-10-04") == {"lyosha": False, "sasha": False}

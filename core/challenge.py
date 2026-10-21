@@ -21,9 +21,31 @@ from migrate_users import ensure_default_users
 logger = logging.getLogger(__name__)
 
 EXERCISES = {
-    "pushups": {"name": "віджимання", "genitive": "віджимань", "emoji": "💪"},
-    "squats": {"name": "присідання", "genitive": "присідань", "emoji": "🦵"},
+    "pushups": {"name": "віджимання", "genitive": "віджимань", "emoji": "💪",
+                "forms": ("віджимання", "віджимання", "віджимань")},
+    "squats": {"name": "присідання", "genitive": "присідань", "emoji": "🦵",
+               "forms": ("присідання", "присідання", "присідань")},
 }
+
+# CV-класи (video_checks.exercise) -> ключі EXERCISES
+CV_EXERCISE_KEYS = {"pushup": "pushups", "pushups": "pushups", "squat": "squats", "squats": "squats"}
+
+
+def plural_uk(n: int, forms) -> str:
+    """Українська форма після числа: forms = (1, 2–4, 5+), напр. 1 присідання, 3 присідання, 5 присідань."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return forms[1]
+    return forms[2]
+
+
+def exercise_word(exercise_key: str, n: int) -> str:
+    """Назва вправи у правильній формі для числа n (exercise_key: 'pushups'/'squats' або CV-клас)."""
+    key = CV_EXERCISE_KEYS.get(exercise_key or "", exercise_key)
+    info = EXERCISES.get(key) or EXERCISES["pushups"]
+    return plural_uk(n, info["forms"])
 
 
 def _active_users(store: Store) -> List[User]:

@@ -1244,6 +1244,21 @@ class Store:
             rows = con.execute(query, params).fetchall()
         return [_row_to_video_check(r) for r in rows]
 
+    def has_video_check_today(self, user_slug: str, date_iso: Union[str, Any]) -> bool:
+        """Перевіряє, чи є в таблиці video_checks запис для user_slug за date_iso (будь-який статус)."""
+        if hasattr(date_iso, "strftime"):
+            date_str = date_iso.strftime("%Y-%m-%d")
+        elif hasattr(date_iso, "isoformat"):
+            date_str = date_iso.isoformat()[:10]
+        else:
+            date_str = str(date_iso)[:10]
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM video_checks WHERE user_slug = ? AND (substr(created_at, 1, 10) = ? OR created_at LIKE ?) LIMIT 1",
+                (user_slug, date_str, f"{date_str}%"),
+            ).fetchone()
+        return bool(row)
+
     # --- OFFLOAD REQUESTS ---
     def create_offload_request(
         self,

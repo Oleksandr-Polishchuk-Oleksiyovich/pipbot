@@ -160,7 +160,7 @@ def test_bot_texts_params_formatting_is_safe(tmp_path):
     store.init_schema()
     bt = BotTexts(store)
 
-    assert bt.get("success", reps=38, target=37) == "Красунчик! Норму 38/37 зараховано! Відпочивай 💪"
+    assert bt.get("success", reps=38, target=37, exercise="віджимань") == DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37, exercise="віджимань")
 
     # Відсутній параметр не ламає форматування — плейсхолдер лишається як є, без винятку
     text = bt.get("success")
@@ -252,16 +252,16 @@ async def test_low_camera_angle_credits_reps_and_appends_angle_hint(tmp_path):
 
 @pytest.mark.asyncio
 async def test_video_reply_paraphrase_used_when_llm_available(tmp_path):
-    fake_llm = FakeLLM(response="Окей, 38/37 — норму зараховано, все ок!")
+    fake_llm = FakeLLM(response="Побачив 38 віджимань з 37 — машина, норму зараховано!")
     flow, sender, _ = make_flow(tmp_path, llm=fake_llm)
     flow.store.create_video_check(
         request_id="req-para-ok", chat_id=CHAT, message_id=902, user_slug="lyosha",
         duration_s=45.0, exercise="pushup", reps=38, confidence=0.92, valid=True, status="done",
     )
     reply = await flow.handle_video_callback("req-para-ok")
-    assert reply == "Окей, 38/37 — норму зараховано, все ок!"
+    assert reply == "Побачив 38 віджимань з 37 — машина, норму зараховано!"
     assert fake_llm.calls
-    fixed_text = DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37)
+    fixed_text = DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37, exercise="віджимань")
     assert fixed_text in fake_llm.calls[0][1]
 
 
@@ -274,7 +274,7 @@ async def test_video_reply_paraphrase_falls_back_on_redo_wording(tmp_path):
         duration_s=45.0, exercise="pushup", reps=38, confidence=0.92, valid=True, status="done",
     )
     reply = await flow.handle_video_callback("req-para-redo")
-    assert reply == DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37)
+    assert reply == DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37, exercise="віджимань")
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_video_reply_paraphrase_falls_back_on_llm_error(tmp_path):
         duration_s=45.0, exercise="pushup", reps=38, confidence=0.92, valid=True, status="done",
     )
     reply = await flow.handle_video_callback("req-para-err")
-    assert reply == DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37)
+    assert reply == DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37, exercise="віджимань")
 
 
 @pytest.mark.asyncio
@@ -297,6 +297,6 @@ async def test_video_reply_paraphrase_rejected_when_numbers_change(tmp_path):
             return "Красунчик! 40/37 зараховано!"
     flow, sender, _ = make_flow(tmp_path, llm=None)
     flow.llm = _LLM()
-    fixed = DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37)
+    fixed = DEFAULT_BOT_TEXTS["success"].format(reps=38, target=37, exercise="віджимань")
     flow._call = lambda fn, *a: fn(*a)
     assert await flow._maybe_paraphrase_video_reply(fixed) == fixed

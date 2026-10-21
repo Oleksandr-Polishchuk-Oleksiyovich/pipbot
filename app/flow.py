@@ -352,12 +352,23 @@ class ChatFlow:
             self.store.set_done(user_slug, True, today.isoformat())
 
         # Persona reply
-        if verdict.category == "success":
-            reply_text = self.bot_texts.get("success", reps=check.reps, target=target)
-        else:
-            reply_text = self.bot_texts.get(verdict.category) or "Відео переглянуто, але зарахувати не можу."
+        day_ex = challenge.day_exercise(self.store, today)
+        reps = check.reps if check.reps is not None else 0
+        counted_key = challenge.CV_EXERCISE_KEYS.get(check.exercise or "", day_ex)
+        # Що побачив CV (у правильній формі для числа): «Побачив 4 присідання з 51»
+        exercise_gen = challenge.exercise_word(counted_key, reps)
 
-        reply_text = await self._maybe_paraphrase_video_reply(reply_text)
+        reply_text = self.bot_texts.get(
+            verdict.category, reps=reps, target=target, exercise=exercise_gen
+        ) or "Відео переглянуто, але зарахувати не можу."
+
+        seen_prefix = f"Побачив {reps} {exercise_gen} з {target}"
+        paraphrased = await self._maybe_paraphrase_video_reply(reply_text)
+        # Відповідь завжди починається з того, що побачив CV; перефраз без цього префікса відкидаємо.
+        if reply_text.startswith(seen_prefix) and not paraphrased.startswith(seen_prefix):
+            logger.info("Video reply paraphrase dropped the 'seen' prefix — using fixed text")
+            paraphrased = reply_text
+        reply_text = paraphrased
 
         for hint_key in verdict.hint_keys:
             hint_text = self.resolve_hint_text(hint_key)
@@ -893,12 +904,23 @@ class ChatFlow:
         targets = challenge.day_targets(self.store, today)
         pmap = challenge.participants_map(self.store)
         exercise = challenge.EXERCISES[challenge.day_exercise(self.store, today)]["genitive"]
+        date_iso = today.strftime("%Y-%m-%d") if hasattr(today, "strftime") else (today.isoformat()[:10] if hasattr(today, "isoformat") else str(today)[:10])
         for r in verdict.reports:
             if r.participant not in pmap:
                 continue
             if done_before.get(r.participant) == r.done:
                 continue
-            self.store.set_done(r.participant, r.done, today.isoformat())
+            if r.done:
+                ev = (r.evidence or "").lower()
+                is_video_evidence = "відеозвіт" in ev or "[надіслано відеозвіт" in ev
+                has_video_today = False
+                has_check_fn = getattr(self.store, "has_video_check_today", None)
+                if callable(has_check_fn):
+                    has_video_today = bool(has_check_fn(r.participant, date_iso))
+                if has_video_today or is_video_evidence:
+                    logger.info("Skipping LLM credit for %s: video reports are judged by CV only", r.participant)
+                    continue
+            self.store.set_done(r.participant, r.done, date_iso)
             name = pmap[r.participant]["name"]
             if r.done:
                 notes.append(f"{name}: ЗАРАХОВАНО норму {targets[r.participant]} {exercise} (доказ: {r.evidence})")

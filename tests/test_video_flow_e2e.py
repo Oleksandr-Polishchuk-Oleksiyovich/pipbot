@@ -120,7 +120,7 @@ async def test_flow_video_callback_near_miss(tmp_path):
     reply = await flow.handle_video_callback("req-e2e-near")
 
     assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
-    assert "не вистачає одного, докинеш?" in reply.lower()
+    assert reply.startswith("Побачив 36 віджимань з 37") and "не зараховано" in reply
     assert sender.replies[-1][0] == 556
 
 
@@ -146,7 +146,7 @@ async def test_flow_video_callback_far_below(tmp_path):
     reply = await flow.handle_video_callback("req-e2e-far")
 
     assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
-    assert "половини немає" in reply.lower()
+    assert reply.startswith("Побачив 12 віджимань з 37") and "не зараховано" in reply
     assert sender.replies[-1][0] == 557
 
 
@@ -171,7 +171,7 @@ async def test_flow_video_callback_bad_quality(tmp_path):
     reply = await flow.handle_video_callback("req-e2e-bad")
 
     assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
-    assert "нічорта не видно" in reply.lower()
+    assert reply.startswith("Побачив 20 віджимань з 37") and "зараховано" in reply
     assert sender.replies[-1][0] == 558
 
 
@@ -197,7 +197,7 @@ async def test_flow_video_callback_wrong_exercise(tmp_path):
     reply = await flow.handle_video_callback("req-e2e-wrong")
 
     assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
-    assert "не по темі" in reply.lower() or "думав, там" in reply.lower()
+    assert reply.startswith("Побачив ") and "інша вправа" in reply
     assert sender.replies[-1][0] == 559
 
 
