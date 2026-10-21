@@ -10,3 +10,7 @@ if _ilu.find_spec("numpy") is None:
     collect_ignore = globals().get("collect_ignore", []) + [
         "test_rep_counter.py", "test_cv_vision.py", "test_cv_worker.py", "test_box_cv_offload.py",
     ]
+
+# Never let a test invoke the real deploy/rollback script (it recursed on the VM).
+import os as _os
+_os.environ.setdefault("DEPLOY_SCRIPT_PATH", "/nonexistent/sportnerd-deploy.sh")
