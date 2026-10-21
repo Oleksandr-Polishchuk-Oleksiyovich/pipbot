@@ -117,14 +117,22 @@ else
     echo "Release directory already exists: $TARGET_RELEASE"
 fi
 
-# 2. Перевірка venv та requirements.txt
+# 2. Перевірка venv та requirements.txt (+ requirements-cv.txt для CV worker)
+# CV worker (sportnerd-cv.service) використовує той самий venv, тому за замовчуванням
+# ставимо requirements-cv.txt (він включає requirements.txt). INSTALL_CV=0 — лише core.
+INSTALL_CV="${INSTALL_CV:-1}"
 REQ_FILE="$TARGET_RELEASE/requirements.txt"
+REQ_CV_FILE="$TARGET_RELEASE/requirements-cv.txt"
+INSTALL_REQ="$REQ_FILE"
+if [ "$INSTALL_CV" = "1" ] && [ -f "$REQ_CV_FILE" ]; then
+    INSTALL_REQ="$REQ_CV_FILE"
+fi
 if [ -f "$REQ_FILE" ]; then
     REQ_HASH=""
     if command -v sha256sum >/dev/null 2>&1; then
-        REQ_HASH=$(sha256sum "$REQ_FILE" | cut -d' ' -f1)
+        REQ_HASH=$(cat "$REQ_FILE" "$INSTALL_REQ" | sha256sum | cut -d' ' -f1)
     elif command -v shasum >/dev/null 2>&1; then
-        REQ_HASH=$(shasum -a 256 "$REQ_FILE" | cut -d' ' -f1)
+        REQ_HASH=$(cat "$REQ_FILE" "$INSTALL_REQ" | shasum -a 256 | cut -d' ' -f1)
     fi
 
     CACHE_HASH_FILE="$VENV_DIR/.requirements.sha256"
@@ -134,20 +142,21 @@ if [ -f "$REQ_FILE" ]; then
     fi
 
     if [ -n "$REQ_HASH" ] && [ "$REQ_HASH" != "$PREV_HASH" ]; then
-        echo "requirements.txt changed (old=$PREV_HASH, new=$REQ_HASH); updating venv..."
+        echo "requirements changed (old=$PREV_HASH, new=$REQ_HASH); updating venv from $(basename "$INSTALL_REQ")..."
         if [ "$DRY_RUN" != "1" ]; then
             if [ ! -d "$VENV_DIR" ]; then
                 python3 -m venv "$VENV_DIR"
             fi
-            "$VENV_DIR/bin/pip" install --upgrade pip
-            "$VENV_DIR/bin/pip" install -r "$REQ_FILE"
+            # --no-cache-dir: менше диску/RAM на e2-micro (1GB)
+            "$VENV_DIR/bin/pip" install --no-cache-dir --upgrade pip
+            "$VENV_DIR/bin/pip" install --no-cache-dir -r "$INSTALL_REQ"
         else
             echo "DRY_RUN: skipping pip install"
         fi
         mkdir -p "$(dirname "$CACHE_HASH_FILE")"
         printf '%s\n' "$REQ_HASH" > "$CACHE_HASH_FILE"
     else
-        echo "requirements.txt unchanged; reusing existing venv."
+        echo "requirements unchanged; reusing existing venv."
     fi
 fi
 

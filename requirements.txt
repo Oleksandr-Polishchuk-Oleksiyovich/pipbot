@@ -1,0 +1,14 @@
+# SportNerdBot core runtime: bot (aiogram + APScheduler), gateway (aiohttp), LLM (google-genai).
+# Pinned from a working venv (Python 3.13). CV worker extras live in requirements-cv.txt.
+aiogram==3.31.0
+aiohttp==3.14.5
+APScheduler==3.11.3
+google-genai==2.32.0
+httpx==0.28.1
+pydantic==2.13.5
+python-dotenv==1.2.4
+pytz==2026.5
+
+# Offline test suite (deploy.sh runs pytest as a smoke check)
+pytest==9.1.1
+pytest-asyncio==1.4.0
