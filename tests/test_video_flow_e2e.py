@@ -52,10 +52,19 @@ def test_judge_video_fact_scenarios():
     assert v_mismatch.category == "wrong_exercise"
 
     # 7. Ненадійний ракурс камери (камера знизу/з підлоги)
-    low_cam_fact = VideoFact(exercise="pushup", reps=30, target=target, confidence=0.35, valid=False, flags=["low_camera_angle"])
+    # -> ніколи не відхиляємо за ракурс: зараховуємо як пораховано + camera_hint
+    low_cam_fact = VideoFact(exercise="pushup", reps=30, target=target, confidence=0.55, valid=True, flags=["low_camera_angle"])
     v_low_cam = ReportJudgeAgent.judge_video_fact(low_cam_fact)
-    assert v_low_cam.done is False
-    assert v_low_cam.category == "low_camera_angle"
+    assert v_low_cam.done is True
+    assert v_low_cam.category == "success"
+    assert v_low_cam.hint_keys == ["angle_hint"]
+    # Навіть дуже низька впевненість через ракурс не призводить до відмови
+    low_cam_fact2 = VideoFact(exercise="pushup", reps=30, target=target, confidence=0.35, valid=True, flags=["low_camera_angle", "low_body_visibility"])
+    assert ReportJudgeAgent.judge_video_fact(low_cam_fact2).done is True
+    # Нормальний ракурс — без підказки
+    assert ReportJudgeAgent.judge_video_fact(
+        VideoFact(exercise="pushup", reps=30, target=target, confidence=0.9, valid=True, flags=[])
+    ).hint_keys == []
 
 
 @pytest.mark.asyncio
@@ -192,34 +201,63 @@ async def test_flow_video_callback_wrong_exercise(tmp_path):
     assert sender.replies[-1][0] == 559
 
 
+REDO_WORDS = ("перезн", "зніми ще", "надішли знову", "надішли ще", "переробі", "переделай", "ще раз")
+
+
 @pytest.mark.asyncio
 async def test_flow_video_callback_low_camera_angle(tmp_path):
-    """Сценарій: ненадійний ракурс камери знизу/з підлоги -> відхилення + прохання перезняти збоку."""
+    """Ракурс знизу/з підлоги -> повтори зараховано одразу + порада на НАСТУПНЕ відео (без прохання переробити)."""
     flow, sender, _ = make_flow(tmp_path, llm=None)
 
-    check = flow.store.create_video_check(
+    flow.store.create_video_check(
         request_id="req-e2e-low-cam",
         chat_id=CHAT,
         message_id=560,
         user_slug="lyosha",
         duration_s=42.0,
         exercise="pushup",
-        reps=0,
-        confidence=0.35,
-        valid=False,
+        reps=40,
+        confidence=0.55,
+        valid=True,
         status="done",
         flags=["low_camera_angle"],
     )
 
     reply = await flow.handle_video_callback("req-e2e-low-cam")
 
-    # Норму НЕ зараховано
-    assert flow.store.get_day_progress("2026-10-04")["lyosha"] is False
-    # Coach persona reply українською з проханням перезняти збоку
-    assert "збоку" in reply.lower()
-    assert "знизу" in reply.lower() or "підлоги" in reply.lower()
-    # Реплай на повідомлення з відео
+    # Норму зараховано
+    assert flow.store.get_day_progress("2026-10-04")["lyosha"] is True
+    low = reply.lower()
+    assert "зараховано" in low
+    # Порада на наступний раз
+    assert "наступного разу" in low
+    assert "цілком" in low
+    # Жодного прохання переробити/перезняти
+    assert not any(w in low for w in REDO_WORDS)
     assert sender.replies[-1][0] == 560
+
+
+@pytest.mark.asyncio
+async def test_angle_hint_text_overridden_from_db(tmp_path):
+    """angle_hint резолвиться з БД (bot_state 'text:angle_hint'), якщо там є значення."""
+    flow, sender, _ = make_flow(tmp_path, llm=None)
+    flow.store.set_state("text:angle_hint", "Наступного разу постав камеру трохи вище 📹")
+    flow.store.create_video_check(
+        request_id="req-e2e-low-cam-db", chat_id=CHAT, message_id=561, user_slug="lyosha",
+        duration_s=42.0, exercise="pushup", reps=40, confidence=0.55, valid=True,
+        status="done", flags=["low_camera_angle"],
+    )
+    reply = await flow.handle_video_callback("req-e2e-low-cam-db")
+    assert flow.store.get_day_progress("2026-10-04")["lyosha"] is True
+    assert "постав камеру трохи вище" in reply
+
+
+def test_video_replies_never_ask_to_redo():
+    """Жодна відповідь на відео (fallbacks + camera hint) не просить перезняти/переробити підхід."""
+    from prompts import COACH_VIDEO_PERSONA_FALLBACKS, DEFAULT_HINT_TEXTS
+
+    for text in list(COACH_VIDEO_PERSONA_FALLBACKS.values()) + list(DEFAULT_HINT_TEXTS.values()):
+        assert not any(w in text.lower() for w in REDO_WORDS), text
 
 
 @pytest.mark.asyncio

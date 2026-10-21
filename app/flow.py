@@ -38,6 +38,7 @@ from database.store import ChatMessage, Store, User, format_ts
 from migrate_users import ensure_default_users, migrate_dynamic_prompt
 from prompts import (
     COACH_VIDEO_PERSONA_FALLBACKS,
+    DEFAULT_HINT_TEXTS,
     DEFAULT_PROMPTS,
     FALLBACK_ADMIN_MESSAGE,
     FALLBACK_GEMINI_MESSAGE,
@@ -224,6 +225,11 @@ class ChatFlow:
                 "Відео переглянуто, але зарахувати не можу."
             )
 
+        for hint_key in verdict.hint_keys:
+            hint_text = self.resolve_hint_text(hint_key)
+            if hint_text:
+                reply_text = f"{reply_text}\n{hint_text}"
+
         chat_id = check.chat_id
         reply_to_msg_id = check.message_id
 
@@ -244,6 +250,15 @@ class ChatFlow:
             )
 
         return reply_text
+
+    def resolve_hint_text(self, key: str) -> str:
+        """Текст підказки за ключем: спершу БД (bot_state 'text:<key>'), інакше дефолт із prompts.DEFAULT_HINT_TEXTS."""
+        try:
+            db_text = self.store.get_state(f"text:{key}", "")
+        except Exception as e:
+            logger.warning("Hint text lookup failed for %s: %s", key, e)
+            db_text = ""
+        return db_text or DEFAULT_HINT_TEXTS.get(key, "")
 
     async def _refresh_chat_members(self, chat_id: int) -> None:
         fetch_fn = getattr(self.sender, "fetch_chat_members", None)

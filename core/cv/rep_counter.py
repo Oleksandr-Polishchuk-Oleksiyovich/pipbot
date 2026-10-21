@@ -46,8 +46,23 @@ DEFAULTS = {"pushup": (100, 150), "squat": (110, 160)}
 
 
 def is_cv_available() -> bool:
-    """Перевіряє чи встановлені всі необхідні CV/ML бібліотеки (cv2, mediapipe, numpy, scipy)."""
-    return all(x is not None for x in (np, cv2, mp, vision, BaseOptions, find_peaks, savgol_filter))
+    """Перевіряє чи встановлені всі необхідні CV/ML бібліотеки (cv2, mediapipe, numpy, scipy)
+    і чи завантажується нативна бібліотека mediapipe (потребує системних libEGL/libGLES)."""
+    global _NATIVE_OK
+    if not all(x is not None for x in (np, cv2, mp, vision, BaseOptions, find_peaks, savgol_filter)):
+        return False
+    if _NATIVE_OK is None:
+        try:
+            from mediapipe.tasks.python.core import mediapipe_c_bindings
+            mediapipe_c_bindings.load_raw_library()
+            _NATIVE_OK = True
+        except Exception as e:  # OSError: libEGL.so.1 missing тощо
+            logger.warning("MediaPipe native library unavailable: %s", e)
+            _NATIVE_OK = False
+    return _NATIVE_OK
+
+
+_NATIVE_OK: Optional[bool] = None
 
 
 def find_model_path(model_type: str = "lite") -> Optional[str]:
@@ -456,20 +471,14 @@ def _analyze_landmarks(
         sw_med = float(np.nanmedian(sw_series))
         sw_rel_rng = float((np.nanpercentile(sw_series, 95) - np.nanpercentile(sw_series, 5)) / sw_med) if sw_med > 5.0 else 0.0
 
-    # Camera angle gate: detect floor-level / low camera angles (from below, e.g. hoodie)
-    if is_unreliable_camera_angle(P, V, meta, sh_y_frac=sh_y_frac, lower_vis=lower_vis, knee_vis=knee_vis, sw_rel_rng=sw_rel_rng):
+    # Camera angle check: floor-level / low camera angles (from below, e.g. hoodie).
+    # NEVER reject for angle: flag it, keep counting, lower confidence; the bot credits
+    # the reps and adds a camera-placement hint for the next video.
+    low_camera_angle = is_unreliable_camera_angle(
+        P, V, meta, sh_y_frac=sh_y_frac, lower_vis=lower_vis, knee_vis=knee_vis, sw_rel_rng=sw_rel_rng
+    )
+    if low_camera_angle:
         flags.append("low_camera_angle")
-        return _make_result(
-            request_id=request_id,
-            file_unique_id=file_unique_id,
-            duration_s=duration_s,
-            exercise="pushup" if (torso_med < 55 or lower_vis < 0.5) else "none",
-            reps=0,
-            confidence=0.35,
-            flags=flags,
-            valid=False,
-            elapsed_s=time.time() - t0,
-        )
 
     # 2. Vertical shoulder/nose motion signal (vy)
     reps_vy, pk_vy, vert_rng = count_pushups_vy(P, fps)
@@ -539,6 +548,9 @@ def _analyze_landmarks(
         valid = False
     else:
         valid = True
+
+    if low_camera_angle and valid:
+        confidence = min(confidence, 0.55)
 
     confidence = max(0.1, min(0.98, confidence))
 

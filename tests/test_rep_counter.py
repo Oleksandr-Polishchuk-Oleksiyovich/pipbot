@@ -110,10 +110,11 @@ def test_ground_truth_pushup_7xras():
 @pytest.mark.skipif(not is_cv_available(), reason="MediaPipe/CV dependencies not installed in this environment")
 @pytest.mark.skipif(not os.path.isfile(VIDEO_7XQZJ), reason="Ground truth video 7XQZJ not present")
 def test_ground_truth_pushup_7xqzj():
-    """T-31/Sequential benchmark: 7XQZJ (floor camera from below, hoodie) is gated as unreliable low camera angle."""
+    """T-31/Sequential benchmark: 7XQZJ (floor camera from below, hoodie) is flagged low_camera_angle but still counted."""
     res = analyze_video(VIDEO_7XQZJ, target_fps=12, max_side=480)
-    assert res["valid"] is False
     assert "low_camera_angle" in res["flags"]
+    assert res["reps"] > 0
+    assert res["valid"] is True
 
 
 @pytest.mark.skipif(not is_cv_available(), reason="MediaPipe/CV dependencies not installed in this environment")
@@ -283,15 +284,17 @@ def test_analyze_landmarks_synthetic_pushup_valid():
     assert "low_fps_undercount_risk" not in res["flags"]
 
 
-def test_analyze_landmarks_synthetic_low_camera_angle_gated():
-    """Тест _analyze_landmarks: ракурс з підлоги знизу блокується прапорцем low_camera_angle і valid=False."""
+def test_analyze_landmarks_synthetic_low_camera_angle_still_counted():
+    """Тест _analyze_landmarks: ракурс з підлоги знизу НЕ блокується — повтори пораховано, прапорець low_camera_angle, знижена впевненість."""
     P, V = make_synthetic_landmarks(num_reps=8, fps=12.0, duration_s=16.0, low_camera=True, base_y=300.0)
     meta = {"duration": 16.0, "width": 640, "height": 480, "fps": 12.0}
 
     res = _analyze_landmarks(P, V, fps=12.0, meta=meta, request_id="syn-low", file_unique_id="fuid-low", t0=0.0)
-    assert res["valid"] is False
     assert "low_camera_angle" in res["flags"]
-    assert res["confidence"] <= 0.5
+    assert res["exercise"] == "pushup"
+    assert res["reps"] == 8
+    assert res["valid"] is True
+    assert res["confidence"] <= 0.55
 
 
 def test_sampling_fps_below_10_warns_and_flags(caplog):

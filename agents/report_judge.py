@@ -32,6 +32,7 @@ class VideoVerdict(BaseModel):
     done: bool
     reason: str
     category: str  # "success" | "near_miss" | "far_below" | "bad_quality" | "wrong_exercise"
+    hint_keys: list = []  # ключі підказок (напр. "angle_hint"): повтори зараховано як пораховано, текст резолвиться окремо
 
 
 _REPORT_MARKERS = [
@@ -99,16 +100,18 @@ class ReportJudgeAgent(PromptAgent):
         """
         flags_set = set(fact.flags)
 
-        if "low_camera_angle" in flags_set or "unreliable_camera_angle" in flags_set:
-            return VideoVerdict(
-                done=False,
-                reason="Ненадійний ракурс камери: зйомка знизу/з підлоги",
-                category="low_camera_angle",
-            )
+        # Ракурс знизу/з підлоги НІКОЛИ не є причиною відмови: рахуємо як є, додаємо підказку.
+        low_angle = "low_camera_angle" in flags_set or "unreliable_camera_angle" in flags_set
+        verdict = ReportJudgeAgent._judge_video_fact_core(fact, flags_set, low_angle)
+        if low_angle:
+            verdict.hint_keys = ["angle_hint"]
+        return verdict
 
+    @staticmethod
+    def _judge_video_fact_core(fact: VideoFact, flags_set: set, low_angle: bool) -> VideoVerdict:
         if (
-            fact.confidence < 0.6
-            or "low_body_visibility" in flags_set
+            (fact.confidence < 0.6 and not low_angle)
+            or ("low_body_visibility" in flags_set and not low_angle)
             or "small_pushup_range" in flags_set
             or "small_squat_range" in flags_set
             or "empty_video" in flags_set
