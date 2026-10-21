@@ -470,6 +470,7 @@ def create_app(
     status_dir: Optional[str] = None,
     env_override: Optional[Dict[str, str]] = None,
     flow_callback: Optional[Any] = None,
+    cv_options: Optional[Dict[str, Any]] = None,
 ) -> web.Application:
     """Створює екземпляр aiohttp Application для sportnerd-gateway."""
     app = web.Application()
@@ -488,6 +489,9 @@ def create_app(
     app.router.add_get("/offload/{request_id}", handle_get_offload_status)
     app.router.add_post("/callback", handle_post_callback)
 
+    from gateway.cv_queue import setup_cv_routes
+    setup_cv_routes(app, **(cv_options or {}))
+
     return app
 
 
@@ -495,7 +499,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     app = create_app()
     logger.info("Starting sportnerd-gateway on %s:%d", GATEWAY_HOST, GATEWAY_PORT)
-    web.run_app(app, host=GATEWAY_HOST, port=GATEWAY_PORT)
+    # keepalive > long-poll (25s) — щоб з'єднання box worker-а не рвалися між claim-ами
+    web.run_app(app, host=GATEWAY_HOST, port=GATEWAY_PORT, keepalive_timeout=75)
 
 
 if __name__ == "__main__":

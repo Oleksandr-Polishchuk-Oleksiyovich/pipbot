@@ -160,8 +160,11 @@ async def test_gate_accepts_valid_video_and_does_not_prematurely_credit(tmp_path
     )
     assert passed is True
     assert reply == "Беру попкорну і йду дивитись відео"
-    checks = flow.store.list_video_checks(status="queued")
+    # CV_OFFLOAD=1 (default): job іде в box-чергу cv_jobs, VM-ний worker його не бере
+    checks = flow.store.list_video_checks(status="offloaded")
     assert len(checks) == 1
+    assert flow.store.get_cv_job(checks[0].request_id)["status"] == "queued"
+    assert flow.store.get_cv_job(checks[0].request_id)["processing_sent_at"] is not None
     assert checks[0].file_id == "vid_123"
     assert checks[0].user_slug == "lyosha"
     assert checks[0].chat_id == CHAT

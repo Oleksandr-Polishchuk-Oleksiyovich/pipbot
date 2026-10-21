@@ -28,7 +28,7 @@ from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
 from core import challenge
 from core.bot_texts import BotTexts
-from core.config import OBEY_MEDIA_DIR, TIMEZONE
+from core.config import CV_OFFLOAD, CV_STILL_COUNTING_MIN, OBEY_MEDIA_DIR, TIMEZONE
 from core.guardrails import (
     check_active_request_limit,
     check_admin_rate_limit,
@@ -73,6 +73,7 @@ class ChatFlow:
         self.obey_media_dir = obey_media_dir
         self.offload_client = offload_client or RoutineOffloadClient(store, now_fn=self.now)
         self.bot_texts = BotTexts(store)
+        self.cv_offload = CV_OFFLOAD
         self._lock = asyncio.Lock()
         self._chat_members_cache: Dict = {}
 
@@ -154,24 +155,24 @@ class ChatFlow:
         5. passed -> INSERT video_checks(status='queued'), ack «Беру попкорну і йду дивитись відео»
         """
         if is_animation:
-            reply = "Це гіфка або анімація, а не відеозвіт! Зніми нормальне відео підходу."
+            reply = "Це гіфка або анімація, а не відеозвіт — таке не рахую."
             await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
             return False, reply
 
         if duration is not None and duration < 5:
-            reply = "Відео занадто коротке (менше 5 секунд) — треба показати нормальний підхід!"
+            reply = "Відео коротше 5 секунд — з такого підхід не порахувати."
             await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
             return False, reply
 
         if file_size is not None and file_size > 20 * 1024 * 1024:
-            reply = "Відео більше 20MB — Telegram не дасть завантажити, стисни будь ласка!"
+            reply = "Відео більше 20MB — Telegram не дасть його завантажити. Стисни це саме відео до меншого розміру — тоді гляну."
             await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
             return False, reply
 
         if file_unique_id:
             existing = self.store.get_video_check_by_file_unique_id(file_unique_id)
             if existing is not None:
-                reply = "Це відео вже надсилали (дублікат). Спробуй зняти свіжий підхід!"
+                reply = "Це відео вже надсилали (дублікат) — вдруге не зараховую."
                 await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
                 return False, reply
 
@@ -184,12 +185,41 @@ class ChatFlow:
             file_id=file_id,
             file_unique_id=file_unique_id,
             duration_s=float(duration) if duration is not None else None,
-            status="queued",
-            location="vm",
+            # offloaded: рахує box worker через gateway /cv/* (VM-ний sportnerd-cv таких не бере)
+            status="offloaded" if self.cv_offload else "queued",
+            location="box" if self.cv_offload else "vm",
         )
+        if self.cv_offload:
+            self.store.enqueue_cv_job(request_id)
         reply = self.bot_texts.get("processing")
         await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+        if self.cv_offload:
+            self.store.mark_cv_job(request_id, "processing_sent_at")
         return True, reply
+
+    async def process_cv_results(self, still_counting_min: Optional[int] = None) -> int:
+        """
+        Періодично (scheduler, ~10 с): відповідає на завершені box CV jobs (judge + reply як раніше)
+        і один раз надсилає «ще рахую», якщо результату немає довше N хв. Ніколи не просить переробити підхід.
+        """
+        handled = 0
+        for job in self.store.list_cv_jobs_to_reply():
+            rid = job["request_id"]
+            try:
+                await self.handle_video_callback(rid)
+            except Exception as e:
+                logger.warning("CV result reply failed for %s: %s", rid, e)
+                continue
+            self.store.mark_cv_job(rid, "replied_at")
+            handled += 1
+        minutes = CV_STILL_COUNTING_MIN if still_counting_min is None else still_counting_min
+        for job in self.store.list_cv_jobs_overdue(minutes):
+            check = self.store.get_video_check(job["request_id"])
+            if check is not None:
+                await self._say_reply(check.chat_id, self.bot_texts.get("still_counting"),
+                                      reply_to_message_id=check.message_id)
+            self.store.mark_cv_job(job["request_id"], "still_sent_at")
+        return handled
 
     async def handle_video_callback(self, request_id: str) -> Optional[str]:
         """

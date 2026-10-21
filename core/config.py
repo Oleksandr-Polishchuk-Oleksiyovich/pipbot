@@ -28,6 +28,13 @@ CV_TARGET_FPS = int(os.getenv("CV_TARGET_FPS", "15"))
 CV_MAX_SIDE = int(os.getenv("CV_MAX_SIDE", "480"))
 CV_MODEL = os.getenv("CV_MODEL", "lite")
 
+# Box CV offload (gateway long-poll /cv/*). CV_OFFLOAD=1: VM не рахує CV сам, а ставить cv_jobs для box worker-а.
+CV_OFFLOAD = os.getenv("CV_OFFLOAD", "1") == "1"
+CV_CLAIM_WAIT_S = float(os.getenv("CV_CLAIM_WAIT_S", "25"))
+CV_LEASE_S = int(os.getenv("CV_LEASE_S", "300"))
+CV_VIDEO_DIR = os.getenv("CV_VIDEO_DIR", os.path.join(os.path.dirname(DB_PATH), "cv_videos"))
+CV_STILL_COUNTING_MIN = int(os.getenv("CV_STILL_COUNTING_MIN", "5"))
+
 # Grok Bot box routine webhook offload конфігурація
 ROUTINE_WEBHOOK_URL = os.getenv("ROUTINE_WEBHOOK_URL", "")
 ROUTINE_SENDER_KEY = os.getenv("ROUTINE_SENDER_KEY", "")

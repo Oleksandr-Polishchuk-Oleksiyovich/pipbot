@@ -5,6 +5,7 @@
 Кожен виклик відкриває власне з'єднання — безпечно для asyncio.to_thread та для тулів Gemini.
 """
 import json
+import uuid
 import logging
 import re
 import sqlite3
@@ -434,7 +435,116 @@ class Store:
                     updated_by  TEXT,
                     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS cv_jobs (
+                    request_id        TEXT PRIMARY KEY,
+                    status            TEXT NOT NULL DEFAULT 'queued',   -- queued|claimed|done|failed
+                    claim_token       TEXT,
+                    claimed_at        TIMESTAMP,
+                    attempts          INTEGER NOT NULL DEFAULT 0,
+                    last_error        TEXT,
+                    timings           TEXT,                              -- JSON від worker-а
+                    processing_sent_at TIMESTAMP,
+                    still_sent_at     TIMESTAMP,
+                    replied_at        TIMESTAMP,
+                    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cv_jobs_status ON cv_jobs(status);
             """)
+
+    # --- CV JOBS (box offload queue, long-poll через gateway) ---
+    def enqueue_cv_job(self, request_id: str) -> None:
+        with self._connect() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO cv_jobs (request_id, status, created_at, updated_at) "
+                "VALUES (?, 'queued', datetime('now'), datetime('now'))",
+                (request_id,),
+            )
+
+    def get_cv_job(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("SELECT * FROM cv_jobs WHERE request_id = ?", (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_cv_job(self, lease_seconds: int = 300, max_attempts: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Атомарно бере найстаріший queued job (або claimed з простроченим lease -> requeue).
+        Job, що вичерпав max_attempts, позначається failed. Повертає dict з claim_token.
+        """
+        token = uuid.uuid4().hex
+        lease = f"-{int(lease_seconds)} seconds"
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE cv_jobs SET status='failed', last_error='lease_expired_max_attempts', updated_at=datetime('now') "
+                "WHERE status='claimed' AND claimed_at <= datetime('now', ?) AND attempts >= ?",
+                (lease, max_attempts),
+            )
+            con.execute(
+                "UPDATE cv_jobs SET status='queued', claim_token=NULL, updated_at=datetime('now') "
+                "WHERE status='claimed' AND claimed_at <= datetime('now', ?)",
+                (lease,),
+            )
+            row = con.execute(
+                "SELECT request_id FROM cv_jobs WHERE status='queued' ORDER BY created_at ASC, rowid ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                con.commit()
+                return None
+            con.execute(
+                "UPDATE cv_jobs SET status='claimed', claim_token=?, claimed_at=datetime('now'), "
+                "attempts=attempts+1, updated_at=datetime('now') WHERE request_id=?",
+                (token, row[0]),
+            )
+            con.execute("UPDATE video_checks SET status='running', location='box' WHERE request_id=?", (row[0],))
+            con.commit()
+        return self.get_cv_job(row[0])
+
+    def complete_cv_job(
+        self, request_id: str, claim_token: str, *, ok: bool, error: Optional[str] = None,
+        timings: Optional[Dict[str, Any]] = None, max_attempts: int = 3,
+    ) -> Optional[str]:
+        """Фіксує результат job-а, якщо claim_token збігається. Повертає новий статус або None (stale/unknown)."""
+        job = self.get_cv_job(request_id)
+        if not job or job["status"] != "claimed" or job["claim_token"] != claim_token:
+            return None
+        if ok:
+            new_status = "done"
+        else:
+            new_status = "failed" if job["attempts"] >= max_attempts else "queued"
+        with self._connect() as con:
+            con.execute(
+                "UPDATE cv_jobs SET status=?, claim_token=CASE WHEN ?='queued' THEN NULL ELSE claim_token END, "
+                "last_error=?, timings=?, updated_at=datetime('now') WHERE request_id=?",
+                (new_status, new_status, error, json.dumps(timings or {}, ensure_ascii=False), request_id),
+            )
+        return new_status
+
+    def mark_cv_job(self, request_id: str, column: str) -> None:
+        if column not in ("processing_sent_at", "still_sent_at", "replied_at"):
+            raise ValueError(column)
+        with self._connect() as con:
+            con.execute(f"UPDATE cv_jobs SET {column}=datetime('now') WHERE request_id=?", (request_id,))
+
+    def list_cv_jobs_to_reply(self) -> List[Dict[str, Any]]:
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT * FROM cv_jobs WHERE status IN ('done','failed') AND replied_at IS NULL ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_cv_jobs_overdue(self, minutes: int) -> List[Dict[str, Any]]:
+        with self._connect() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT * FROM cv_jobs WHERE status IN ('queued','claimed') AND still_sent_at IS NULL "
+                "AND created_at <= datetime('now', ?)",
+                (f"-{int(minutes)} minutes",),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # --- USERS ---
     def upsert_user(self, user: User) -> None:

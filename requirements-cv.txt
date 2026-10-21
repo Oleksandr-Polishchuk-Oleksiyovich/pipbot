@@ -1,5 +1,5 @@
-# CV worker (cv_worker/, core/cv/) — heavy deps, installed into the same shared venv by
-# deploy/deploy.sh when INSTALL_CV=1 (default). Set INSTALL_CV=0 on hosts without the CV worker.
+# CV deps (core/cv/) for the BOX worker (cv_worker/box_worker.py): `.venv/bin/pip install -r requirements-cv.txt`.
+# The e2-micro VM does NOT need these (deploy.sh default INSTALL_CV=0); INSTALL_CV=1 only for legacy VM CV.
 # opencv-contrib-python is the build mediapipe itself depends on; do not add opencv-python(-headless)
 # alongside it (two cv2 packages conflict and waste disk/RAM on the e2-micro).
 # System packages required by mediapipe's native lib: libegl1 libgles2 (apt).

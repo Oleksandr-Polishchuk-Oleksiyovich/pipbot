@@ -118,9 +118,9 @@ else
 fi
 
 # 2. Перевірка venv та requirements.txt (+ requirements-cv.txt для CV worker)
-# CV worker (sportnerd-cv.service) використовує той самий venv, тому за замовчуванням
-# ставимо requirements-cv.txt (він включає requirements.txt). INSTALL_CV=0 — лише core.
-INSTALL_CV="${INSTALL_CV:-1}"
+# CV рахує box worker (cv_worker/box_worker.py, long-poll /cv/*), тому на VM за замовчуванням
+# лише core (INSTALL_CV=0, без mediapipe). INSTALL_CV=1 — ще й requirements-cv.txt (легасі VM CV).
+INSTALL_CV="${INSTALL_CV:-0}"
 REQ_FILE="$TARGET_RELEASE/requirements.txt"
 REQ_CV_FILE="$TARGET_RELEASE/requirements-cv.txt"
 INSTALL_REQ="$REQ_FILE"
