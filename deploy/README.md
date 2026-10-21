@@ -75,3 +75,21 @@ CV-підрахунок відео винесено з e2-micro VM на Grok Bot
 - **Box worker (`cv_worker/box_worker.py`):** env `CV_GATEWAY_URL`, `CV_HMAC_SECRET_ENV` (назва змінної, default `GATEWAY_HMAC_SECRET`), `CV_ENV_FILE`. Після 204 одразу новий claim; backoff лише на помилках 1/2/5/10/20/30 с. Кожен job: `heavy --who SportNerdBot-CV --max 600 python -m cv_worker.cv_job <video> <out.json>` (15 fps, мін. 12; 640px). Запуск: `nohup cv_worker/run_box_worker.sh >/dev/null 2>&1 &` (supervisor-цикл, pidfile `/tmp/sportnerd-boxcv.pid`; у box немає systemd --user/cron — після рестарту box запустити знову). Залежності на box: `pip install -r requirements-cv.txt` + apt `libegl1 libgles2`.
 - **VM deps:** `deploy.sh` за замовчуванням `INSTALL_CV=0` (без mediapipe). `sportnerd-cv.service` на VM вимкнути: `systemctl disable --now sportnerd-cv`.
 - **Мережа:** gateway має бути доступний з box: публічний HTTPS (reverse proxy з TLS -> 127.0.0.1:8443, `proxy_read_timeout >= 60s`, `proxy_buffering off` для /cv/claim) і firewall-правило лише на цей порт. aiohttp `keepalive_timeout=75`.
+
+## One-shot deploy from GCP Cloud Shell (`deploy/cloudshell_deploy.sh`)
+
+Run in Cloud Shell (no SSH from box needed):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Oleksandr-Polishchuk-Oleksiyovich/pipbot/main/deploy/cloudshell_deploy.sh)
+```
+
+What it does (idempotent, safe to re-run):
+1. Firewall rule `sportnerd-allow-https` (tcp:443, target tag `sportnerd-https`) + tag on `sportnerd-bot-vm`; resolves external IP.
+2. On the VM via `gcloud compute ssh` (root): timestamped DB backup to `/var/lib/sportnerdbot/backups/pre_cloudshell_*`, 2G `/swapfile` if no swap, `sportnerd` user + layout (as `setup_remote.sh`), legacy `.env`/`challenge.db` copied to `/etc/sportnerdbot/env` / `/var/lib/sportnerdbot/challenge.db` only if the targets are missing, `git pull` in `/opt/sportnerdbot/repo`, systemd units from `deploy/systemd` (bot, gateway, deploy timer files; cv not installed), `deploy.sh` with `INSTALL_CV=0`.
+3. `GATEWAY_HMAC_SECRET` generated (`openssl rand -hex 32`) only if absent; env file `chmod 600`.
+4. Caddy: `<IP>.sslip.io` -> `127.0.0.1:8443`, `flush_interval -1`, read/response timeouts 90s (long-poll `/cv/claim` 25s).
+5. `systemctl disable --now sportnerd-cv`, restart `sportnerdbot` + `sportnerd-gateway`, local + public `/healthz` check.
+6. Prints IP, `CV_GATEWAY_URL=https://<IP>.sslip.io` and the secret (your terminal only).
+
+Overrides: `PROJECT`, `VM_NAME`, `ZONE`, `FW_RULE`, `NET_TAG`, `BRANCH`.
