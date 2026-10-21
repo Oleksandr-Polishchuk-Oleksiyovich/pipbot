@@ -50,11 +50,8 @@ def post_webhook(cfg: Dict[str, str], payload: Dict, timeout: float = 30) -> int
     req = urllib.request.Request(cfg["url"], data=body, method="POST",
                                  headers={"Content-Type": "application/json", cfg["header"]: cfg["value"],
                                           "User-Agent": "SportNerdBot-AdminTasks/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status
-    except urllib.error.HTTPError as e:
-        return e.code
+    from cv_worker.box_worker import urlopen_with_deadline
+    return urlopen_with_deadline(req, timeout)[0]
 
 
 def task_payload(task: Dict) -> Dict:
@@ -118,7 +115,12 @@ class AdminTasksWorker:
         return True
 
     def run(self) -> None:
+        heartbeat_s = float(os.getenv("ADMIN_TASKS_HEARTBEAT_S", "300"))
+        last_beat = time.monotonic()
         while not self.stopped:
+            if heartbeat_s > 0 and time.monotonic() - last_beat >= heartbeat_s:
+                logger.info("heartbeat: alive, polling (errors=%d)", self.errors)
+                last_beat = time.monotonic()
             self.step()
 
 

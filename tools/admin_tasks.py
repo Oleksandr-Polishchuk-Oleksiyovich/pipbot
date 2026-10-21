@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.signing import sign_request  # noqa: E402
-from cv_worker.box_worker import load_secret  # noqa: E402
+from cv_worker.box_worker import load_secret, urlopen_with_deadline  # noqa: E402
 
 
 class AdminTasksClient:
@@ -37,11 +37,7 @@ class AdminTasksClient:
             headers["Content-Type"] = "application/json"
         url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
         req = urllib.request.Request(url, data=body or None, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+        return urlopen_with_deadline(req, timeout)
 
     def list(self, status: Optional[str] = None) -> list:
         code, data = self._request("GET", "/admin_tasks", {"status": status} if status else None)

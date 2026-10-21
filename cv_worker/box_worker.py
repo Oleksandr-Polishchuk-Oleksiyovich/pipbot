@@ -48,6 +48,44 @@ def load_secret() -> str:
     return secret
 
 
+HEARTBEAT_S = float(os.getenv("CV_HEARTBEAT_S", "300"))
+DEADLINE_SLACK_S = 15  # жорсткий загальний дедлайн запиту = timeout + slack
+
+
+class RequestDeadlineExceeded(TimeoutError):
+    pass
+
+
+def urlopen_with_deadline(req, timeout: float, deadline: Optional[float] = None) -> Tuple[int, bytes]:
+    """
+    urlopen з ЖОРСТКИМ загальним дедлайном. Socket timeout у urllib діє на кожну операцію окремо
+    (connect/TLS/кожен read), тож завислий TLS/сокет міг тримати long-poll 20+ хв. Тут запит іде в
+    daemon-потоці; якщо він не завершився за deadline — кидаємо RequestDeadlineExceeded (потік покинуто,
+    його сокет сам закриється по socket timeout), і викликач одразу переконектиться.
+    """
+    import threading
+    deadline = timeout + DEADLINE_SLACK_S if deadline is None else deadline
+    box: Dict[str, Any] = {}
+
+    def _run():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                box["res"] = (resp.status, resp.read())
+        except urllib.error.HTTPError as e:
+            box["res"] = (e.code, e.read())
+        except BaseException as e:  # noqa: BLE001
+            box["err"] = e
+
+    t = threading.Thread(target=_run, daemon=True, name="gw-request")
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        raise RequestDeadlineExceeded(f"{req.get_method()} {req.full_url} exceeded hard deadline {deadline:.0f}s")
+    if "err" in box:
+        raise box["err"]
+    return box["res"]
+
+
 class GatewayClient:
     def __init__(self, base_url: str, secret: str):
         self.base = base_url.rstrip("/")
@@ -60,11 +98,7 @@ class GatewayClient:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(self.base + path, data=body if method != "GET" else None,
                                      method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+        return urlopen_with_deadline(req, timeout)
 
     def claim(self) -> Optional[Dict[str, Any]]:
         status, data = self.request("POST", "/cv/claim", b"{}", timeout=CLAIM_HTTP_TIMEOUT_S)
@@ -154,9 +188,13 @@ class BoxCVWorker:
 
     def run(self) -> None:
         self.running = True
+        last_beat = time.monotonic()
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "running", False))
         while self.running:
+            if HEARTBEAT_S > 0 and time.monotonic() - last_beat >= HEARTBEAT_S:
+                logger.info("heartbeat: alive, polling (errors=%d)", self.errors)
+                last_beat = time.monotonic()
             try:
                 self.step()
                 self.errors = 0
