@@ -139,10 +139,18 @@ else
     echo "Release directory already exists: $TARGET_RELEASE"
 fi
 
+# Реліз має належати сервісному користувачу (бот пише логи/кеш; деплой зазвичай іде від root).
+if id -u "${SERVICE_USER:-sportnerd}" >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+    chown -R "${SERVICE_USER:-sportnerd}:" "$TARGET_RELEASE" 2>/dev/null || true
+fi
+
 # Ревізія релізу для пост-деплой анонсів admin_tasks (на VM у релізі немає .git).
 if git cat-file -e "$SHA^{commit}" 2>/dev/null; then
     echo "$SHA" > "$TARGET_RELEASE/REVISION" || true
     git rev-list --max-count=200 "$SHA" > "$TARGET_RELEASE/REVISION_COMMITS" 2>/dev/null || true
+    if id -u "${SERVICE_USER:-sportnerd}" >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+        chown "${SERVICE_USER:-sportnerd}:" "$TARGET_RELEASE/REVISION" "$TARGET_RELEASE/REVISION_COMMITS" 2>/dev/null || true
+    fi
 fi
 
 # 2. Перевірка venv та requirements.txt (+ requirements-cv.txt для CV worker)

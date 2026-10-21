@@ -16,7 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.flow import ChatFlow
 from core import challenge
-from core.config import BASE_DIR, BOT_TOKEN, CANDIDATE_MODELS, CHAT_ID, DB_PATH, GEMINI_API_KEY, LOG_RETENTION_DAYS, TIMEZONE
+from core.config import BASE_DIR, BOT_TOKEN, CANDIDATE_MODELS, CHAT_ID, DB_PATH, GEMINI_API_KEY, IS_PRODUCTION, LOG_RETENTION_DAYS, TIMEZONE
 from core.llm import GeminiLLM
 from database.store import Store
 
@@ -27,16 +27,21 @@ def setup_logging() -> None:
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     # Щоденна ротація bot.log, зберігаємо LOG_RETENTION_DAYS (7) днів — узгоджено з
     # DB log-retention (ChatFlow.prune_old_logs) і journald MaxRetentionSec у deploy.sh.
-    file_handler = TimedRotatingFileHandler(
-        os.path.join(BASE_DIR, "bot.log"), when="midnight", backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
-    )
+    # bot.log поруч із БД (поза release-каталогом, який може бути не наш і не переживає деплой);
+    # якщо файл недоступний для запису — лише stdout/journald, бот не падає.
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_dir = os.getenv("LOG_DIR") or (os.path.dirname(DB_PATH) if IS_PRODUCTION else BASE_DIR)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        handlers.append(TimedRotatingFileHandler(
+            os.path.join(log_dir, "bot.log"), when="midnight", backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
+        ))
+    except OSError as e:
+        print(f"WARNING: file logging disabled ({e}); logging to stdout/journald only", file=sys.stderr)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            file_handler,
-        ],
+        handlers=handlers,
         force=True,
     )
 
