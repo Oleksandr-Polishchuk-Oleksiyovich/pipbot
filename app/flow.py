@@ -12,6 +12,7 @@ timer:           morning / afternoon / evening — шаблони; night — Coa
 import asyncio
 import glob
 import logging
+import re
 import os
 import random
 import uuid
@@ -26,6 +27,7 @@ from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, Video
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
 from core import challenge
+from core.bot_texts import BotTexts
 from core.config import OBEY_MEDIA_DIR, TIMEZONE
 from core.guardrails import (
     check_active_request_limit,
@@ -37,16 +39,21 @@ from core.llm import GeminiLLM, LLMUnavailable
 from database.store import ChatMessage, Store, User, format_ts
 from migrate_users import ensure_default_users, migrate_dynamic_prompt
 from prompts import (
-    COACH_VIDEO_PERSONA_FALLBACKS,
-    DEFAULT_HINT_TEXTS,
+    DEFAULT_BOT_TEXTS,
     DEFAULT_PROMPTS,
     FALLBACK_ADMIN_MESSAGE,
     FALLBACK_GEMINI_MESSAGE,
+    REDO_WORDS,
+    build_video_reply_tone_prompt,
 )
 
 logger = logging.getLogger(__name__)
 
 COACH_NAME = "Спорт Зануда"
+VIDEO_REPLY_PARAPHRASE_SYSTEM = (
+    "Ти — «Спорт Зануда», суворий і дотепний спортивний AI-тренер. "
+    "Перефразуй наданий тон-зразок відповіді на відеозвіт за правилами нижче."
+)
 
 
 class Sender(Protocol):
@@ -65,6 +72,7 @@ class ChatFlow:
         self.now = now
         self.obey_media_dir = obey_media_dir
         self.offload_client = offload_client or RoutineOffloadClient(store, now_fn=self.now)
+        self.bot_texts = BotTexts(store)
         self._lock = asyncio.Lock()
         self._chat_members_cache: Dict = {}
 
@@ -80,6 +88,7 @@ class ChatFlow:
             self.editor,
             chat_members_fetcher=lambda: self._chat_members_cache,
             offload_client=self.offload_client,
+            bot_texts=self.bot_texts,
         )
 
     def init_storage(self) -> None:
@@ -88,6 +97,10 @@ class ChatFlow:
         seeded = self.store.seed_prompts(DEFAULT_PROMPTS)
         if seeded:
             logger.info("Seeded prompts: %s", seeded)
+        seeded_texts = self.store.seed_bot_texts(DEFAULT_BOT_TEXTS)
+        if seeded_texts:
+            logger.info("Seeded bot_texts: %s", seeded_texts)
+            self.bot_texts.invalidate()
         migrate_dynamic_prompt(self.store)
         if not self.store.get_state("last_processed_timestamp"):
             self.store.set_state("last_processed_timestamp", self._yesterday_cutoff())
@@ -174,7 +187,7 @@ class ChatFlow:
             status="queued",
             location="vm",
         )
-        reply = "Беру попкорну і йду дивитись відео"
+        reply = self.bot_texts.get("processing")
         await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
         return True, reply
 
@@ -218,12 +231,11 @@ class ChatFlow:
 
         # Persona reply
         if verdict.category == "success":
-            reply_text = COACH_VIDEO_PERSONA_FALLBACKS["success"].format(reps=check.reps, target=target)
+            reply_text = self.bot_texts.get("success", reps=check.reps, target=target)
         else:
-            reply_text = COACH_VIDEO_PERSONA_FALLBACKS.get(
-                verdict.category,
-                "Відео переглянуто, але зарахувати не можу."
-            )
+            reply_text = self.bot_texts.get(verdict.category) or "Відео переглянуто, але зарахувати не можу."
+
+        reply_text = await self._maybe_paraphrase_video_reply(reply_text)
 
         for hint_key in verdict.hint_keys:
             hint_text = self.resolve_hint_text(hint_key)
@@ -252,13 +264,34 @@ class ChatFlow:
         return reply_text
 
     def resolve_hint_text(self, key: str) -> str:
-        """Текст підказки за ключем: спершу БД (bot_state 'text:<key>'), інакше дефолт із prompts.DEFAULT_HINT_TEXTS."""
+        """Текст підказки за ключем: BotTexts (БД bot_texts -> дефолт із prompts.DEFAULT_BOT_TEXTS)."""
+        return self.bot_texts.get(key)
+
+    async def _maybe_paraphrase_video_reply(self, reply_text: str) -> str:
+        """
+        Якщо LLM доступний — перефразовує тон-зразок reply_text через Gemini (prompts.build_video_reply_tone_prompt),
+        зберігаючи факти/числа й без прохань переробити підхід. При будь-якій помилці або порушенні правил —
+        лишає фіксований reply_text як фолбек (не блокує тести/офлайн-режим, бо llm=None просто повертає reply_text).
+        """
+        if self.llm is None:
+            return reply_text
         try:
-            db_text = self.store.get_state(f"text:{key}", "")
+            paraphrased = await self._call(
+                self.llm.text, VIDEO_REPLY_PARAPHRASE_SYSTEM, build_video_reply_tone_prompt(reply_text)
+            )
+        except LLMUnavailable as e:
+            logger.debug("Video reply paraphrase unavailable (%s) — using fixed tone sample", e)
+            return reply_text
         except Exception as e:
-            logger.warning("Hint text lookup failed for %s: %s", key, e)
-            db_text = ""
-        return db_text or DEFAULT_HINT_TEXTS.get(key, "")
+            logger.warning("Video reply paraphrase failed (%s) — using fixed tone sample", e)
+            return reply_text
+        paraphrased = (paraphrased or "").strip()
+        if not paraphrased or any(w in paraphrased.lower() for w in REDO_WORDS):
+            return reply_text
+        # Факти/числа мають зберегтися дослівно (жодних вигаданих чи змінених чисел)
+        if sorted(re.findall(r"\d+", paraphrased)) != sorted(re.findall(r"\d+", reply_text)):
+            return reply_text
+        return paraphrased
 
     async def _refresh_chat_members(self, chat_id: int) -> None:
         fetch_fn = getattr(self.sender, "fetch_chat_members", None)

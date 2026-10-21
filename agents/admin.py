@@ -9,6 +9,7 @@ from agents.base import PromptAgent, render_messages
 from agents.onboarding import normalize_difficulty
 from agents.prompt_editor import COACH_DYNAMIC_KEY, CoachPromptEditor, RuleChange
 from core import challenge
+from core.bot_texts import BotTexts
 from database.store import ChatMessage, DIFFICULTY_LIVES
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,15 @@ class AdminAgent(PromptAgent):
         chat_members_fetcher: Optional[Callable[[], dict]] = None,
         offload_client: Optional[object] = None,
         box_available: Optional[Union[bool, Callable[[], bool]]] = None,
+        bot_texts: Optional[BotTexts] = None,
     ):
         super().__init__(llm, store)
         self.editor = editor
         self.chat_members_fetcher = chat_members_fetcher
         self.offload_client = offload_client
         self._box_available = box_available
+        # Той самий кешований сервіс, що й у ChatFlow — щоб правка діяла одразу, без рестарту.
+        self.bot_texts = bot_texts or BotTexts(store)
 
     def is_box_available(self) -> bool:
         if self._box_available is not None:
@@ -44,7 +48,7 @@ class AdminAgent(PromptAgent):
         return False
 
     def _tools(self, today: date, author: str, actions: List[str]) -> list:
-        store, editor, fetcher = self.store, self.editor, self.chat_members_fetcher
+        store, editor, fetcher, bot_texts = self.store, self.editor, self.chat_members_fetcher, self.bot_texts
 
         def set_lives(
             participant: Optional[str] = None,
@@ -286,9 +290,30 @@ class AdminAgent(PromptAgent):
             """Показати чинні динамічні правила тренера."""
             return store.get_prompt(COACH_DYNAMIC_KEY) or "(динамічних правил немає)"
 
+        def set_bot_text(key: str, text: str) -> str:
+            """
+            Змінити фіксований текст відповіді бота (bot_texts) за ключем — на відміну від
+            update_coach_prompt, це ДАНІ (конкретна фраза), а не правило поведінки; діє негайно,
+            без деплою й без рестарту бота.
+            :param key: ключ тексту в snake_case (наприклад 'angle_hint', 'success', 'near_miss',
+                        'far_below', 'bad_quality', 'wrong_exercise', 'processing').
+            :param text: новий текст. Для 'success' підтримуються плейсхолдери {reps} і {target}.
+            """
+            if not _KEY_RE.match(key):
+                return f"Помилка: ключ '{key}' недопустимий."
+            bot_texts.set(key, text, updated_by=author)
+            actions.append(f"set_bot_text({key})")
+            return f"Текст '{key}' оновлено: «{text}»."
+
+        def list_bot_texts() -> str:
+            """Отримати всі фіксовані тексти бота (bot_texts): ключ, поточний текст, хто востаннє редагував."""
+            actions.append("list_bot_texts()")
+            return json.dumps(store.list_bot_texts(), ensure_ascii=False)
+
         return [
             set_lives, set_targets, set_schedule, set_progress, update_user_profile,
             get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
+            set_bot_text, list_bot_texts,
         ]
 
     def execute(self, today: date, directive: str, sender: str, pending: List[ChatMessage],

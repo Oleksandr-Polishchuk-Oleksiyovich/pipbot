@@ -239,9 +239,9 @@ async def test_flow_video_callback_low_camera_angle(tmp_path):
 
 @pytest.mark.asyncio
 async def test_angle_hint_text_overridden_from_db(tmp_path):
-    """angle_hint резолвиться з БД (bot_state 'text:angle_hint'), якщо там є значення."""
+    """angle_hint резолвиться з БД (bot_texts), якщо там є значення, і діє негайно (без рестарту)."""
     flow, sender, _ = make_flow(tmp_path, llm=None)
-    flow.store.set_state("text:angle_hint", "Наступного разу постав камеру трохи вище 📹")
+    flow.bot_texts.set("angle_hint", "Наступного разу постав камеру трохи вище 📹")
     flow.store.create_video_check(
         request_id="req-e2e-low-cam-db", chat_id=CHAT, message_id=561, user_slug="lyosha",
         duration_s=42.0, exercise="pushup", reps=40, confidence=0.55, valid=True,
@@ -254,9 +254,9 @@ async def test_angle_hint_text_overridden_from_db(tmp_path):
 
 def test_video_replies_never_ask_to_redo():
     """Жодна відповідь на відео (fallbacks + camera hint) не просить перезняти/переробити підхід."""
-    from prompts import COACH_VIDEO_PERSONA_FALLBACKS, DEFAULT_HINT_TEXTS
+    from prompts import COACH_VIDEO_PERSONA_FALLBACKS, DEFAULT_BOT_TEXTS, DEFAULT_HINT_TEXTS
 
-    for text in list(COACH_VIDEO_PERSONA_FALLBACKS.values()) + list(DEFAULT_HINT_TEXTS.values()):
+    for text in list(COACH_VIDEO_PERSONA_FALLBACKS.values()) + list(DEFAULT_HINT_TEXTS.values()) + list(DEFAULT_BOT_TEXTS.values()):
         assert not any(w in text.lower() for w in REDO_WORDS), text
 
 

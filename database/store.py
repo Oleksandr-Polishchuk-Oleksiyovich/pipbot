@@ -1,6 +1,7 @@
 """
 Синхронне сховище бота поверх SQLite: користувачі (users), прогрес (user_progress),
-історія чату (chat_history), bot_state та версіоновані промпти агентів (prompts / prompt_history).
+історія чату (chat_history), bot_state, версіоновані промпти агентів (prompts / prompt_history)
+та bot_texts (фіксовані відповіді бота / тон-зразки, читані через core.bot_texts.BotTexts).
 Кожен виклик відкриває власне з'єднання — безпечно для asyncio.to_thread та для тулів Gemini.
 """
 import json
@@ -271,6 +272,21 @@ def _row_to_admin_audit(row: Tuple) -> AdminAudit:
     )
 
 
+def _row_to_bot_text(row: Tuple) -> Dict[str, Any]:
+    variants_val = row[2]
+    try:
+        variants = json.loads(variants_val) if variants_val else None
+    except Exception:
+        variants = None
+    return {
+        "key": row[0],
+        "text": row[1],
+        "variants": variants,
+        "updated_by": row[3],
+        "updated_at": row[4] or "",
+    }
+
+
 class Store:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -411,6 +427,13 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_admin_audit_request_id ON admin_audit(request_id);
                 CREATE INDEX IF NOT EXISTS idx_admin_audit_status ON admin_audit(status);
+                CREATE TABLE IF NOT EXISTS bot_texts (
+                    key         TEXT PRIMARY KEY,
+                    text        TEXT NOT NULL,
+                    variants    TEXT,
+                    updated_by  TEXT,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     # --- USERS ---
@@ -598,6 +621,53 @@ class Store:
     def all_state(self) -> Dict[str, str]:
         with self._connect() as con:
             return dict(con.execute("SELECT key, value FROM bot_state").fetchall())
+
+    # --- BOT TEXTS (фіксовані відповіді бота / тон-зразки, правка без деплою) ---
+    def get_bot_text(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT key, text, variants, updated_by, updated_at FROM bot_texts WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return _row_to_bot_text(row) if row else None
+
+    def set_bot_text(
+        self,
+        key: str,
+        text: str,
+        variants: Optional[List[str]] = None,
+        updated_by: Optional[str] = None,
+    ) -> None:
+        variants_json = json.dumps(variants, ensure_ascii=False) if variants is not None else None
+        with self._connect() as con:
+            con.execute("""
+                INSERT INTO bot_texts (key, text, variants, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    text = excluded.text, variants = excluded.variants,
+                    updated_by = excluded.updated_by, updated_at = datetime('now')
+            """, (key, text, variants_json, updated_by))
+
+    def list_bot_texts(self) -> List[Dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT key, text, variants, updated_by, updated_at FROM bot_texts ORDER BY key"
+            ).fetchall()
+        return [_row_to_bot_text(r) for r in rows]
+
+    def seed_bot_texts(self, defaults: Dict[str, str]) -> List[str]:
+        """Ідемпотентно додає відсутні bot_texts (INSERT OR IGNORE) — ніколи не чіпає адмінські правки."""
+        seeded = []
+        with self._connect() as con:
+            for key, text in defaults.items():
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO bot_texts (key, text, updated_by, updated_at) "
+                    "VALUES (?, ?, 'seed', datetime('now'))",
+                    (key, text),
+                )
+                if cur.rowcount:
+                    seeded.append(key)
+        return seeded
 
     # --- PROGRESS ---
     def get_day_progress(self, date_iso: str) -> Dict[str, bool]:

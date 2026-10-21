@@ -32,13 +32,13 @@ from tests.flow_fixtures import Clock, FakeSender, NOW
 # ============================================================================
 
 def test_clean_db_applies_all_migrations(tmp_path):
-    """На чистій БД runner створює всі таблиці й ставить версію HEAD (v7)."""
+    """На чистій БД runner створює всі таблиці й ставить версію HEAD (v8)."""
     db_file = str(tmp_path / "clean.db")
     applied = run_migrations(db_file)
-    assert len(applied) == 7
-    assert [v for v, _ in applied] == [1, 2, 3, 4, 5, 6, 7]
+    assert len(applied) == 8
+    assert [v for v, _ in applied] == [1, 2, 3, 4, 5, 6, 7, 8]
 
-    assert get_current_version(db_file) == 7
+    assert get_current_version(db_file) == 8
 
     # Перевіряємо наявність таблиць
     conn = sqlite3.connect(db_file)
@@ -50,7 +50,7 @@ def test_clean_db_applies_all_migrations(tmp_path):
     expected = {
         "schema_version", "progress", "users", "user_progress",
         "chat_history", "bot_state", "prompts", "prompt_history", "pending_replies",
-        "video_checks", "offload_requests", "admin_audit"
+        "video_checks", "offload_requests", "admin_audit", "bot_texts",
     }
     assert expected.issubset(tables)
 
@@ -59,11 +59,11 @@ def test_migrations_idempotency(tmp_path):
     """Повторний запуск runner — no-op, повертає порожній список."""
     db_file = str(tmp_path / "idem.db")
     first = run_migrations(db_file)
-    assert len(first) == 7
+    assert len(first) == 8
 
     second = run_migrations(db_file)
     assert second == []
-    assert get_current_version(db_file) == 7
+    assert get_current_version(db_file) == 8
 
 
 def test_legacy_db_stamped_v1_without_data_loss(tmp_path):
@@ -97,12 +97,12 @@ def test_legacy_db_stamped_v1_without_data_loss(tmp_path):
 
     # Запускаємо runner
     applied = run_migrations(db_file)
-    # Версія 1 має бути застампована як legacy, а версії 2, 3, 4, 5, 6, 7 застосовані
+    # Версія 1 має бути застампована як legacy, а версії 2..8 застосовані
     applied_versions = [v for v, _ in applied]
-    assert applied_versions == [2, 3, 4, 5, 6, 7]
+    assert applied_versions == [2, 3, 4, 5, 6, 7, 8]
 
     applied_all = get_applied_migrations(db_file)
-    assert [v for v, _, _ in applied_all] == [1, 2, 3, 4, 5, 6, 7]
+    assert [v for v, _, _ in applied_all] == [1, 2, 3, 4, 5, 6, 7, 8]
 
     # Перевіряємо збереження історичних даних і результат міграції v2
     conn = sqlite3.connect(db_file)
@@ -154,11 +154,11 @@ def test_cli_status_and_migration(tmp_path):
     # Запуск міграцій
     mig_cmd = [sys.executable, "-m", "database.migrate", "--db", db_file]
     res_mig = subprocess.run(mig_cmd, capture_output=True, text=True, check=True)
-    assert "Applied 7 migration(s)" in res_mig.stdout
+    assert "Applied 8 migration(s)" in res_mig.stdout
 
     # Status після міграцій
     res_after = subprocess.run(status_cmd, capture_output=True, text=True, check=True)
-    assert "Current schema version: 7" in res_after.stdout
+    assert "Current schema version: 8" in res_after.stdout
     assert "none - up to date" in res_after.stdout
 
 
