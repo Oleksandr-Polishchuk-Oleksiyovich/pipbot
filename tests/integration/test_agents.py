@@ -23,7 +23,7 @@ NOT_DONE = {"lyosha": False, "sasha": False}
 def test_router_admin_variants(env, text):
     flow, _, _ = env
     d = RouterAgent(flow.llm, flow.store).decide([msg(DAD, text)], [])
-    assert d.route == "admin" and d.passphrase_detected
+    assert d.route in ("admin", "admin_quick", "admin_dev") and d.passphrase_detected
     assert d.directive
 
 

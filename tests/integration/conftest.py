@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from core.config import CANDIDATE_MODELS, GEMINI_API_KEY
@@ -9,7 +11,11 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if "integration" in str(item.fspath):
             item.add_marker(pytest.mark.integration)
-            if not GEMINI_API_KEY:
+            # Live Gemini calls (quota 429 / 503 retries can stall the run for many minutes):
+            # opt-in only, even if GEMINI_API_KEY is present in .env.
+            if os.getenv("RUN_INTEGRATION") != "1":
+                item.add_marker(pytest.mark.skip(reason="integration: set RUN_INTEGRATION=1 to run live Gemini tests"))
+            elif not GEMINI_API_KEY:
                 item.add_marker(pytest.mark.skip(reason="GEMINI_API_KEY is not set"))
 
 

@@ -455,7 +455,98 @@ class Store:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_cv_jobs_status ON cv_jobs(status);
+
+                CREATE TABLE IF NOT EXISTS admin_tasks (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id               INTEGER,
+                    requester_telegram_id INTEGER,
+                    requester_name        TEXT,
+                    text                  TEXT NOT NULL,
+                    status                TEXT NOT NULL DEFAULT 'pending'
+                                          CHECK (status IN ('pending','claimed','done_pending_deploy','announced','rejected')),
+                    fix_commit            TEXT,
+                    result                TEXT,
+                    notified              INTEGER NOT NULL DEFAULT 0,
+                    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_admin_tasks_status ON admin_tasks(status);
             """)
+
+    # --- ADMIN TASKS (запити до розробника, яких не покривають вузькі адмін-тули) ---
+    _ADMIN_TASK_COLS = ("id", "chat_id", "requester_telegram_id", "requester_name", "text", "status",
+                        "fix_commit", "result", "notified", "created_at", "updated_at")
+
+    def _admin_task_row(self, row) -> Optional[Dict[str, Any]]:
+        return dict(zip(self._ADMIN_TASK_COLS, row)) if row else None
+
+    def create_admin_task(self, chat_id: Optional[int], requester_telegram_id: Optional[int],
+                          requester_name: str, text: str) -> int:
+        with self._connect() as con:
+            cur = con.execute(
+                "INSERT INTO admin_tasks (chat_id, requester_telegram_id, requester_name, text) VALUES (?, ?, ?, ?)",
+                (chat_id, requester_telegram_id, requester_name, text),
+            )
+            task_id = int(cur.lastrowid)
+        logger.info("admin_task created: id=%s requester=%s/%s text=%r", task_id, requester_telegram_id,
+                    requester_name, text[:200])
+        return task_id
+
+    def get_admin_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as con:
+            row = con.execute(f"SELECT {', '.join(self._ADMIN_TASK_COLS)} FROM admin_tasks WHERE id = ?",
+                              (int(task_id),)).fetchone()
+        return self._admin_task_row(row)
+
+    def list_admin_tasks(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        q = f"SELECT {', '.join(self._ADMIN_TASK_COLS)} FROM admin_tasks"
+        args: list = []
+        if status:
+            q += " WHERE status = ?"
+            args.append(status)
+        q += " ORDER BY id ASC LIMIT ?"
+        args.append(int(limit))
+        with self._connect() as con:
+            return [self._admin_task_row(r) for r in con.execute(q, args).fetchall()]
+
+    def claim_admin_task(self) -> Optional[Dict[str, Any]]:
+        """Атомарно бере найстарішу pending-задачу і ставить claimed."""
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT id FROM admin_tasks WHERE status='pending' ORDER BY id ASC LIMIT 1").fetchone()
+            if not row:
+                con.commit()
+                return None
+            con.execute("UPDATE admin_tasks SET status='claimed', updated_at=datetime('now') WHERE id=? AND status='pending'",
+                        (row[0],))
+            con.commit()
+        logger.info("admin_task claimed: id=%s", row[0])
+        return self.get_admin_task(row[0])
+
+    def set_admin_task_result(self, task_id: int, status: str, fix_commit: Optional[str] = None,
+                              result: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if status not in ("done_pending_deploy", "rejected"):
+            raise ValueError(f"invalid admin_task result status: {status!r}")
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE admin_tasks SET status=?, fix_commit=?, result=?, updated_at=datetime('now') "
+                "WHERE id=? AND status IN ('pending','claimed')",
+                (status, fix_commit, result, int(task_id)),
+            )
+            changed = cur.rowcount
+        if not changed:
+            return None
+        logger.info("admin_task result: id=%s status=%s fix_commit=%s", task_id, status, fix_commit)
+        return self.get_admin_task(task_id)
+
+    def mark_admin_task_announced(self, task_id: int) -> None:
+        with self._connect() as con:
+            con.execute("UPDATE admin_tasks SET status='announced', notified=1, updated_at=datetime('now') WHERE id=?",
+                        (int(task_id),))
+
+    def mark_admin_task_notified(self, task_id: int) -> None:
+        with self._connect() as con:
+            con.execute("UPDATE admin_tasks SET notified=1, updated_at=datetime('now') WHERE id=?", (int(task_id),))
 
     # --- CV JOBS (box offload queue, long-poll через gateway) ---
     def enqueue_cv_job(self, request_id: str) -> None:

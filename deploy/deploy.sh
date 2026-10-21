@@ -139,6 +139,12 @@ else
     echo "Release directory already exists: $TARGET_RELEASE"
 fi
 
+# Ревізія релізу для пост-деплой анонсів admin_tasks (на VM у релізі немає .git).
+if git cat-file -e "$SHA^{commit}" 2>/dev/null; then
+    echo "$SHA" > "$TARGET_RELEASE/REVISION" || true
+    git rev-list --max-count=200 "$SHA" > "$TARGET_RELEASE/REVISION_COMMITS" 2>/dev/null || true
+fi
+
 # 2. Перевірка venv та requirements.txt (+ requirements-cv.txt для CV worker)
 # CV рахує box worker (cv_worker/box_worker.py, long-poll /cv/*), тому на VM за замовчуванням
 # лише core (INSTALL_CV=0, без mediapipe). INSTALL_CV=1 — ще й requirements-cv.txt (легасі VM CV).

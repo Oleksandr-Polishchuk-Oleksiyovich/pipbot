@@ -395,6 +395,23 @@ class AdminAgent(PromptAgent):
             actions.append(f"set_bot_text({key})")
             return f"Текст '{key}' оновлено: «{text}»."
 
+        def create_admin_task(text: str) -> str:
+            """
+            Передати запит розробнику, якщо наказ НЕ покривається жодним іншим тулом (нова фіча, зміна логіки,
+            правила, багфікс тощо). НЕ імпровізуй і не вдавай, що зробив — виклич цей тул.
+            :param text: короткий, чіткий опис запиту українською (що саме треба змінити і навіщо).
+            """
+            from core.config import CHAT_ID
+            user = store.find_user(author) if author else None
+            task_id = store.create_admin_task(
+                CHAT_ID or None,
+                user.telegram_id if user else None,
+                (user.display_name if user else author) or "невідомо",
+                (text or "").strip()[:2000],
+            )
+            actions.append(f"create_admin_task(#{task_id})")
+            return bot_texts.get("admin_task_created", id=task_id)
+
         def list_bot_texts() -> str:
             """Отримати всі фіксовані тексти бота (bot_texts): ключ, поточний текст, хто востаннє редагував."""
             actions.append("list_bot_texts()")
@@ -404,7 +421,7 @@ class AdminAgent(PromptAgent):
             _logged_tool(t) for t in (
                 set_lives, set_targets, set_schedule, swap_today_exercise, set_progress, update_user_profile,
                 get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
-                set_bot_text, list_bot_texts,
+                set_bot_text, list_bot_texts, create_admin_task,
             )
         ]
 

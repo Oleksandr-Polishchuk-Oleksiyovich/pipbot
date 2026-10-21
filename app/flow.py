@@ -61,6 +61,28 @@ class Sender(Protocol):
     async def send_video(self, chat_id: int, path: str) -> None: ...
 
 
+
+def load_release_commits(release_dir: str) -> Optional[set]:
+    """SHA задеплоєного релізу + його історія (REVISION, REVISION_COMMITS від deploy.sh). None — файлів немає."""
+    commits = set()
+    found = False
+    for name in ("REVISION", "REVISION_COMMITS"):
+        path = os.path.join(release_dir, name)
+        if os.path.isfile(path):
+            found = True
+            with open(path, encoding="utf-8") as f:
+                commits.update(line.strip().lower() for line in f if line.strip())
+    return commits if found else None
+
+
+def commit_is_deployed(fix_commit: Optional[str], deployed: Optional[set]) -> bool:
+    if deployed is None:
+        return True  # fallback: невідомо, що задеплоєно — анонсуємо
+    fc = (fix_commit or "").strip().lower()
+    if len(fc) < 7:
+        return False
+    return any(c.startswith(fc) or fc.startswith(c) for c in deployed if len(c) >= 7)
+
 class ChatFlow:
     def __init__(self, store: Store, llm: Optional[GeminiLLM], sender: Sender,
                  now: Callable[[], datetime] = lambda: datetime.now(TIMEZONE),
@@ -128,6 +150,45 @@ class ChatFlow:
             self.store.get_state("schedule_mode", "ladder"),
             challenge.day_exercise(self.store, today),
         )
+
+    async def announce_admin_tasks(self, chat_id: int, startup: bool = False,
+                                   release_dir: Optional[str] = None) -> int:
+        """
+        Анонси по admin_tasks. Лише на старті (після деплою): done_pending_deploy, чий fix_commit входить у
+        задеплоєний реліз (REVISION / REVISION_COMMITS у каталозі релізу; якщо файлів немає — анонсуємо)
+        -> «Пропатчився…», status=announced. Rejected (ще не повідомлені) — і на старті, і на кожному тіку.
+        """
+        posted = 0
+        if startup:
+            deployed = load_release_commits(release_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            for task in self.store.list_admin_tasks(status="done_pending_deploy"):
+                if not commit_is_deployed(task.get("fix_commit"), deployed):
+                    logger.info("admin_task #%s: fix_commit %s not in deployed release yet", task["id"], task.get("fix_commit"))
+                    continue
+                text = self.bot_texts.get("admin_task_patched", requester=task.get("requester_name") or "",
+                                          text=task.get("text") or "", id=task["id"])
+                try:
+                    await self._say(task.get("chat_id") or chat_id, text)
+                except Exception as e:
+                    logger.warning("admin_task #%s announce failed: %s", task["id"], e)
+                    continue
+                self.store.mark_admin_task_announced(task["id"])
+                logger.info("admin_task #%s announced (fix_commit=%s)", task["id"], task.get("fix_commit"))
+                posted += 1
+        for task in self.store.list_admin_tasks(status="rejected"):
+            if task.get("notified"):
+                continue
+            text = self.bot_texts.get("admin_task_rejected", requester=task.get("requester_name") or "",
+                                      text=task.get("text") or "", note=task.get("result") or "", id=task["id"])
+            try:
+                await self._say(task.get("chat_id") or chat_id, text)
+            except Exception as e:
+                logger.warning("admin_task #%s reject notice failed: %s", task["id"], e)
+                continue
+            self.store.mark_admin_task_notified(task["id"])
+            logger.info("admin_task #%s rejection notified", task["id"])
+            posted += 1
+        return posted
 
     async def prune_old_logs(self) -> Dict[str, int]:
         """Щоденне прибирання рядків старших за LOG_RETENTION_DAYS днів (планується через scheduler)."""
@@ -689,6 +750,12 @@ class ChatFlow:
             reply, actions = FALLBACK_ADMIN_MESSAGE, []
 
         logger.info("Admin quick actions executed (%d): %s", len(actions), actions)
+        for action in actions:
+            m = re.match(r"create_admin_task\(#(\d+)\)", action)
+            if m:
+                fixed = self.bot_texts.get("admin_task_created", id=int(m.group(1)))
+                if fixed not in (reply or ""):
+                    reply = f"{reply}\n\n{fixed}" if reply else fixed
         for action in actions:
             self.store.create_admin_audit(
                 request_id=str(uuid.uuid4()),

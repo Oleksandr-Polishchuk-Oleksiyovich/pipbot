@@ -492,6 +492,9 @@ def create_app(
     from gateway.cv_queue import setup_cv_routes
     setup_cv_routes(app, **(cv_options or {}))
 
+    from gateway.admin_tasks_api import setup_admin_task_routes
+    setup_admin_task_routes(app, claim_wait_s=(cv_options or {}).get("claim_wait_s"))
+
     return app
 
 

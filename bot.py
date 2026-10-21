@@ -291,12 +291,15 @@ async def main():
     scheduler.add_job(flow.check_expired_offload_requests, "interval", minutes=1,
                       args=[CHAT_ID], id="check_offload_expiry")
     scheduler.add_job(flow.prune_old_logs, "cron", hour=0, minute=10, id="prune_old_logs")
+    scheduler.add_job(flow.announce_admin_tasks, "interval", minutes=1, args=[CHAT_ID],
+                      id="admin_task_rejections", max_instances=1, coalesce=True)
     scheduler.start()
     logging.info("Scheduler started (00:05 settle, 00:10 prune_old_logs, 08:30, 15:00, 19:00, 23:30 Kyiv).")
 
     try:
         await flow.drain_pending_replies()
         await flow.process(CHAT_ID, trigger="startup")
+        await flow.announce_admin_tasks(CHAT_ID, startup=True)
     except Exception as e:
         logging.warning("Startup processing failed: %s", e)
 
