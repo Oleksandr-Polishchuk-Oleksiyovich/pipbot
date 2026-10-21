@@ -194,6 +194,15 @@ if [ "$SIMULATE_SMOKE_FAIL" = "1" ]; then
     exit 1
 fi
 
+if [ "${SKIP_TESTS:-1}" = "1" ] && [ -f "$TARGET_RELEASE/deploy/smoke_env.py" ]; then
+    echo "Running light env/DB smoke..."
+    if ! DB_PATH="$DB_PATH" "$PYTHON_BIN" "$TARGET_RELEASE/deploy/smoke_env.py" "${ENV_FILE:-/etc/sportnerdbot/env}"; then
+        echo "ERROR: env/DB smoke failed!" >&2
+        write_status "failed" "$SHA" "env/DB smoke failed"
+        exit 1
+    fi
+fi
+
 echo "Running smoke check: build_app..."
 if [ -f "$TARGET_RELEASE/bot.py" ]; then
     if ! (cd "$TARGET_RELEASE" && PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -c "import bot; bot.build_app(); print('build_app smoke ok')"); then
@@ -210,7 +219,7 @@ if [ -n "$SMOKE_TEST_CMD" ]; then
         write_status "failed" "$SHA" "smoke test command failed"
         exit 1
     fi
-elif [ "${SKIP_TESTS:-0}" != "1" ] && [ -d "$TARGET_RELEASE/tests" ]; then
+elif [ "${SKIP_TESTS:-1}" != "1" ] && [ -d "$TARGET_RELEASE/tests" ]; then
     echo "Running offline test suite..."
     if ! (cd "$TARGET_RELEASE" && SPORTNERD_IN_DEPLOY=1 PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -m pytest -q --ignore=tests/integration); then
         echo "ERROR: Offline test suite failed!" >&2
