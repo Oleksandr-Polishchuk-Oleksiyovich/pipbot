@@ -3,7 +3,7 @@
 04.10 — віджимання 26 для обох; 05.10 — присідання ceil(1.5 × 26) = 39; 06.10 — віджимання 27; ...
 Ідемпотентна: якщо чергування вже увімкнене, нічого не робить.
 
-Запуск: .venv/Scripts/python.exe enable_alternating.py [шлях_до_БД]
+Запуск: .venv/Scripts/python.exe scripts/legacy/enable_alternating.py [шлях_до_БД]  (з кореня репо, PYTHONPATH=.)
 """
 import sys
 from datetime import date, timedelta
