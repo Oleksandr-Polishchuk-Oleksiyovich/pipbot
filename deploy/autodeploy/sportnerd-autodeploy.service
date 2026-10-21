@@ -1,0 +1,8 @@
+[Unit]
+Description=SportNerdBot auto-deploy from origin/main
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sportnerdbot/repo/deploy/autodeploy/sportnerd-autodeploy.sh
+TimeoutStartSec=900
