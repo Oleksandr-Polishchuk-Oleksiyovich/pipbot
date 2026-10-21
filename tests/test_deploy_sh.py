@@ -12,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+# Running deploy.sh from inside a real deploy's test phase recurses on the VM.
+pytestmark = pytest.mark.skipif(os.environ.get("SPORTNERD_IN_DEPLOY") == "1", reason="inside real deploy")
+
 
 DEPLOY_SCRIPT = str(Path(__file__).resolve().parent.parent / "deploy" / "deploy.sh")
 

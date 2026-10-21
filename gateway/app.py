@@ -504,4 +504,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Run via the canonical module so AppKeys are shared with gateway.cv_queue
+    from gateway.app import main as _main
+    _main()

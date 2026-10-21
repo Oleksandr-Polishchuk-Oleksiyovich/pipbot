@@ -212,7 +212,7 @@ if [ -n "$SMOKE_TEST_CMD" ]; then
     fi
 elif [ -d "$TARGET_RELEASE/tests" ]; then
     echo "Running offline test suite..."
-    if ! (cd "$TARGET_RELEASE" && PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -m pytest -q --ignore=tests/integration); then
+    if ! (cd "$TARGET_RELEASE" && SPORTNERD_IN_DEPLOY=1 PYTHONPATH="$TARGET_RELEASE:${PYTHONPATH:-}" "$PYTHON_BIN" -m pytest -q --ignore=tests/integration); then
         echo "ERROR: Offline test suite failed!" >&2
         write_status "failed" "$SHA" "offline test suite failed"
         exit 1
