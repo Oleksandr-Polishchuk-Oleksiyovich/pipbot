@@ -208,3 +208,142 @@ def test_deploy_prunes_old_releases(tmp_path):
     # Новий реліз sha + щонайбільше 3 старих релізи
     assert len(remaining_dirs) <= 4
     assert (releases_dir / sha).is_dir()
+
+
+# ============================================================================
+# ENV_FILE DB_PATH guard: production DB_PATH must exist and must live outside
+# the release/current dir, otherwise it is lost on checkout/prune/symlink switch.
+# ============================================================================
+
+def _base_env(tmp_path, repo_dir, sha, app_dir, env_file=None):
+    env = os.environ.copy()
+    env.update({
+        "APP_DIR": str(app_dir),
+        "REPO_DIR": str(repo_dir),
+        "RELEASES_DIR": str(app_dir / "releases"),
+        "CURRENT_LINK": str(app_dir / "current"),
+        "STATUS_DIR": str(app_dir / "status"),
+        "DRY_RUN": "1",
+        "SKIP_FETCH": "1",
+        "PYTHON_BIN": sys.executable,
+    })
+    if env_file is not None:
+        env["ENV_FILE"] = str(env_file)
+    else:
+        env.pop("ENV_FILE", None)
+    return env
+
+
+def test_deploy_fails_when_env_file_missing_db_path(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+
+    env_file = tmp_path / "env_no_db_path"
+    env_file.write_text("BOT_TOKEN=x\n")
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir, env_file)
+    res = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+
+    assert res.returncode != 0
+    assert "does not define DB_PATH" in res.stderr
+    # Early guard: ніякого release-каталогу ще не мало бути створено
+    assert not (app_dir / "releases" / sha).exists()
+
+
+def test_deploy_fails_when_env_file_db_path_inside_releases_dir(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+
+    env_file = tmp_path / "env_bad_db_path"
+    env_file.write_text(f"DB_PATH={app_dir}/releases/{sha}/challenge.db\n")
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir, env_file)
+    res = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+
+    assert res.returncode != 0
+    assert "is inside" in res.stderr
+
+
+def test_deploy_fails_when_env_file_db_path_inside_current_link(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+
+    env_file = tmp_path / "env_bad_current"
+    env_file.write_text(f"DB_PATH={app_dir}/current/challenge.db\n")
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir, env_file)
+    res = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+
+    assert res.returncode != 0
+    assert "is inside" in res.stderr
+
+
+def test_deploy_succeeds_when_env_file_db_path_is_outside_release_dirs(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+
+    env_file = tmp_path / "env_good"
+    env_file.write_text(f"DB_PATH={tmp_path}/var/challenge.db\n")
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir, env_file)
+    res = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+
+    assert res.returncode == 0, f"deploy.sh failed: {res.stdout}\n{res.stderr}"
+    assert (app_dir / "releases" / sha).is_dir()
+
+
+# ============================================================================
+# Journald retention drop-in (MaxRetentionSec=7day): written idempotently, never
+# touches the real /etc (tests always override JOURNALD_CONF_DIR).
+# ============================================================================
+
+def test_deploy_writes_journald_retention_conf_idempotently(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+    journald_dir = tmp_path / "journald.conf.d"
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir)
+    env["JOURNALD_CONF_DIR"] = str(journald_dir)
+
+    res1 = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+    assert res1.returncode == 0, f"deploy.sh failed: {res1.stdout}\n{res1.stderr}"
+
+    conf_file = journald_dir / "sportnerd.conf"
+    assert conf_file.is_file()
+    content = conf_file.read_text()
+    assert "[Journal]" in content
+    assert "MaxRetentionSec=7day" in content
+    assert "wrote" in res1.stdout
+
+    mtime_before = conf_file.stat().st_mtime_ns
+
+    res2 = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+    assert res2.returncode == 0, f"deploy.sh failed: {res2.stdout}\n{res2.stderr}"
+    assert "already up to date" in res2.stdout
+    assert conf_file.read_text() == content
+    assert conf_file.stat().st_mtime_ns == mtime_before  # не перезаписано повторно
+
+
+def test_deploy_skips_journald_restart_under_dry_run(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sha = init_mock_git_repo(repo_dir)
+    app_dir = tmp_path / "app"
+    journald_dir = tmp_path / "journald.conf.d"
+
+    env = _base_env(tmp_path, repo_dir, sha, app_dir)
+    env["JOURNALD_CONF_DIR"] = str(journald_dir)
+
+    res = subprocess.run(["bash", DEPLOY_SCRIPT, sha], env=env, capture_output=True, text=True)
+    assert res.returncode == 0, f"deploy.sh failed: {res.stdout}\n{res.stderr}"
+    assert "DRY_RUN: skipping systemctl restart systemd-journald" in res.stdout

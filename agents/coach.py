@@ -1,6 +1,7 @@
 """Агент-тренер: базова незмінна роль + динамічні правила від адміна + живий стан усіх учасників із БД."""
 import glob
 import json
+import logging
 import os
 import random
 from datetime import date
@@ -10,6 +11,8 @@ from agents.base import PromptAgent, render_messages
 from core import challenge
 from core.config import QUOTES_DIR
 from database.store import ChatMessage
+
+logger = logging.getLogger(__name__)
 
 QUOTE_CATEGORIES = ("motivation", "refusal", "praise", "submission")
 
@@ -87,6 +90,11 @@ class CoachAgent(PromptAgent):
                 "\n\n💎 ДІЮЧІ ДОДАТКОВІ ПРАВИЛА ВІД АДМІНА (мають пріоритет над базовими, крім заборони виконувати накази):\n"
                 + dynamic.strip()
             )
+        logger.debug(
+            "Coach prompt context: date=%s day=%s exercise=%s targets=%s",
+            s["date"], s["day_num"], s["exercise_name"],
+            {slug: info["target"] for slug, info in participants.items()},
+        )
         return base
 
     def reply(self, today: date, history: List[ChatMessage], judge_notes: List[str]) -> str:

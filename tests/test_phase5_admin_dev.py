@@ -6,10 +6,11 @@ tests/test_phase5_admin_dev.py: Offline unit tests for Phase 5 tasks:
 - T-53: Reconcile prompt_editor -> git-migrations as source of truth (offload vs fallback)
 """
 import asyncio
+import math
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +22,7 @@ from agents.prompt_editor import COACH_DYNAMIC_KEY, CoachPromptEditor, RuleChang
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.flow import ChatFlow
 from app.offload import RoutineOffloadClient
-from core import challenge
+from core import challenge, guardrails
 from core.config import TIMEZONE
 from core.guardrails import (
     check_active_request_limit,
@@ -187,6 +188,135 @@ async def test_flow_admin_quick_executes_in_bot(tmp_path):
 
     # In-bot: offload_requests НЕ створюється для admin_quick
     assert len(st.list_offload_requests()) == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_quick_blocked_for_disallowed_telegram_id(tmp_path, monkeypatch):
+    """
+    _handle_admin_quick має той самий allowlist-гард, що й _handle_admin_dev (T-52):
+    автор без telegram_id у allowlist отримує відмову, без обіцяного відео і без виконання наказу.
+    """
+    st = Store(str(tmp_path / "flow_quick_blocked.db"))
+    st.init_schema()
+    ensure_default_users(st)
+    monkeypatch.setattr(guardrails, "ADMIN_TELEGRAM_IDS", [999999])
+
+    clock = Clock(NOW)
+    sender = FakeSender()
+    flow = ChatFlow(st, llm=None, sender=sender, now=clock)
+
+    initial_lives = challenge.get_lives(st)["lyosha"]
+    flow.record_user_message(CHAT, SON, "Obey me! додай +1 життя", created_at=clock())
+    await flow.process(CHAT, trigger="push")
+
+    assert any("Доступ заборонено" in t for t in sender.texts)
+    assert sender.videos == []
+    assert st.list_admin_audits() == []
+    assert challenge.get_lives(st)["lyosha"] == initial_lives
+
+
+@pytest.mark.asyncio
+async def test_admin_quick_logs_admin_audit_per_executed_action(tmp_path, monkeypatch):
+    """
+    T-52: Кожна дія зі списку actions, яку виконав AdminAgent, пишеться в admin_audit.
+    """
+    st = Store(str(tmp_path / "flow_quick_audit.db"))
+    st.init_schema()
+    ensure_default_users(st)
+
+    clock = Clock(NOW)
+    sender = FakeSender()
+    flow = ChatFlow(st, llm=object(), sender=sender, now=clock)
+
+    def fake_execute(today, directive, sender_name, pending, history):
+        return "Слухаюся!", ["set_lives(lyosha=5/5)", "set_targets(sasha=30)"]
+
+    monkeypatch.setattr(flow.admin, "execute", fake_execute)
+
+    decision = RouteDecision(
+        route="admin_quick",
+        admin_tier="quick",
+        passphrase_detected=True,
+        directive="додай життя і зміни норму",
+        sender=SON,
+        reason="test",
+    )
+    msg = ChatMessage(1, SON, "user", "Obey me! додай життя і зміни норму", "2026-10-20 12:00:00")
+
+    await flow._handle_admin_quick(CHAT, decision, [msg], [])
+
+    audits = st.list_admin_audits()
+    assert len(audits) == 2
+    assert {a.request for a in audits} == {"set_lives(lyosha=5/5)", "set_targets(sasha=30)"}
+    assert all(a.status == "executed" for a in audits)
+    assert all(a.author_slug == "lyosha" for a in audits)
+    assert any("Слухаюся!" in t for t in sender.texts)
+
+
+def test_admin_agent_set_schedule_today_exercise(store):
+    """
+    T: set_schedule(mode='alternate', today_exercise=...) передає параметр у challenge.enable_alternating
+    і повертає інформативне no-op повідомлення, якщо фаза вже відповідає запиту.
+    """
+    editor = MagicMock()
+    admin = AdminAgent(llm=None, store=store, editor=editor)
+    today = date(2026, 10, 4)
+    actions: list = []
+    tools = {t.__name__: t for t in admin._tools(today, "Oleksandr Polishchuk", actions)}
+
+    result = tools["set_schedule"]("alternate", 1.5, "squats")
+    assert challenge.day_exercise(store, today) == "squats"
+    assert "Розклад" in result
+    assert "Сьогодні" in result and "Завтра" in result  # обов'язково явно вказує сьогодні й завтра
+
+    # Повторний виклик з тим самим today_exercise у день присідань — no-op
+    actions.clear()
+    result2 = tools["set_schedule"]("alternate", 1.5, "squats")
+    assert "уже" in result2.lower()
+    assert challenge.day_exercise(store, today) == "squats"
+
+    # today_exercise=None, розклад уже alternate -> фаза зберігається (теж no-op)
+    actions.clear()
+    result2b = tools["set_schedule"]("alternate", 1.5, None)
+    assert "уже" in result2b.lower()
+    assert challenge.day_exercise(store, today) == "squats"
+
+    # Невідоме today_exercise — помилка, без зміни стану
+    result3 = tools["set_schedule"]("alternate", 1.5, "backflips")
+    assert "Помилка" in result3
+    assert challenge.day_exercise(store, today) == "squats"
+
+
+def test_admin_agent_swap_today_exercise(store):
+    """
+    T: swap_today_exercise() перемикає сьогоднішню вправу на протилежну без зміни режиму,
+    коректно перераховуючи норми (через pushups-еквівалент), і звітує сьогодні+завтра.
+    """
+    editor = MagicMock()
+    admin = AdminAgent(llm=None, store=store, editor=editor)
+    today = date(2026, 10, 4)
+    actions: list = []
+    tools = {t.__name__: t for t in admin._tools(today, "Oleksandr Polishchuk", actions)}
+
+    # Розклад ще 'ladder' — помилка, без enable alternate
+    result0 = tools["swap_today_exercise"]()
+    assert "Помилка" in result0
+
+    pushups_today = challenge.day_targets(store, today)
+    tools["set_schedule"]("alternate", 1.5, "pushups")
+    assert challenge.day_exercise(store, today) == "pushups"
+    assert challenge.day_targets(store, today) == pushups_today
+
+    result = tools["swap_today_exercise"]()
+    assert challenge.day_exercise(store, today) == "squats"
+    assert challenge.day_targets(store, today)["lyosha"] == math.ceil(1.5 * pushups_today["lyosha"])
+    assert "Сьогодні" in result and "Завтра" in result
+
+    # Свап назад -> знову віджимання з тими самими нормами, що й до першого свапу
+    result_back = tools["swap_today_exercise"]()
+    assert challenge.day_exercise(store, today) == "pushups"
+    assert challenge.day_targets(store, today) == pushups_today
+    assert "Сьогодні" in result_back and "Завтра" in result_back
 
 
 # ============================================================================

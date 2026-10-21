@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
 try:
@@ -16,7 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.flow import ChatFlow
 from core import challenge
-from core.config import BASE_DIR, BOT_TOKEN, CANDIDATE_MODELS, CHAT_ID, DB_PATH, GEMINI_API_KEY, TIMEZONE
+from core.config import BASE_DIR, BOT_TOKEN, CANDIDATE_MODELS, CHAT_ID, DB_PATH, GEMINI_API_KEY, LOG_RETENTION_DAYS, TIMEZONE
 from core.llm import GeminiLLM
 from database.store import Store
 
@@ -25,13 +25,17 @@ def setup_logging() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    # Щоденна ротація bot.log, зберігаємо LOG_RETENTION_DAYS (7) днів — узгоджено з
+    # DB log-retention (ChatFlow.prune_old_logs) і journald MaxRetentionSec у deploy.sh.
+    file_handler = TimedRotatingFileHandler(
+        os.path.join(BASE_DIR, "bot.log"), when="midnight", backupCount=LOG_RETENTION_DAYS, encoding="utf-8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            RotatingFileHandler(os.path.join(BASE_DIR, "bot.log"), maxBytes=5 * 1024 * 1024,
-                                backupCount=3, encoding="utf-8"),
+            file_handler,
         ],
         force=True,
     )
@@ -286,8 +290,9 @@ async def main():
                       max_instances=1, coalesce=True)
     scheduler.add_job(flow.check_expired_offload_requests, "interval", minutes=1,
                       args=[CHAT_ID], id="check_offload_expiry")
+    scheduler.add_job(flow.prune_old_logs, "cron", hour=0, minute=10, id="prune_old_logs")
     scheduler.start()
-    logging.info("Scheduler started (00:05 settle, 08:30, 15:00, 19:00, 23:30 Kyiv).")
+    logging.info("Scheduler started (00:05 settle, 00:10 prune_old_logs, 08:30, 15:00, 19:00, 23:30 Kyiv).")
 
     try:
         await flow.drain_pending_replies()

@@ -16,6 +16,28 @@ CURRENT_LINK="${CURRENT_LINK:-$APP_DIR/current}"
 SHARED_DIR="${SHARED_DIR:-$APP_DIR/shared}"
 VENV_DIR="${VENV_DIR:-$APP_DIR/venv}"
 DB_PATH="${DB_PATH:-/var/lib/sportnerdbot/challenge.db}"
+ENV_FILE="${ENV_FILE:-/etc/sportnerdbot/env}"
+
+# Early guard: the production DB_PATH (as the systemd service will actually load it from
+# ENV_FILE) must be set and must NOT live inside the release/current dir — otherwise the DB
+# is lost on every new release checkout or on `prune_releases`.
+if [ -f "$ENV_FILE" ]; then
+    ENV_DB_PATH=$( (grep -E '^DB_PATH=' "$ENV_FILE" || true) | tail -n1 | cut -d'=' -f2- | tr -d '"'"'"'')
+    if [ -z "$ENV_DB_PATH" ]; then
+        echo "ERROR: $ENV_FILE does not define DB_PATH — refusing to deploy without an explicit production DB path." >&2
+        exit 1
+    fi
+    case "$ENV_DB_PATH" in
+        "$RELEASES_DIR"/*|"$RELEASES_DIR")
+            echo "ERROR: DB_PATH in $ENV_FILE ($ENV_DB_PATH) is inside $RELEASES_DIR — it would be wiped on release checkout/prune." >&2
+            exit 1
+            ;;
+        "$CURRENT_LINK"/*|"$CURRENT_LINK")
+            echo "ERROR: DB_PATH in $ENV_FILE ($ENV_DB_PATH) is inside $CURRENT_LINK — it would be wiped on every symlink switch." >&2
+            exit 1
+            ;;
+    esac
+fi
 
 if [ -z "${BACKUP_DIR:-}" ]; then
     if [ -d "/var/lib/sportnerdbot" ] && [ -w "/var/lib/sportnerdbot" ]; then
@@ -306,6 +328,40 @@ fi
 # 9. Успіх та prune старих релізів
 echo "=== Deployment successful for SHA: $SHA ==="
 write_status "ok" "$SHA" "Deploy completed successfully"
+
+# 9.1 Journald retention (7 днів): gateway/cv worker пишуть лише в journal (без файлових логів),
+# тож тут задаємо MaxRetentionSec=7day через drop-in, узгоджено з bot.log ротацією (LOG_RETENTION_DAYS)
+# і DB log-пруном (ChatFlow.prune_old_logs). Ідемпотентно: файл переписується лише якщо вміст змінився,
+# і лише тоді рестартує systemd-journald (сам рестарт — реальна системна дія, тож під DRY_RUN пропускається).
+# Best-effort: якщо /etc недоступний для запису (напр. у тестовому піскобоксі) — попередження, деплой не падає.
+JOURNALD_CONF_DIR="${JOURNALD_CONF_DIR:-/etc/systemd/journald.conf.d}"
+JOURNALD_CONF_FILE="$JOURNALD_CONF_DIR/sportnerd.conf"
+# Без кінцевого \n: $(cat ...) завжди обтинає кінцеві нові рядки, тож порівняння з рядком, що
+# закінчується на \n, НІКОЛИ не збігалося б (файл переписувався б щоразу, не ідемпотентно).
+DESIRED_JOURNALD_CONF='[Journal]
+MaxRetentionSec=7day'
+if mkdir -p "$JOURNALD_CONF_DIR" 2>/dev/null; then
+    CURRENT_JOURNALD_CONF=""
+    if [ -f "$JOURNALD_CONF_FILE" ]; then
+        CURRENT_JOURNALD_CONF=$(cat "$JOURNALD_CONF_FILE" 2>/dev/null || true)
+    fi
+    if [ "$CURRENT_JOURNALD_CONF" != "$DESIRED_JOURNALD_CONF" ]; then
+        if printf '%s\n' "$DESIRED_JOURNALD_CONF" > "$JOURNALD_CONF_FILE" 2>/dev/null; then
+            echo "journald retention: wrote $JOURNALD_CONF_FILE (MaxRetentionSec=7day)"
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "DRY_RUN: skipping systemctl restart systemd-journald"
+            elif command -v systemctl >/dev/null 2>&1; then
+                systemctl restart systemd-journald 2>/dev/null || echo "WARNING: systemctl restart systemd-journald failed" >&2
+            fi
+        else
+            echo "WARNING: could not write $JOURNALD_CONF_FILE — skipping journald retention config" >&2
+        fi
+    else
+        echo "journald retention: $JOURNALD_CONF_FILE already up to date"
+    fi
+else
+    echo "WARNING: $JOURNALD_CONF_DIR not writable — skipping journald retention config" >&2
+fi
 
 prune_releases() {
     local keep="${1:-$KEEP_RELEASES}"

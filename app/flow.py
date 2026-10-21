@@ -28,7 +28,7 @@ from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
 from core import challenge
 from core.bot_texts import BotTexts
-from core.config import CV_OFFLOAD, CV_STILL_COUNTING_MIN, OBEY_MEDIA_DIR, TIMEZONE
+from core.config import CV_OFFLOAD, CV_STILL_COUNTING_MIN, DB_PATH, IS_PRODUCTION, LOG_RETENTION_DAYS, OBEY_MEDIA_DIR, TIMEZONE
 from core.guardrails import (
     check_active_request_limit,
     check_admin_rate_limit,
@@ -94,7 +94,15 @@ class ChatFlow:
 
     def init_storage(self) -> None:
         self.store.init_schema()
-        ensure_default_users(self.store)
+        if IS_PRODUCTION:
+            if not self.store.list_users():
+                logger.error(
+                    "Users table empty in production DB (%s) — refusing to auto-seed default "
+                    "participants at startup. Run migrate_users.py explicitly or restore from backup.",
+                    DB_PATH,
+                )
+        else:
+            ensure_default_users(self.store)
         seeded = self.store.seed_prompts(DEFAULT_PROMPTS)
         if seeded:
             logger.info("Seeded prompts: %s", seeded)
@@ -108,9 +116,32 @@ class ChatFlow:
         if not self.store.get_state("last_processed_id"):
             self.store.set_state("last_processed_id", "0")
 
+        deleted = self.store.prune_old_logs(self._log_retention_cutoff())
+        if any(deleted.values()):
+            logger.info("Startup log pruning (older than %dd): %s", LOG_RETENTION_DAYS, deleted)
+
+        today = self.now().date()
+        logger.info(
+            "Startup: db_path=%s participants=%d schedule_mode=%s today_exercise=%s",
+            os.path.abspath(DB_PATH),
+            len(self.store.list_users(status="active")),
+            self.store.get_state("schedule_mode", "ladder"),
+            challenge.day_exercise(self.store, today),
+        )
+
+    async def prune_old_logs(self) -> Dict[str, int]:
+        """Щоденне прибирання рядків старших за LOG_RETENTION_DAYS днів (планується через scheduler)."""
+        deleted = self.store.prune_old_logs(self._log_retention_cutoff())
+        if any(deleted.values()):
+            logger.info("Daily log pruning (older than %dd): %s", LOG_RETENTION_DAYS, deleted)
+        return deleted
+
     # --- допоміжне ---
     def _yesterday_cutoff(self) -> str:
         return (self.now() - timedelta(days=1)).strftime("%Y-%m-%d 23:55:00")
+
+    def _log_retention_cutoff(self) -> str:
+        return (self.now() - timedelta(days=LOG_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _day_start(self) -> str:
         return self.now().strftime("%Y-%m-%d 00:00:00")
@@ -428,7 +459,7 @@ class ChatFlow:
                     trigger, len(pending), last_ts, last_id,
                 )
                 await self._refresh_chat_members(chat_id)
-                await self._handle_pending(chat_id, pending)
+                await self._handle_pending(chat_id, pending, trigger)
                 self.store.set_state("last_processed_timestamp", pending[-1].created_at)
                 self.store.set_state("last_processed_id", str(pending[-1].id))
 
@@ -438,7 +469,7 @@ class ChatFlow:
                 else:
                     await self._handle_timer(chat_id, job)
 
-    async def _handle_pending(self, chat_id: int, pending: List[ChatMessage]) -> None:
+    async def _handle_pending(self, chat_id: int, pending: List[ChatMessage], trigger: str = "push") -> None:
         today_iso = self.now().date().isoformat()
         history = self.store.messages_since(chat_id, self._day_start())
 
@@ -498,9 +529,9 @@ class ChatFlow:
         logger.info("Route decision: %s", decision.model_dump())
 
         if decision.is_admin_dev:
-            await self._handle_admin_dev(chat_id, decision, active_pending, history)
+            await self._handle_admin_dev(chat_id, decision, active_pending, history, trigger)
         elif decision.is_admin_quick or decision.is_admin:
-            await self._handle_admin_quick(chat_id, decision, active_pending, history)
+            await self._handle_admin_quick(chat_id, decision, active_pending, history, trigger)
         elif decision.route == "coach":
             await self._handle_coach(chat_id, active_pending, history)
 
@@ -525,6 +556,7 @@ class ChatFlow:
         decision: RouteDecision,
         pending: List[ChatMessage],
         history: List[ChatMessage],
+        trigger: str = "push",
     ) -> None:
         last_msg = pending[-1] if pending else None
         msg_id = last_msg.id if last_msg else None
@@ -533,7 +565,12 @@ class ChatFlow:
         telegram_id = user.telegram_id if user else None
 
         # Guardrail: Allowlist check (T-52)
-        if not is_admin_allowed(telegram_id):
+        allowed = is_admin_allowed(telegram_id)
+        logger.info(
+            "Admin entry: mode=admin_dev trigger=%s user_id=%s user_name=%s sender_slug=%s allowed=%s",
+            trigger, telegram_id, decision.sender, author_slug, allowed,
+        )
+        if not allowed:
             reply = (
                 "❌ **Доступ заборонено.**\n"
                 "Ваш Telegram ID не входить до списку дозволених адміністраторів для змін системи."
@@ -615,10 +652,31 @@ class ChatFlow:
         decision: RouteDecision,
         pending: List[ChatMessage],
         history: List[ChatMessage],
+        trigger: str = "push",
     ) -> None:
+        last_msg = pending[-1] if pending else None
+        msg_id = last_msg.id if last_msg else None
+        author_slug = challenge.normalize_participant(decision.sender, self.store) or decision.sender
+        user = self.store.find_user(author_slug)
+        telegram_id = user.telegram_id if user else None
+
+        # Guardrail: Allowlist check (T-52) — той самий, що й у _handle_admin_dev.
+        allowed = is_admin_allowed(telegram_id)
+        logger.info(
+            "Admin entry: mode=admin_quick trigger=%s user_id=%s user_name=%s sender_slug=%s allowed=%s",
+            trigger, telegram_id, decision.sender, author_slug, allowed,
+        )
+        if not allowed:
+            reply = (
+                "❌ **Доступ заборонено.**\n"
+                "Ваш Telegram ID не входить до списку дозволених адміністраторів для змін системи."
+            )
+            await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
+            return
+
         await self._send_obey_video(chat_id)
         try:
-            reply, _ = await self._call(
+            reply, actions = await self._call(
                 self.admin.execute,
                 self.now().date(),
                 decision.directive,
@@ -628,7 +686,19 @@ class ChatFlow:
             )
         except LLMUnavailable as e:
             logger.error("Admin agent unavailable: %s", e)
-            reply = FALLBACK_ADMIN_MESSAGE
+            reply, actions = FALLBACK_ADMIN_MESSAGE, []
+
+        logger.info("Admin quick actions executed (%d): %s", len(actions), actions)
+        for action in actions:
+            self.store.create_admin_audit(
+                request_id=str(uuid.uuid4()),
+                author_slug=author_slug,
+                author_telegram_id=telegram_id,
+                request=action,
+                plan=decision.directive or "",
+                status="executed",
+            )
+
         await self._say(chat_id, reply)
 
     async def _handle_admin(

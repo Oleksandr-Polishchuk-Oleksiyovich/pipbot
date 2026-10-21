@@ -84,7 +84,8 @@ class GeminiLLM:
 
     def _run(self, contents: object, config: types.GenerateContentConfig, accept: Callable) -> object:
         errors = []
-        for model in list(self._models):
+        models = list(self._models)
+        for attempt, model in enumerate(models, start=1):
             try:
                 self._wait_and_record_call()
                 resp = self._client.models.generate_content(model=model, contents=contents, config=config)
@@ -92,8 +93,15 @@ class GeminiLLM:
                 self._promote(model)
                 self.last_model = model
                 return result
-            except Exception as e:  # мережа, 4xx/5xx, невалідний JSON — пробуємо наступну модель
-                logger.warning("Gemini model %s failed: %s", model, str(e)[:300])
+            except Exception as e:  # мережа, 4xx/5xx (у т.ч. 503/504), невалідний JSON — пробуємо наступну модель
+                is_last = attempt == len(models)
+                err_text = str(e)[:300]
+                is_transient = any(code in err_text for code in ("503", "504", "UNAVAILABLE", "DEADLINE_EXCEEDED"))
+                logger.warning(
+                    "Gemini model %s failed (attempt %d/%d, transient=%s): %s — %s",
+                    model, attempt, len(models), is_transient, err_text,
+                    "no more models, giving up" if is_last else "retrying with next model",
+                )
                 errors.append(f"{model}: {str(e)[:120]}")
         raise LLMUnavailable("; ".join(errors[-3:]) or "no models configured")
 

@@ -15,6 +15,7 @@ This directory contains deployment scripts and documentation for SportNerdBot pu
 
 `deploy/deploy.sh` performs atomic zero-downtime (or minimal restart window) deployments:
 
+0. **DB_PATH Safety Guard:** If `ENV_FILE` (`/etc/sportnerdbot/env` by default) exists, requires it to define a non-empty `DB_PATH` that does NOT live inside `$RELEASES_DIR` or `$CURRENT_LINK` — otherwise the production DB would be wiped on the next checkout/prune/symlink switch. Fails fast (exit 1) before touching anything else.
 1. **Fetch & Resolve SHA:** Pulls latest references from remotes (`git fetch --all`), resolves target reference (default: `origin/main`).
 2. **Release Checkout:** Extracts committed tree into `/opt/sportnerdbot/releases/<sha>` via `git archive`.
 3. **Virtualenv Validation:** Compares `requirements.txt` SHA256 against cached hash; runs `pip install` only on dependency changes.
@@ -25,7 +26,8 @@ This directory contains deployment scripts and documentation for SportNerdBot pu
 8. **Service Restart:** Restarts `sportnerdbot` systemd service (`systemctl restart sportnerdbot`).
 9. **Health Verification:** Verifies service status via `systemctl is-active`, journal polling confirmation, or `GET /healthz`.
 10. **Automated Rollback:** If health verification fails, atomically restores previous symlink (`current -> $PREV`), restarts service, records status `rolled_back`, and exits with non-zero code.
-11. **Release Pruning:** Keeps the newest 5 releases, protecting currently active and previous releases from pruning.
+11. **Journald Retention:** Idempotently writes `/etc/systemd/journald.conf.d/sportnerd.conf` (`MaxRetentionSec=7day`) and restarts `systemd-journald` only when the file content actually changed (skipped under `DRY_RUN=1`). See "Log Retention (7 days)" below.
+12. **Release Pruning:** Keeps the newest 5 releases, protecting currently active and previous releases from pruning.
 
 ### Usage
 
@@ -56,6 +58,16 @@ DRY_RUN=1 ./deploy/deploy.sh
 | `KEEP_RELEASES` | `5` | Number of previous releases to retain |
 | `HEALTH_WAIT_SEC` | `5` | Seconds to wait before checking service health |
 | `DRY_RUN` | `0` | If `1`, simulates execution without systemd or external commands |
+| `ENV_FILE` | `/etc/sportnerdbot/env` | Checked for a valid, out-of-release-dir `DB_PATH` before anything else runs |
+| `JOURNALD_CONF_DIR` | `/etc/systemd/journald.conf.d` | Where the `sportnerd.conf` retention drop-in is written |
+
+## Log Retention (7 days)
+
+Three independent mechanisms, all tied to `LOG_RETENTION_DAYS` (default `7`, see `core/config.py`):
+
+1. **`bot.log` (file):** `bot.py` configures a `TimedRotatingFileHandler(when="midnight", backupCount=LOG_RETENTION_DAYS)` — rotates nightly, keeps 7 days of backups.
+2. **journald (gateway, cv worker):** these services only log to stdout/journal (no file handler). `deploy.sh` writes `/etc/systemd/journald.conf.d/sportnerd.conf` with `MaxRetentionSec=7day` idempotently (only rewrites + restarts `systemd-journald` when the content actually changes) as part of every deploy.
+3. **DB "noisy" log tables:** `Store.prune_old_logs()` deletes rows older than 7 days from `cv_jobs` and `offload_requests` (technical video/offload processing bookkeeping). Run at bot startup (`ChatFlow.init_storage`) and daily via the `prune_old_logs` scheduler job (00:10 Kyiv, `bot.py`). `chat_history` and `video_checks` are challenge data (chat/report history), and `admin_audit`/`prompt_history` are the audit trail / prompt version history — none of these are ever pruned.
 
 ## Automated Rollback Behavior
 

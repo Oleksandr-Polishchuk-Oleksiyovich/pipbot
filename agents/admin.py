@@ -1,8 +1,9 @@
 """Агент-адмін: виконує легітимні накази (вже перевірені роутером) через Python-тули Gemini."""
+import functools
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable, List, Optional, Union
 
 from agents.base import PromptAgent, render_messages
@@ -15,8 +16,25 @@ from database.store import ChatMessage, DIFFICULTY_LIVES
 logger = logging.getLogger(__name__)
 
 # Ключі, які set_counter не має права перезаписувати — для них є окремі тули або це службові дані.
+# Стан розкладу/норм/життів змінюється лише профільними тулами (set_schedule, set_targets, set_lives).
+SCHEDULE_KEY_PREFIXES = ("schedule_", "alt_", "override_", "offset_", "lives_", "text:")
 PROTECTED_KEYS = {"last_processed_timestamp", "last_processed_id", "lives_settled_through", "custom_system_prompt"}
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+
+
+def _logged_tool(fn):
+    """Обгортає admin-тул логуванням кожного виклику (ім'я, args/kwargs) і результату."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        logger.info("Admin tool call: %s(args=%r, kwargs=%r)", fn.__name__, args, kwargs)
+        try:
+            result = fn(*args, **kwargs)
+        except Exception:
+            logger.exception("Admin tool call raised an exception: %s", fn.__name__)
+            raise
+        logger.info("Admin tool result: %s -> %r", fn.__name__, result)
+        return result
+    return wrapper
 
 
 class AdminAgent(PromptAgent):
@@ -49,6 +67,15 @@ class AdminAgent(PromptAgent):
 
     def _tools(self, today: date, author: str, actions: List[str]) -> list:
         store, editor, fetcher, bot_texts = self.store, self.editor, self.chat_members_fetcher, self.bot_texts
+
+        def _today_tomorrow_summary() -> str:
+            tomorrow = today + timedelta(days=1)
+            t_ex, tm_ex = challenge.day_exercise(store, today), challenge.day_exercise(store, tomorrow)
+            t_targets, tm_targets = challenge.day_targets(store, today), challenge.day_targets(store, tomorrow)
+            return (
+                f"Сьогодні ({today.isoformat()}, {challenge.EXERCISES[t_ex]['name']}): {t_targets}. "
+                f"Завтра ({tomorrow.isoformat()}, {challenge.EXERCISES[tm_ex]['name']}): {tm_targets}."
+            )
 
         def set_lives(
             participant: Optional[str] = None,
@@ -111,23 +138,84 @@ class AdminAgent(PromptAgent):
             actions.append(f"set_targets({', '.join(changed)})")
             return "Норми оновлено: " + (", ".join(changed) or "без змін")
 
-        def set_schedule(mode: str, squat_factor: float = 1.5) -> str:
+        def set_schedule(mode: str, squat_factor: float = 1.5, today_exercise: Optional[str] = None) -> str:
             """
             Перемкнути розклад вправ.
-            :param mode: 'alternate' — чергування віджимання/присідання з сьогоднішнього дня (сьогодні — віджимання
-                         з поточними нормами; присідання = squat_factor × учорашні віджимання, вгору до цілого);
-                         'ladder' — щодня віджимання +1.
+            :param mode: 'alternate' — чергування віджимання/присідання з сьогоднішнього дня (присідання =
+                         squat_factor × пушапс-еквівалент дня, вгору до цілого); 'ladder' — щодня віджимання +1.
             :param squat_factor: коефіцієнт присідань для режиму 'alternate'.
+            :param today_exercise: яка вправа СЬОГОДНІ в режимі 'alternate' — 'pushups' або 'squats'.
+                         ОБОВ'ЯЗКОВО передавай явно, якщо адмін прямо називає сьогоднішню вправу
+                         («сьогодні присідання», «зробимо сьогодні качання ніг», «з сьогодні навпаки —
+                         спочатку присідання» тощо). Якщо не передано і розклад УЖЕ 'alternate' — поточна
+                         вправа сьогодні НЕ змінюється (фаза зберігається, щоб не збити лічильник прогресії).
+                         Якщо не передано і розклад ще 'ladder' — за замовчуванням сьогодні 'pushups'.
+                         Для прохання «поміняй сьогодні вправу на протилежну» / «сьогодні навпаки» БЕЗ
+                         називання конкретної вправи використовуй swap_today_exercise() замість цього.
             """
+            before_mode = store.get_state("schedule_mode", "ladder")
+            before_exercise = challenge.day_exercise(store, today)
+            before_targets = challenge.day_targets(store, today)
+
             if mode == "alternate":
-                challenge.enable_alternating(store, today, challenge.day_targets(store, today), squat_factor)
+                if today_exercise is not None and today_exercise not in ("pushups", "squats"):
+                    return f"Помилка: невідоме today_exercise '{today_exercise}' (очікується 'pushups' або 'squats')."
+                effective_exercise = today_exercise
+                if effective_exercise is None:
+                    effective_exercise = before_exercise if before_mode == "alternate" else "pushups"
+                no_op = challenge.enable_alternating(
+                    store, today, challenge.pushups_equivalent(store, today), squat_factor, effective_exercise
+                )
             elif mode == "ladder":
+                no_op = None
                 challenge.disable_alternating(store, today)
             else:
                 return f"Помилка: невідомий режим '{mode}'."
-            actions.append(f"set_schedule({mode}, {squat_factor})")
-            return (f"Розклад: {mode}. Сьогодні: {challenge.day_exercise(store, today)} "
-                    f"{challenge.day_targets(store, today)}.")
+
+            after_mode = store.get_state("schedule_mode", "ladder")
+            after_exercise = challenge.day_exercise(store, today)
+            after_targets = challenge.day_targets(store, today)
+            logger.info(
+                "set_schedule state change: mode %s->%s, today(%s) exercise %s->%s, targets %s->%s",
+                before_mode, after_mode, today.isoformat(), before_exercise, after_exercise,
+                before_targets, after_targets,
+            )
+
+            if no_op:
+                actions.append(f"set_schedule(alternate, no_op={no_op})")
+                return f"Розклад уже 'alternate' ({no_op}). {_today_tomorrow_summary()}"
+
+            actions.append(f"set_schedule({mode}, {squat_factor}, today_exercise={today_exercise})")
+            return f"Розклад: {mode}. {_today_tomorrow_summary()}"
+
+        def swap_today_exercise() -> str:
+            """
+            Перемкнути вправу СЬОГОДНІ на протилежну в межах чинного чергування (віджимання <-> присідання),
+            не зачіпаючи саму систему 'alternate' — завтрашній день далі просувається природно.
+            Застосовуй САМЕ цей інструмент для прохань типу «сьогодні навпаки» / «поміняй вправу
+            сьогодні» / «зробимо сьогодні ноги» БЕЗ називання конкретної вправи — він сам визначить
+            протилежну до поточної. Якщо адмін називає конкретну вправу («сьогодні точно присідання») —
+            краще використати set_schedule(mode='alternate', today_exercise=...).
+            Вимагає, щоб розклад уже був 'alternate' (інакше спершу set_schedule(mode='alternate', ...)).
+            """
+            before_mode = store.get_state("schedule_mode", "ladder")
+            if before_mode != "alternate":
+                return "Помилка: розклад зараз 'ladder' (не чергування) — спершу set_schedule(mode='alternate', ...)."
+
+            before_exercise = challenge.day_exercise(store, today)
+            target_exercise = "squats" if before_exercise == "pushups" else "pushups"
+            factor = float(store.get_state("alt_squat_factor", "1.5"))
+            pushups_map = challenge.pushups_equivalent(store, today)
+
+            challenge.enable_alternating(store, today, pushups_map, factor, target_exercise)
+
+            after_exercise = challenge.day_exercise(store, today)
+            logger.info(
+                "swap_today_exercise state change: today(%s) exercise %s->%s",
+                today.isoformat(), before_exercise, after_exercise,
+            )
+            actions.append(f"swap_today_exercise({before_exercise}->{after_exercise})")
+            return f"Вправу сьогодні змінено: {before_exercise} -> {after_exercise}. {_today_tomorrow_summary()}"
 
         def set_progress(participant: str, done: bool, report_date: str = "") -> str:
             """
@@ -217,9 +305,11 @@ class AdminAgent(PromptAgent):
             :param value: нове значення (рядком).
             :param description: що означає цей лічильник.
             """
-            if not _KEY_RE.match(key) or key in PROTECTED_KEYS:
+            if not _KEY_RE.match(key) or key in PROTECTED_KEYS or key.startswith(SCHEDULE_KEY_PREFIXES):
                 return f"Помилка: ключ '{key}' недопустимий."
+            before = store.get_state(key, "")
             store.set_state(key, value)
+            logger.info("set_counter state change: %s: %r -> %r", key, before, value)
             actions.append(f"set_counter({key}={value})")
             return f"Лічильник {key} = {value} ({description})."
 
@@ -311,9 +401,11 @@ class AdminAgent(PromptAgent):
             return json.dumps(store.list_bot_texts(), ensure_ascii=False)
 
         return [
-            set_lives, set_targets, set_schedule, set_progress, update_user_profile,
-            get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
-            set_bot_text, list_bot_texts,
+            _logged_tool(t) for t in (
+                set_lives, set_targets, set_schedule, swap_today_exercise, set_progress, update_user_profile,
+                get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
+                set_bot_text, list_bot_texts,
+            )
         ]
 
     def execute(self, today: date, directive: str, sender: str, pending: List[ChatMessage],

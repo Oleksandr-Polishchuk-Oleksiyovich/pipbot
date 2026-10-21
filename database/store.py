@@ -23,6 +23,10 @@ DIFFICULTY_LIVES = {
     "welcome": 10,
 }
 
+# Таблиці з "гучними" лог-даними, які можна чистити за віком (див. Store.prune_old_logs).
+# НЕ включати admin_audit/prompt_history (аудит/історія версій) чи user_progress/progress (історія норм).
+LOG_RETENTION_TABLES = ("cv_jobs", "offload_requests")  # chat_history/video_checks = дані челенджу, не чистимо
+
 _CYR_TO_LAT = {
     "а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d", "е": "e", "є": "ye",
     "ж": "zh", "з": "z", "и": "y", "і": "i", "ї": "yi", "й": "y", "к": "k", "л": "l",
@@ -1402,6 +1406,22 @@ class Store:
         with self._connect() as con:
             row = con.execute(query, tuple(params)).fetchone()
         return _row_to_admin_audit(row) if row else None
+
+    # --- LOG RETENTION ---
+    def prune_old_logs(self, before_ts: str) -> Dict[str, int]:
+        """
+        Видаляє рядки старші за `before_ts` ('YYYY-MM-DD HH:MM:SS') із таблиць LOG_RETENTION_TABLES
+        (cv_jobs, offload_requests — технічні службові записи обробки відео/офлоаду). НЕ чіпає
+        chat_history/video_checks (дані челенджу — історія чату та звітів), admin_audit/prompt_history
+        (аудит і історія версій промптів) ні user_progress/progress (історія норм).
+        Повертає {таблиця: кількість_видалених_рядків}.
+        """
+        deleted: Dict[str, int] = {}
+        with self._connect() as con:
+            for table in LOG_RETENTION_TABLES:
+                cur = con.execute(f"DELETE FROM {table} WHERE created_at < ?", (before_ts,))
+                deleted[table] = cur.rowcount
+        return deleted
 
     # --- RECONCILE PROMPTS (T-53) ---
     def get_unreconciled_prompts(self) -> List[Dict[str, Any]]:

@@ -1,4 +1,5 @@
 """Офлайн-тести: сховище, міграція юзерів, онбординг, циклічний буфер LLM, промпти в БД та доменна логіка (без Gemini)."""
+import math
 from datetime import date
 from types import SimpleNamespace
 
@@ -259,6 +260,70 @@ def test_disable_alternating_continues_ladder_from_today(tmp_path):
     challenge.disable_alternating(store, date(2026, 10, 6))
     assert challenge.day_targets(store, date(2026, 10, 6)) == {"lyosha": 27, "sasha": 27}
     assert challenge.day_targets(store, date(2026, 10, 7)) == {"lyosha": 28, "sasha": 28}
+
+
+def test_enable_alternating_start_with_squats_today(tmp_path):
+    """today_exercise='squats': сьогодні — присідання = ceil(factor × поточні віджимання), завтра — +1 віджимання."""
+    store = Store(str(tmp_path / "alt_squats.db"))
+    store.init_schema()
+    ensure_default_users(store)
+    pushups_today = challenge.day_targets(store, date(2026, 10, 4))
+
+    result = challenge.enable_alternating(store, date(2026, 10, 4), pushups_today, 1.5, today_exercise="squats")
+
+    assert result is None
+    assert challenge.day_exercise(store, date(2026, 10, 4)) == "squats"
+    assert challenge.day_targets(store, date(2026, 10, 4))["lyosha"] == math.ceil(1.5 * pushups_today["lyosha"])
+    assert challenge.day_targets(store, date(2026, 10, 4))["sasha"] == math.ceil(1.5 * pushups_today["sasha"])
+    assert challenge.day_exercise(store, date(2026, 10, 5)) == "pushups"
+    assert challenge.day_targets(store, date(2026, 10, 5))["lyosha"] == pushups_today["lyosha"] + 1
+
+
+def test_enable_alternating_start_with_pushups_is_default(tmp_path):
+    store = Store(str(tmp_path / "alt_pushups.db"))
+    store.init_schema()
+    ensure_default_users(store)
+    pushups_today = challenge.day_targets(store, date(2026, 10, 4))
+
+    result = challenge.enable_alternating(store, date(2026, 10, 4), pushups_today, 1.5)
+
+    assert result is None
+    assert challenge.day_exercise(store, date(2026, 10, 4)) == "pushups"
+    assert challenge.day_targets(store, date(2026, 10, 4)) == pushups_today
+
+
+def test_enable_alternating_no_op_when_phase_already_matches(tmp_path):
+    """Повторний set_schedule('alternate', today_exercise='squats') у день присідань не повинен збити лічильник."""
+    store = _alt_store(tmp_path)  # alt_start=10-04 (pushups); 10-05 за розкладом — присідання
+    before_start = store.get_state("alt_start_date")
+    before_targets = challenge.day_targets(store, date(2026, 10, 5))
+
+    result = challenge.enable_alternating(store, date(2026, 10, 5), {"lyosha": 999, "sasha": 999}, 1.5, today_exercise="squats")
+
+    assert result is not None
+    assert store.get_state("alt_start_date") == before_start
+    assert challenge.day_targets(store, date(2026, 10, 5)) == before_targets
+
+
+def test_enable_alternating_switches_phase_when_start_with_differs(tmp_path):
+    """Якщо адмін явно просить іншу вправу на сьогодні, ніж за чинним розкладом — фаза реально змінюється."""
+    store = _alt_store(tmp_path)  # 10-05 — день присідань за чинним розкладом
+    result = challenge.enable_alternating(store, date(2026, 10, 5), {"lyosha": 30, "sasha": 30}, 1.5, today_exercise="pushups")
+
+    assert result is None
+    assert challenge.day_exercise(store, date(2026, 10, 5)) == "pushups"
+    assert challenge.day_targets(store, date(2026, 10, 5)) == {"lyosha": 30, "sasha": 30}
+
+
+def test_enable_alternating_rejects_unknown_start_with(tmp_path):
+    store = Store(str(tmp_path / "alt_bad.db"))
+    store.init_schema()
+    ensure_default_users(store)
+    try:
+        challenge.enable_alternating(store, date(2026, 10, 4), {}, 1.5, today_exercise="jumping_jacks")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
 
 
 def test_seed_prompts_upgrade_only_untouched(tmp_path):

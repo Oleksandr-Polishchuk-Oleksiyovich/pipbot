@@ -9,13 +9,16 @@
               Присідання: ceil(alt_squat_factor × учорашні віджимання) — дробових норм не буває.
 Разова правка будь-якої норми на конкретний день: override_<slug>_<YYYY-MM-DD>.
 """
+import logging
 import math
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
-from core.config import START_DATE
+from core.config import DB_PATH, IS_PRODUCTION, START_DATE
 from database.store import DIFFICULTY_LIVES, Store, User
 from migrate_users import ensure_default_users
+
+logger = logging.getLogger(__name__)
 
 EXERCISES = {
     "pushups": {"name": "віджимання", "genitive": "віджимань", "emoji": "💪"},
@@ -26,8 +29,15 @@ EXERCISES = {
 def _active_users(store: Store) -> List[User]:
     users = store.list_users(status="active")
     if not users and not store.list_users():
-        ensure_default_users(store)
-        users = store.list_users(status="active")
+        if IS_PRODUCTION:
+            logger.error(
+                "Users table is empty in production DB (%s) — refusing to seed default "
+                "participants automatically. Run migrate_users.py explicitly or restore from backup.",
+                DB_PATH,
+            )
+        else:
+            ensure_default_users(store)
+            users = store.list_users(status="active")
     return users
 
 
@@ -107,10 +117,8 @@ def day_exercise(store: Store, day: date) -> str:
     return "squats" if k is not None and k % 2 == 1 else "pushups"
 
 
-def _formula_target_for_user(store: Store, user: User, day: date) -> int:
-    k = _alternate_index(store, day)
-    if k is None:
-        return user.base_pushups + day_index(day) + user.ladder_offset
+def _alt_pushups_base(store: Store, user: User, day: date, k: int) -> int:
+    """Пушапс-еквівалент `day` у системі чергування (базове число до коефіцієнта присідань)."""
     alt_base = user.alt_pushups
     if alt_base is None:
         raw_state = store.get_state(f"alt_pushups_{user.slug}", "")
@@ -119,10 +127,32 @@ def _formula_target_for_user(store: Store, user: User, day: date) -> int:
         else:
             alt_start = date.fromisoformat(store.get_state("alt_start_date"))
             alt_base = user.base_pushups + day_index(alt_start) + user.ladder_offset
-    pushups = alt_base + k // 2
+    return alt_base + k // 2
+
+
+def _formula_target_for_user(store: Store, user: User, day: date) -> int:
+    k = _alternate_index(store, day)
+    if k is None:
+        return user.base_pushups + day_index(day) + user.ladder_offset
+    pushups = _alt_pushups_base(store, user, day, k)
     if k % 2 == 0:
         return pushups
     return math.ceil(float(store.get_state("alt_squat_factor", "1.5")) * pushups)
+
+
+def pushups_equivalent(store: Store, day: date) -> Dict[str, int]:
+    """
+    Пушапс-еквівалент норми на `day` для кожного активного учасника, незалежно від того, яка
+    вправа сьогодні фактично: у режимі 'ladder' це просто норма дня; у режимі 'alternate' —
+    базове число віджимань (до коефіцієнта присідань), з якого однаково обчислюються і
+    віджимання, і присідання. Використовується, щоб коректно перемикати вправу дня
+    (`enable_alternating(..., today_exercise=...)`, `swap_today_exercise`) без спотворення прогресії.
+    """
+    result = {}
+    for u in _active_users(store):
+        k = _alternate_index(store, day)
+        result[u.slug] = _formula_target_for_user(store, u, day) if k is None else _alt_pushups_base(store, u, day, k)
+    return result
 
 
 def day_targets(store: Store, day: date) -> Dict[str, int]:
@@ -176,16 +206,45 @@ def set_starting_pushups(store: Store, participant: str, starting_pushups: int, 
     store.set_state(f"offset_{user.slug}", str(user.ladder_offset))
 
 
-def enable_alternating(store: Store, start: date, pushups: Dict[str, int], squat_factor: float = 1.5) -> None:
-    """Увімкнути систему чергування: `start` — день віджимань із нормами `pushups`."""
+def enable_alternating(
+    store: Store,
+    start: date,
+    pushups: Dict[str, int],
+    squat_factor: float = 1.5,
+    today_exercise: str = "pushups",
+) -> Optional[str]:
+    """
+    Увімкнути систему чергування з дня `start`.
+
+    `today_exercise` визначає, яка вправа припадає на `start` ('pushups' — за замовчуванням, або 'squats'):
+    - 'pushups': `start` = alt_start_date, норми `pushups` діють на `start` як є.
+    - 'squats': alt_start_date = `start` - 1 день, тож `start` стає днем присідань
+      (ceil(squat_factor × `pushups`), округлення вгору), а наступний день віджимань = `pushups` + 1.
+      `pushups` тут має бути пушапс-еквівалентом дня (див. `pushups_equivalent`), а не вже відображеною
+      нормою — інакше число спотвориться.
+
+    Якщо режим уже 'alternate' і вправа дня `start` за чинним розкладом вже збігається з `today_exercise` —
+    нічого не змінює (щоб не збити лічильник прогресії) і повертає рядок із поясненням no-op.
+    Повертає None, якщо зміну застосовано.
+    """
+    if today_exercise not in ("pushups", "squats"):
+        raise ValueError(f"Unknown today_exercise: {today_exercise!r} (expected 'pushups' or 'squats')")
+
+    if store.get_state("schedule_mode", "ladder") == "alternate" and day_exercise(store, start) == today_exercise:
+        return (
+            f"уже 'alternate', і {start.isoformat()} — день '{today_exercise}' за чинним розкладом; без змін"
+        )
+
+    alt_start = start if today_exercise == "pushups" else start - timedelta(days=1)
     for u in _active_users(store):
         val = int(pushups.get(u.slug, _formula_target_for_user(store, u, start)))
         u.alt_pushups = val
         store.upsert_user(u)
         store.set_state(f"alt_pushups_{u.slug}", str(val))
     store.set_state("alt_squat_factor", str(squat_factor))
-    store.set_state("alt_start_date", start.isoformat())
+    store.set_state("alt_start_date", alt_start.isoformat())
     store.set_state("schedule_mode", "alternate")
+    return None
 
 
 def disable_alternating(store: Store, day: date) -> None:

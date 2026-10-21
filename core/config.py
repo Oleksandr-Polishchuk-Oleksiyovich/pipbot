@@ -8,13 +8,48 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Продакшн-індикатор: явний APP_ENV=production АБО код запущено з release-каталогу деплою
+# (/opt/sportnerdbot/releases/<sha> чи symlink /opt/sportnerdbot/current — див. deploy/deploy.sh).
+_RELEASE_DIR_PREFIX = os.path.join(os.sep, "opt", "sportnerdbot")
+IS_PRODUCTION = (
+    os.getenv("APP_ENV", "").strip().lower() == "production"
+    or BASE_DIR == _RELEASE_DIR_PREFIX.rstrip(os.sep)
+    or BASE_DIR.startswith(_RELEASE_DIR_PREFIX + os.sep)
+)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = int(os.getenv("CHAT_ID") or 0)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# Шлях до БД: локально за замовчуванням у BASE_DIR, на сервері через env
-# (наприклад, DB_PATH=/var/lib/sportnerdbot/challenge.db поза release-каталогом)
-DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "challenge.db"))
+
+# Шлях до БД: локально за замовчуванням у BASE_DIR, на сервері — лише явно через env
+# (наприклад, DB_PATH=/var/lib/sportnerdbot/challenge.db поза release-каталогом).
+# У продакшні (IS_PRODUCTION) DB_PATH МАЄ бути заданий явно і НЕ може лежати всередині BASE_DIR
+# (release/symlink-каталог деплою) — інакше дані губляться при кожному новому релізі/prune.
+_env_db_path = os.getenv("DB_PATH", "").strip()
+if IS_PRODUCTION:
+    if not _env_db_path:
+        raise RuntimeError(
+            "DB_PATH is not set in production (APP_ENV=production or running under "
+            f"{_RELEASE_DIR_PREFIX}) — refusing to fall back to a path inside the release "
+            "directory. Set DB_PATH explicitly (e.g. /var/lib/sportnerdbot/challenge.db) in "
+            "/etc/sportnerdbot/env."
+        )
+    DB_PATH = os.path.abspath(_env_db_path)
+    _base_abs = os.path.abspath(BASE_DIR)
+    if DB_PATH == _base_abs or DB_PATH.startswith(_base_abs + os.sep):
+        raise RuntimeError(
+            f"DB_PATH ({DB_PATH}) resolves inside the code/release directory ({_base_abs}) — "
+            "this would lose the database on every new deploy. Point DB_PATH to a persistent "
+            "location outside the release directory (e.g. /var/lib/sportnerdbot/challenge.db)."
+        )
+else:
+    DB_PATH = os.path.abspath(_env_db_path) if _env_db_path else os.path.join(BASE_DIR, "challenge.db")
+
 BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
+
+# Скільки днів тримати "гучні" лог-дані (cv_jobs, offload_requests)
+# та файлові/journald логи. admin_audit і prompt_history НЕ чистяться (аудит/історія версій).
+LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "7"))
 
 # sportnerd-gateway (aiohttp) конфігурація
 GATEWAY_HMAC_SECRET = os.getenv("GATEWAY_HMAC_SECRET", "")
