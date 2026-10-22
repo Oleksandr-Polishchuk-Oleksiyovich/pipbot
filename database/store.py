@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from core.textguard import ensure_clean
+
 logger = logging.getLogger(__name__)
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -513,6 +515,7 @@ class Store:
 
     def create_admin_task(self, chat_id: Optional[int], requester_telegram_id: Optional[int],
                           requester_name: str, text: str) -> int:
+        ensure_clean(text, "admin_task.text")
         with self._connect() as con:
             cur = con.execute(
                 "INSERT INTO admin_tasks (chat_id, requester_telegram_id, requester_name, text) VALUES (?, ?, ?, ?)",
@@ -644,6 +647,7 @@ class Store:
                               result: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if status not in ("done_pending_deploy", "rejected"):
             raise ValueError(f"invalid admin_task result status: {status!r}")
+        ensure_clean(result, "admin_task.result")
         with self._connect() as con:
             cur = con.execute(
                 "UPDATE admin_tasks SET status=?, fix_commit=?, result=?, updated_at=datetime('now') "
@@ -960,6 +964,9 @@ class Store:
         variants: Optional[List[str]] = None,
         updated_by: Optional[str] = None,
     ) -> None:
+        ensure_clean(text, f"bot_texts.{key}")
+        for v in variants or []:
+            ensure_clean(v, f"bot_texts.{key} variant")
         variants_json = json.dumps(variants, ensure_ascii=False) if variants is not None else None
         with self._connect() as con:
             con.execute("""
@@ -1120,6 +1127,7 @@ class Store:
 
     def save_prompt(self, key: str, content: str, updated_by: str) -> int:
         """Зберігає нову версію промпту та архівує її в prompt_history. Повертає номер версії."""
+        ensure_clean(content, f"prompts.{key}")
         with self._connect() as con:
             row = con.execute("SELECT version FROM prompts WHERE key = ?", (key,)).fetchone()
             version = (row[0] + 1) if row else 1

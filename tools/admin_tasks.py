@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.signing import sign_request  # noqa: E402
 from cv_worker.box_worker import load_secret, urlopen_with_deadline  # noqa: E402
+from core.textguard import looks_mangled  # noqa: E402
 
 
 class AdminTasksClient:
@@ -66,9 +67,22 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("list"); p.add_argument("--status")
     sub.add_parser("claim")
-    p = sub.add_parser("done"); p.add_argument("id", type=int); p.add_argument("--commit", required=True); p.add_argument("--note", default="")
-    p = sub.add_parser("reject"); p.add_argument("id", type=int); p.add_argument("--note", required=True)
+    p = sub.add_parser("done"); p.add_argument("id", type=int); p.add_argument("--commit", required=True); p.add_argument("--note", default=""); p.add_argument("--note-file", help="UTF-8 файл з нотаткою (замість --note)")
+    p = sub.add_parser("reject"); p.add_argument("id", type=int); p.add_argument("--note", default=""); p.add_argument("--note-file", help="UTF-8 файл з нотаткою (замість --note)")
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    note = getattr(args, "note", "")
+    if getattr(args, "note_file", None):
+        with open(args.note_file, encoding="utf-8") as f:
+            note = f.read().strip()
+    if note and looks_mangled(note):
+        raise SystemExit("note looks encoding-mangled ('????'); pass Cyrillic via --note-file (UTF-8), not the Windows command line")
+    if args.cmd == "reject" and not note:
+        raise SystemExit("reject needs --note or --note-file")
 
     secret = load_secret()
     url = os.getenv("CV_GATEWAY_URL", "")
@@ -80,9 +94,9 @@ def main(argv=None) -> int:
     elif args.cmd == "claim":
         out = client.claim()
     elif args.cmd == "done":
-        out = client.result(args.id, "done_pending_deploy", args.commit, args.note)
+        out = client.result(args.id, "done_pending_deploy", args.commit, note)
     else:
-        out = client.result(args.id, "rejected", None, args.note)
+        out = client.result(args.id, "rejected", None, note)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export PYTHONIOENCODING=utf-8
 # Supervisor loop for the box CV worker (box has no systemd --user / cron).
 #   start:  nohup cv_worker/run_box_worker.sh >/dev/null 2>&1 &
 #   stop:   kill "$(cat /tmp/sportnerd-boxcv.pid)"   (kills only this supervisor + its child)

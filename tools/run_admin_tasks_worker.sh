@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export PYTHONIOENCODING=utf-8
 # Supervisor loop for the box admin_tasks worker (no systemd --user on the box). Not heavy.
 #   start:  nohup tools/run_admin_tasks_worker.sh >/dev/null 2>&1 &
 #   stop:   kill "$(cat /tmp/sportnerd-admintasks.pid)"

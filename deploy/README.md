@@ -105,3 +105,19 @@ What it does (idempotent, safe to re-run):
 6. Prints IP, `CV_GATEWAY_URL=https://<IP>.sslip.io` and the secret (your terminal only).
 
 Overrides: `PROJECT`, `VM_NAME`, `ZONE`, `FW_RULE`, `NET_TAG`, `BRANCH`.
+
+## Text encoding rule (incident 2026-10-22)
+
+**Never pass Cyrillic (or any non-ASCII) through a Windows command line or PowerShell re-encoding
+(`Set-Content -Encoding ascii`, console code page, `gcloud ssh --command "…кирилиця…"`). Always ship UTF-8 files.**
+
+On 2026-10-22 an ops script was re-saved on the laptop with `Set-Content -Encoding ascii` (to strip CRLF);
+every Cyrillic char became a literal `?` (0x3F) before reaching the VM, so `admin_tasks #1` and the
+«Пропатчився…» announcement were stored/posted as `????`.
+
+- Write scripts/SQL/texts on the box (UTF-8, LF) and copy the **file** verbatim (`gcloud compute scp`). If CRLF
+  must be stripped on Windows, use `[IO.File]::WriteAllText($p, $s, [Text.UTF8Encoding]::new($false))`, never `-Encoding ascii`.
+- Put Cyrillic data inside the shipped Python/SQL file, not on the command line; run with `PYTHONIOENCODING=utf-8`.
+- `tools/admin_tasks.py` takes `--note-file` (UTF-8) and refuses `????`-looking notes.
+- `core/textguard.py`: `Store.create_admin_task`, `set_admin_task_result`, `set_bot_text`, `save_prompt` refuse
+  text with runs of `????` or U+FFFD.
