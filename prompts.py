@@ -294,6 +294,11 @@ DEFAULT_BOT_TEXTS = {
     "admin_task_created": "📨 Передав розробнику, задача #{id}. Чекайте на патч — я повідомлю, коли оновлюся.",
     "admin_task_patched": "🔧 Пропатчився на запит {requester}: «{text}»",
     "admin_task_rejected": "🙅 Запит {requester} «{text}» відхилено: {note}",
+    "admin_dev_accepted": "🫡 Прийняв, задачу #{id} передав розробнику — чекайте, повідомлю, коли пропатчусь.",
+    "admin_task_still_working": "⏳ Задача #{id} від {requester} ще в роботі — розробник не забув, чекайте на «Пропатчився…».",
+    "level_up": "🆙 **{name}** — рівень {level}! Макс. життів тепер {max_lives}, життя відновлено до максимуму ❤️",
+    "progress_settled": "{emoji} {name}: +{xp_gain} XP (⭐ {xp}/100, рівень {level}) · наступна норма ({exercise}): {next}",
+    "status_xp": " | ⭐ {xp}/100 XP | 🆙 рів. {level}",
     "angle_hint": "Наступного разу зніми так, щоб тебе було видно цілком — постав телефон збоку на рівні корпусу 📹",
 }
 

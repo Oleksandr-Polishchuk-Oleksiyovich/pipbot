@@ -471,6 +471,37 @@ class Store:
                     updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_admin_tasks_status ON admin_tasks(status);
+
+                CREATE TABLE IF NOT EXISTS daily_attempts (
+                    date        TEXT NOT NULL,
+                    user_slug   TEXT NOT NULL,
+                    exercise    TEXT,
+                    best_reps   INTEGER NOT NULL DEFAULT 0,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (date, user_slug)
+                );
+                CREATE TABLE IF NOT EXISTS user_xp (
+                    user_slug   TEXT PRIMARY KEY,
+                    xp          INTEGER NOT NULL DEFAULT 0,
+                    level       INTEGER NOT NULL DEFAULT 0,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS next_norms (
+                    user_slug      TEXT NOT NULL,
+                    exercise       TEXT NOT NULL,
+                    target         INTEGER NOT NULL,
+                    effective_from TEXT NOT NULL,
+                    source_date    TEXT,
+                    PRIMARY KEY (user_slug, exercise)
+                );
+                CREATE TABLE IF NOT EXISTS xp_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date        TEXT,
+                    user_slug   TEXT,
+                    delta       INTEGER,
+                    reason      TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     # --- ADMIN TASKS (запити до розробника, яких не покривають вузькі адмін-тули) ---
@@ -497,6 +528,92 @@ class Store:
             row = con.execute(f"SELECT {', '.join(self._ADMIN_TASK_COLS)} FROM admin_tasks WHERE id = ?",
                               (int(task_id),)).fetchone()
         return self._admin_task_row(row)
+
+    # --- ПРОГРЕСІЯ: найкраща спроба дня, XP/рівні, адаптивна наступна норма (міграція 0011) ---
+    def record_attempt(self, date_iso: str, slug: str, exercise: str, reps: int) -> int:
+        """Зберігає спробу; best_reps = MAX(попередній, reps). Повертає поточний best."""
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO daily_attempts (date, user_slug, exercise, best_reps) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(date, user_slug) DO UPDATE SET best_reps = MAX(best_reps, excluded.best_reps), "
+                "exercise = excluded.exercise, updated_at = CURRENT_TIMESTAMP",
+                (date_iso, slug, exercise, max(0, int(reps))),
+            )
+        best = self.get_best_attempt(date_iso, slug) or 0
+        logger.info("Attempt recorded: %s %s %s reps=%s best=%s", date_iso, slug, exercise, reps, best)
+        return best
+
+    def get_best_attempt(self, date_iso: str, slug: str) -> Optional[int]:
+        with self._connect() as con:
+            row = con.execute("SELECT best_reps FROM daily_attempts WHERE date = ? AND user_slug = ?",
+                              (date_iso, slug)).fetchone()
+        return int(row[0]) if row else None
+
+    def video_reps_rows(self, slug: str, since_utc: str) -> List[Tuple[str, Optional[str], int]]:
+        """(created_at UTC, exercise, reps) з video_checks автора, новіші за since_utc — фолбек для найкращої спроби."""
+        with self._connect() as con:
+            return [(r[0], r[1], int(r[2] or 0)) for r in con.execute(
+                "SELECT created_at, exercise, reps FROM video_checks WHERE user_slug = ? AND reps > 0 AND created_at >= ?",
+                (slug, since_utc)).fetchall()]
+
+    def get_xp(self, slug: str) -> Tuple[int, int]:
+        with self._connect() as con:
+            row = con.execute("SELECT xp, level FROM user_xp WHERE user_slug = ?", (slug,)).fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+    def set_xp(self, slug: str, xp: int, level: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO user_xp (user_slug, xp, level) VALUES (?, ?, ?) ON CONFLICT(user_slug) DO UPDATE SET "
+                "xp = excluded.xp, level = excluded.level, updated_at = CURRENT_TIMESTAMP",
+                (slug, int(xp), int(level)),
+            )
+
+    def add_xp_log(self, date_iso: str, slug: str, delta: int, reason: str) -> None:
+        with self._connect() as con:
+            con.execute("INSERT INTO xp_log (date, user_slug, delta, reason) VALUES (?, ?, ?, ?)",
+                        (date_iso, slug, int(delta), reason))
+
+    def get_next_norm(self, slug: str, exercise: str) -> Optional[Tuple[int, str]]:
+        with self._connect() as con:
+            row = con.execute("SELECT target, effective_from FROM next_norms WHERE user_slug = ? AND exercise = ?",
+                              (slug, exercise)).fetchone()
+        return (int(row[0]), str(row[1])) if row else None
+
+    def set_next_norm(self, slug: str, exercise: str, target: int, effective_from: str,
+                      source_date: Optional[str] = None) -> None:
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO next_norms (user_slug, exercise, target, effective_from, source_date) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_slug, exercise) DO UPDATE SET target = excluded.target, "
+                "effective_from = excluded.effective_from, source_date = excluded.source_date",
+                (slug, exercise, int(target), effective_from, source_date),
+            )
+
+    def clear_next_norm(self, slug: str, exercise: str) -> None:
+        with self._connect() as con:
+            con.execute("DELETE FROM next_norms WHERE user_slug = ? AND exercise = ?", (slug, exercise))
+
+    def active_admin_task_for(self, requester_telegram_id: Optional[int], requester_name: Optional[str]) -> Optional[int]:
+        """id незавершеної (pending/claimed) admin_task цього автора або None."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT id FROM admin_tasks WHERE status IN ('pending','claimed') AND "
+                "((? IS NOT NULL AND requester_telegram_id = ?) OR (? IS NOT NULL AND requester_name = ?)) "
+                "ORDER BY id DESC LIMIT 1",
+                (requester_telegram_id, requester_telegram_id, requester_name, requester_name),
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def list_stale_admin_tasks(self, hours: float) -> List[Dict[str, Any]]:
+        """pending/claimed задачі, старші за `hours` годин (для нагадування «ще в роботі», без скасування)."""
+        with self._connect() as con:
+            rows = con.execute(
+                f"SELECT {', '.join(self._ADMIN_TASK_COLS)} FROM admin_tasks WHERE status IN ('pending','claimed') "
+                "AND created_at <= datetime('now', ?) ORDER BY id ASC",
+                (f"-{float(hours)} hours",),
+            ).fetchall()
+        return [self._admin_task_row(r) for r in rows]
 
     def list_admin_tasks(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         q = f"SELECT {', '.join(self._ADMIN_TASK_COLS)} FROM admin_tasks"

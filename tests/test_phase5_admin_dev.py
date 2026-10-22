@@ -129,13 +129,8 @@ def test_router_fallback_routes_quick_and_dev():
 
 
 @pytest.mark.asyncio
-async def test_flow_admin_dev_immediate_ack_and_offload(tmp_path):
-    """
-    T-50: Запит admin_dev:
-    1. Відповідає Telegram миттєвим ack: «Прийняв, виконую. request_id=…».
-    2. Створює запис в offload_requests зі статусом 'sent'.
-    3. Створює запис в admin_audit зі статусом 'planned'.
-    """
+async def test_flow_admin_dev_creates_admin_task_and_acks(tmp_path):
+    """admin_dev -> admin_tasks (а не offload): ack через bot_texts, повний текст + автор + msg_id у задачі."""
     st = Store(str(tmp_path / "flow_dev.db"))
     st.init_schema()
     ensure_default_users(st)
@@ -144,28 +139,48 @@ async def test_flow_admin_dev_immediate_ack_and_offload(tmp_path):
     sender = FakeSender()
     flow = ChatFlow(st, llm=None, sender=sender, now=clock)
 
-    # Автор з кодовою фразою та dev-наказом
     flow.record_user_message(CHAT, SON, "Obey me! зміни стиль тренера на суворий", created_at=clock())
     await flow.process(CHAT, trigger="push")
 
-    # 1. Перевіряємо відповідь в Telegram
-    assert len(sender.texts) > 0
     ack_reply = sender.texts[-1]
-    assert "Прийняв, виконую. request_id=" in ack_reply
-
-    # 2. Перевіряємо offload_requests
-    offload_reqs = st.list_offload_requests()
-    assert len(offload_reqs) == 1
-    req = offload_reqs[0]
-    assert req.type == "admin"
-    assert req.status == "sent"
-    assert req.request_id in ack_reply
-
-    # 3. Перевіряємо admin_audit (T-52)
+    assert "передав розробнику" in ack_reply
+    assert st.list_offload_requests() == []
+    tasks = st.list_admin_tasks()
+    assert len(tasks) == 1
+    assert "#1" in ack_reply
+    assert "Obey me! зміни стиль тренера на суворий" in tasks[0]["text"]
+    assert "msg_id=" in tasks[0]["text"]
     audits = st.list_admin_audits()
-    assert len(audits) == 1
-    assert audits[0].request_id == req.request_id
-    assert audits[0].status == "planned"
+    assert len(audits) == 1 and audits[0].status == "delegated"
+    assert audits[0].request_id in tasks[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_flow_admin_dev_replies_to_passphrase_message_and_blocks_second(tmp_path):
+    st = Store(str(tmp_path / "flow_dev2.db"))
+    st.init_schema()
+    ensure_default_users(st)
+    clock = Clock(NOW)
+    sender = FakeSender()
+    flow = ChatFlow(st, llm=None, sender=sender, now=clock)
+
+    flow.record_user_message(CHAT, DAD, "Лелуш ві Британія наказує: зміни стиль тренера", created_at=clock())
+    directive_id = st.get_last_message_id(CHAT)
+    flow.record_user_message(CHAT, SON, "20 mb я не подолаю", created_at=clock())
+    await flow.process(CHAT, trigger="push")
+
+    tasks = st.list_admin_tasks()
+    assert len(tasks) == 1
+    assert sender.replies[-1][0] == directive_id
+    assert f"msg_id={directive_id}" in tasks[0]["text"]
+
+    # другий наказ, поки задача pending -> відмова, нова задача не створюється
+    clock.value = clock() + timedelta(hours=2)
+    flow.record_user_message(CHAT, DAD, "Лелуш ві Британія наказує: зміни стиль тренера на лагідний", created_at=clock())
+    await flow.process(CHAT, trigger="push")
+    assert len(st.list_admin_tasks()) == 1
+    assert "Вже є активний запит" in sender.texts[-1]
+
 
 
 @pytest.mark.asyncio

@@ -181,7 +181,13 @@ def day_targets(store: Store, day: date) -> Dict[str, int]:
     targets = {}
     for u in _active_users(store):
         override = store.get_state(f"override_{u.slug}_{day.isoformat()}", "")
-        targets[u.slug] = max(0, int(override) if override.strip() else _formula_target_for_user(store, u, day))
+        if override.strip():
+            value = int(override)
+        else:
+            nn = store.get_next_norm(u.slug, day_exercise(store, day))
+            # Адаптивна норма (core/progression.py) діє з effective_from для днів тієї ж вправи.
+            value = nn[0] if nn and day.isoformat() >= nn[1] else _formula_target_for_user(store, u, day)
+        targets[u.slug] = max(0, value)
     return targets
 
 
@@ -196,6 +202,9 @@ def set_target(store: Store, participant: str, target: int, day: date) -> None:
     if user is None:
         raise ValueError(f"Unknown participant: {participant}")
     k = _alternate_index(store, day)
+    # Адмінська норма перекриває адаптивну: прибираємо next_norms цієї вправи — сьогодні діє формула/override
+    # з новим значенням, а о 00:05 наступна норма порахується вже від нього (core/progression.py).
+    store.clear_next_norm(user.slug, day_exercise(store, day))
     if k is None:
         base = user.base_pushups + day_index(day)
         user.ladder_offset = int(target) - base
@@ -333,6 +342,8 @@ def status_snapshot(store: Store, day: date) -> Dict:
             "done": done.get(u.slug, False),
             "lives": lives.get(u.slug),
             "max_lives": max_lives.get(u.slug),
+            "xp": store.get_xp(u.slug)[0],
+            "level": store.get_xp(u.slug)[1],
         }
         for u in users
     }
@@ -373,7 +384,8 @@ def status_text(store: Store, day: date) -> str:
             lives_str = f" | Життя: {lives}/{max_l}" if max_l else f" | Життя: {lives}"
         else:
             lives_str = ""
-        lines.append(f"{info['emoji']} {info['name']}: норма {info['target']} | Статус: {mark}{lives_str}")
+        lines.append(f"{info['emoji']} {info['name']}: норма {info['target']} | Статус: {mark}{lives_str}"
+                     f" | XP {info.get('xp', 0)}/100 | Рівень {info.get('level', 0)}")
     return "\n".join(lines)
 
 

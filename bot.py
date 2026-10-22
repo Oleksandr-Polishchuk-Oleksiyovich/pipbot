@@ -170,7 +170,8 @@ def build_app():
                 lives = f" | ❤️ {meta['lives']}/{meta['max_lives']}" if meta.get("max_lives") else f" | ❤️ {meta['lives']}"
             else:
                 lives = ""
-            lines.append(f"{meta['emoji']} **{meta['name']}:** {state}{lives}")
+            xp_str = flow.bot_texts.get("status_xp", xp=meta.get("xp", 0), level=meta.get("level", 0)) or ""
+            lines.append(f"{meta['emoji']} **{meta['name']}:** {state}{lives}{xp_str}")
         if s.get("uninitialized"):
             names = ", ".join(u["display_name"] for u in s["uninitialized"])
             lines.append(f"\n🆕 *Очікують на завершення реєстрації:* {names}")

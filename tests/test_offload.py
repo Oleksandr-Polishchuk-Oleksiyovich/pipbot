@@ -321,20 +321,13 @@ async def test_flow_check_expired_offload_requests(store):
     assert store.get_offload_request(req_video_expired).status == "expired"
     assert store.get_offload_request(req_active).status == "sent"
 
-    # Перевірка надісланих повідомлень
-    assert len(sender.texts) == 2
-
-    # Повідомлення про прострочений admin-запит
-    admin_msg = next(txt for txt in sender.texts if req_admin_expired in txt)
-    assert "прострочено" in admin_msg
-
-    # Повідомлення про прострочене відео
-    video_msg = next(txt for txt in sender.texts if "відео" in txt.lower())
+    # Перевірка надісланих повідомлень: лише про відео; admin-offload'и гасяться мовчки
+    # (admin_dev тепер іде через admin_tasks без таймера).
+    assert len(sender.texts) == 1
+    assert not any(req_admin_expired in txt for txt in sender.texts)
+    video_msg = sender.texts[0]
     assert "вичерпано" in video_msg.lower()
-
-    # Перевірка replies (reply_to_message_id)
-    assert any(reply_id == 100 for reply_id, _ in sender.replies)
-    assert any(reply_id == 201 for reply_id, _ in sender.replies)
+    assert [reply_id for reply_id, _ in sender.replies] == [201]
 
 
 @pytest.mark.asyncio
@@ -358,5 +351,4 @@ async def test_flow_timer_trigger_offload_expiry(store):
     await flow.process(-100777, trigger="timer", job="offload_expiry")
 
     assert store.get_offload_request(req_id).status == "expired"
-    assert len(sender.texts) == 1
-    assert req_id in sender.texts[0]
+    assert sender.texts == []  # admin-offload гаситься мовчки

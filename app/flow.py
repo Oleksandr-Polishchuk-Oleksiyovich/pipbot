@@ -26,9 +26,9 @@ from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptM
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
-from core import challenge
+from core import challenge, progression
 from core.bot_texts import BotTexts
-from core.config import CV_OFFLOAD, CV_STILL_COUNTING_MIN, DB_PATH, IS_PRODUCTION, LOG_RETENTION_DAYS, OBEY_MEDIA_DIR, TIMEZONE
+from core.config import ADMIN_TASK_STALE_HOURS, CV_OFFLOAD, CV_STILL_COUNTING_MIN, DB_PATH, IS_PRODUCTION, LOG_RETENTION_DAYS, OBEY_MEDIA_DIR, TIMEZONE
 from core.guardrails import (
     check_active_request_limit,
     check_admin_rate_limit,
@@ -60,6 +60,12 @@ class Sender(Protocol):
     async def send_text(self, chat_id: int, text: str, **kwargs) -> None: ...
     async def send_video(self, chat_id: int, path: str) -> None: ...
 
+
+
+def _short_task_text(text: Optional[str], limit: int = 300) -> str:
+    """Для анонсів: лише суть задачі (до блоку «--- повний текст …»), обрізана."""
+    head = (text or "").split("\n\n--- повний текст", 1)[0].strip()
+    return head if len(head) <= limit else head[: limit - 1] + "…"
 
 
 def load_release_commits(release_dir: str) -> Optional[set]:
@@ -166,7 +172,7 @@ class ChatFlow:
                     logger.info("admin_task #%s: fix_commit %s not in deployed release yet", task["id"], task.get("fix_commit"))
                     continue
                 text = self.bot_texts.get("admin_task_patched", requester=task.get("requester_name") or "",
-                                          text=task.get("text") or "", id=task["id"])
+                                          text=_short_task_text(task.get("text")), id=task["id"])
                 try:
                     await self._say(task.get("chat_id") or chat_id, text)
                 except Exception as e:
@@ -179,7 +185,7 @@ class ChatFlow:
             if task.get("notified"):
                 continue
             text = self.bot_texts.get("admin_task_rejected", requester=task.get("requester_name") or "",
-                                      text=task.get("text") or "", note=task.get("result") or "", id=task["id"])
+                                      text=_short_task_text(task.get("text")), note=task.get("result") or "", id=task["id"])
             try:
                 await self._say(task.get("chat_id") or chat_id, text)
             except Exception as e:
@@ -187,6 +193,27 @@ class ChatFlow:
                 continue
             self.store.mark_admin_task_notified(task["id"])
             logger.info("admin_task #%s rejection notified", task["id"])
+            posted += 1
+        # Довгі задачі НЕ скасовуються: раз на ADMIN_TASK_STALE_HOURS — «ще в роботі».
+        for task in self.store.list_stale_admin_tasks(ADMIN_TASK_STALE_HOURS):
+            key = f"admin_task_stale_{task['id']}"
+            last = self.store.get_state(key, "")
+            now = self.now()
+            if last:
+                try:
+                    if (now - datetime.fromisoformat(last)).total_seconds() < ADMIN_TASK_STALE_HOURS * 3600:
+                        continue
+                except ValueError:
+                    pass
+            text = self.bot_texts.get("admin_task_still_working", id=task["id"],
+                                      requester=task.get("requester_name") or "", text=_short_task_text(task.get("text")))
+            try:
+                await self._say(task.get("chat_id") or chat_id, text)
+            except Exception as e:
+                logger.warning("admin_task #%s stale notice failed: %s", task["id"], e)
+                continue
+            self.store.set_state(key, now.isoformat())
+            logger.info("admin_task #%s still in progress notice", task["id"])
             posted += 1
         return posted
 
@@ -357,6 +384,8 @@ class ChatFlow:
         counted_key = challenge.CV_EXERCISE_KEYS.get(check.exercise or "", day_ex)
         # Що побачив CV (у правильній формі для числа): «Побачив 4 присідання з 51»
         exercise_gen = challenge.exercise_word(counted_key, reps)
+        if counted_key == day_ex and reps > 0:
+            self.store.record_attempt(today.isoformat(), user_slug, day_ex, reps)
 
         reply_text = self.bot_texts.get(
             verdict.category, reps=reps, target=target, exercise=exercise_gen
@@ -495,6 +524,9 @@ class ChatFlow:
             self.store.update_offload_request(req.request_id, status="expired")
             expired_ids.append(req.request_id)
             logger.info("Marked offload request %s as expired", req.request_id)
+            if req.type != "video":
+                # admin_dev іде через admin_tasks (без таймера); старі admin-offload'и гасимо мовчки.
+                continue
 
             if req.type == "video":
                 notice = (
@@ -630,17 +662,19 @@ class ChatFlow:
         history: List[ChatMessage],
         trigger: str = "push",
     ) -> None:
-        last_msg = pending[-1] if pending else None
-        msg_id = last_msg.id if last_msg else None
+        # Відповідаємо на повідомлення, що реально містить кодову фразу/наказ (а не на останнє в черзі).
+        directive_msg = next((m for m in reversed(pending) if has_passphrase(m.text)), pending[-1] if pending else None)
+        msg_id = directive_msg.id if directive_msg else None
         author_slug = challenge.normalize_participant(decision.sender, self.store) or decision.sender
         user = self.store.find_user(author_slug)
         telegram_id = user.telegram_id if user else None
+        requester_name = (user.display_name if user else author_slug) or "невідомо"
 
         # Guardrail: Allowlist check (T-52)
         allowed = is_admin_allowed(telegram_id)
         logger.info(
-            "Admin entry: mode=admin_dev trigger=%s user_id=%s user_name=%s sender_slug=%s allowed=%s",
-            trigger, telegram_id, decision.sender, author_slug, allowed,
+            "Admin entry: mode=admin_dev trigger=%s user_id=%s user_name=%s sender_slug=%s allowed=%s msg_id=%s",
+            trigger, telegram_id, decision.sender, author_slug, allowed, msg_id,
         )
         if not allowed:
             reply = (
@@ -662,61 +696,44 @@ class ChatFlow:
             await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
             return
 
-        # Guardrail: Active request check (T-52: один активний запит одночасно)
+        # Guardrail: один активний запит одночасно (admin_audit + незавершена admin_task автора)
         allowed_active, active_id = check_active_request_limit(
             self.store,
             author_slug=author_slug,
             author_telegram_id=telegram_id,
         )
-        if not allowed_active and active_id:
+        active_task = self.store.active_admin_task_for(telegram_id, requester_name)
+        if (not allowed_active and active_id) or active_task:
+            ref = f"#{active_task}" if active_task else active_id
             reply = (
-                f"⚠️ **Вже є активний запит в обробці** (`{active_id}`). "
+                f"⚠️ **Вже є активний запит в обробці** (`{ref}`). "
                 "Будь ласка, зачекайте завершення попереднього запиту перед створенням нового."
             )
             await self._say_reply(chat_id, reply, reply_to_message_id=msg_id)
             return
 
-        # 2. Generate request_id
         request_id = str(uuid.uuid4())
-
-        # 3. Log to admin_audit
+        full_text = directive_msg.text if directive_msg else ""
         self.store.create_admin_audit(
             request_id=request_id,
             author_slug=author_slug,
             author_telegram_id=telegram_id,
-            request=decision.directive or (last_msg.text if last_msg else ""),
-            plan="admin_dev offload to Grok Box",
+            request=decision.directive or full_text,
+            plan="admin_dev -> admin_tasks queue",
             status="planned",
         )
+        task_text = (
+            f"{decision.directive or ''}\n\n--- повний текст (msg_id={msg_id}, автор={requester_name}/{author_slug}, "
+            f"tg={telegram_id}, request_id={request_id}) ---\n{full_text}"
+        )[:4000]
+        task_id = self.store.create_admin_task(chat_id, telegram_id, requester_name, task_text)
+        # admin_audit — лише журнал; активність далі контролює admin_tasks (pending/claimed), без таймерів.
+        self.store.update_admin_audit(request_id, status="delegated")
+        logger.info("admin_dev %s -> admin_task #%s (msg_id=%s)", request_id, task_id, msg_id)
 
-        # 4. Immediate ack (T-50): «Прийняв, виконую. request_id=…»
-        ack_text = f"Прийняв, виконую. request_id={request_id}"
-        await self._say_reply(chat_id, ack_text, reply_to_message_id=msg_id)
-
-        # 5. Offload to box (Contract 8.1)
-        payload_data = {
-            "directive": decision.directive,
-            "text": last_msg.text if last_msg else "",
-            "recent_messages": [m.render() for m in history[-10:]],
-        }
-        user_info = {
-            "telegram_id": telegram_id,
-            "username": user.username if user else None,
-            "slug": author_slug,
-        }
-        try:
-            await self.offload_client.offload(
-                request_type="admin",
-                request_id=request_id,
-                chat_id=chat_id,
-                message_id=msg_id,
-                reply_to_message_id=msg_id,
-                user=user_info,
-                payload_data=payload_data,
-                reply_mode="callback",
-            )
-        except Exception as e:
-            logger.error("Failed to offload admin_dev request %s: %s", request_id, e)
+        ack = self.bot_texts.get("admin_dev_accepted", id=task_id, request_id=request_id) \
+            or f"Прийняв, задачу #{task_id} передав розробнику — чекайте."
+        await self._say_reply(chat_id, ack, reply_to_message_id=msg_id)
 
     async def _handle_admin_quick(
         self,
@@ -986,16 +1003,40 @@ class ChatFlow:
         await self._say(chat_id, text)
 
     async def _settle_lives(self, chat_id: int, day) -> None:
+        # 1) мінус життя за незакритий день; 2) прогресія (норма/XP/рівні) — левел-ап відновлює життя.
         changed = challenge.settle_missed_day(self.store, day)
-        if not changed:
+        try:
+            prog = progression.settle_progression(self.store, day)
+        except Exception as e:
+            logger.exception("Progression settlement failed for %s: %s", day, e)
+            prog = {}
+        if not changed and not prog:
             return
         pmap = challenge.participants_map(self.store)
-        lines = [
-            f"💔 **{pmap.get(p, {}).get('name', p)}** втрачає життя → залишилось **{v}** ❤️"
-            for p, v in changed.items()
-        ]
-        dead = [pmap.get(p, {}).get("name", p) for p, v in changed.items() if v == 0]
-        text = f"⚰️ **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n\n" + "\n".join(lines)
+        text = f"⚰️ **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n"
+        if changed:
+            lines = [
+                f"💔 **{pmap.get(p, {}).get('name', p)}** втрачає життя → залишилось **{v}** ❤️"
+                for p, v in changed.items()
+            ]
+            text += "\n" + "\n".join(lines)
+        if prog:
+            plines, ups = [], []
+            for slug, r in prog.items():
+                meta = pmap.get(slug, {})
+                name = meta.get("name", slug)
+                ex_name = challenge.EXERCISES.get(r["exercise"], {}).get("name", r["exercise"])
+                plines.append(self.bot_texts.get("progress_settled", emoji=meta.get("emoji", ""), name=name,
+                                                 xp_gain=r["xp_gain"], xp=r["xp"], level=r["level"],
+                                                 exercise=ex_name, next=r["next"]))
+                if r["level_ups"]:
+                    ups.append(self.bot_texts.get("level_up", name=name, level=r["level"],
+                                                  max_lives=r["max_lives"] if r["max_lives"] is not None else "—"))
+            text += "\n\n" + "\n".join(plines)
+            if ups:
+                text += "\n\n" + "\n".join(ups)
+        dead = [pmap.get(p, {}).get("name", p) for p, v in changed.items()
+                if v == 0 and not (prog.get(p) or {}).get("level_ups")]
         if dead:
             text += f"\n\n💀 **{', '.join(dead)} — нуль життів. Дискваліфікація!**"
         await self._say(chat_id, text)
