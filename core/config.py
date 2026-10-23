@@ -66,6 +66,8 @@ CV_MODEL = os.getenv("CV_MODEL", "lite")
 # Box CV offload (gateway long-poll /cv/*). CV_OFFLOAD=1: VM не рахує CV сам, а ставить cv_jobs для box worker-а.
 CV_OFFLOAD = os.getenv("CV_OFFLOAD", "1") == "1"
 CV_CLAIM_WAIT_S = float(os.getenv("CV_CLAIM_WAIT_S", "25"))
+CV_RESULTS_INTERVAL_SEC = int(os.getenv("CV_RESULTS_INTERVAL_SEC", "10"))
+ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC = int(os.getenv("ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC", "60"))
 CV_LEASE_S = int(os.getenv("CV_LEASE_S", "300"))
 CV_VIDEO_DIR = os.getenv("CV_VIDEO_DIR", os.path.join(os.path.dirname(DB_PATH), "cv_videos"))
 CV_STILL_COUNTING_MIN = int(os.getenv("CV_STILL_COUNTING_MIN", "5"))

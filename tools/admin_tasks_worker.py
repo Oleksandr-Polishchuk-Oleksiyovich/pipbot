@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from logging.handlers import TimedRotatingFileHandler
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -61,10 +61,16 @@ def task_payload(task: Dict) -> Dict:
 
 class AdminTasksWorker:
     def __init__(self, client, get_config: Callable = webhook_config, poster: Callable = post_webhook,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None):
         self.client, self.get_config, self.poster, self.sleep = client, get_config, poster, sleep
         self.errors = 0
         self.stopped = False
+        if get_workers_config is not None:
+            self.get_workers_config = get_workers_config
+        else:
+            from tools.worker_timers import read_workers_config
+            self.get_workers_config = read_workers_config
 
     def _backoff(self) -> None:
         delay = BACKOFF_STEPS[min(self.errors, len(BACKOFF_STEPS) - 1)]
@@ -100,14 +106,22 @@ class AdminTasksWorker:
                          "(they stay pending). Recheck in %ss", CONFIG_RECHECK_S)
             self.sleep(CONFIG_RECHECK_S)
             return False
+        cfg = self.get_workers_config()
+        poll_wait = float(cfg.get("ADMIN_TASKS_POLL_WAIT_SEC", 25.0))
+        check_interval = float(cfg.get("ADMIN_TASKS_CHECK_INTERVAL_SEC", 0.0))
         try:
-            task = self.client.claim()
+            try:
+                task = self.client.claim(wait_s=poll_wait)
+            except TypeError:
+                task = self.client.claim()
         except Exception as e:
             logger.warning("claim failed: %s", e)
             self._backoff()
             return False
         self.errors = 0
         if task is None:
+            if check_interval > 0:
+                self.sleep(check_interval)
             return False  # 204 -> одразу новий long-poll
         logger.info("admin_task #%s claimed: requester=%s text=%r", task["id"], task.get("requester_name"),
                     (task.get("text") or "")[:200])
@@ -115,9 +129,10 @@ class AdminTasksWorker:
         return True
 
     def run(self) -> None:
-        heartbeat_s = float(os.getenv("ADMIN_TASKS_HEARTBEAT_S", "300"))
         last_beat = time.monotonic()
         while not self.stopped:
+            cfg = self.get_workers_config()
+            heartbeat_s = float(cfg.get("ADMIN_TASKS_HEARTBEAT_S", 300.0))
             if heartbeat_s > 0 and time.monotonic() - last_beat >= heartbeat_s:
                 logger.info("heartbeat: alive, polling (errors=%d)", self.errors)
                 last_beat = time.monotonic()

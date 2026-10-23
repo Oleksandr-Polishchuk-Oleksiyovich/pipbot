@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -91,17 +92,21 @@ class GatewayClient:
         self.base = base_url.rstrip("/")
         self.secret = secret
 
-    def request(self, method: str, path: str, body: bytes = b"", timeout: float = 30) -> Tuple[int, bytes]:
+    def request(self, method: str, path: str, body: bytes = b"", timeout: float = 30,
+                query: Optional[Dict[str, str]] = None) -> Tuple[int, bytes]:
         headers = sign_request(method, path, body, self.secret)
         headers["User-Agent"] = "SportNerdBot-BoxCV/1.0"
         if body:
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(self.base + path, data=body if method != "GET" else None,
+        url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
+        req = urllib.request.Request(url, data=body if method != "GET" else None,
                                      method=method, headers=headers)
         return urlopen_with_deadline(req, timeout)
 
-    def claim(self) -> Optional[Dict[str, Any]]:
-        status, data = self.request("POST", "/cv/claim", b"{}", timeout=CLAIM_HTTP_TIMEOUT_S)
+    def claim(self, wait_s: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        query = {"wait": str(wait_s)} if wait_s is not None else None
+        timeout = max(CLAIM_HTTP_TIMEOUT_S, (float(wait_s) + 15.0) if wait_s is not None else CLAIM_HTTP_TIMEOUT_S)
+        status, data = self.request("POST", "/cv/claim", b"{}", timeout=timeout, query=query)
         if status == 204:
             return None
         if status != 200:
@@ -150,12 +155,18 @@ def run_cv_subprocess(video: str) -> Dict[str, Any]:
 
 class BoxCVWorker:
     def __init__(self, client: GatewayClient, analyzer: Optional[Callable[[str], Dict[str, Any]]] = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None):
         self.client = client
         self.analyzer = analyzer or run_cv_subprocess
         self.sleep = sleep
         self.running = False
         self.errors = 0
+        if get_workers_config is not None:
+            self.get_workers_config = get_workers_config
+        else:
+            from tools.worker_timers import read_workers_config
+            self.get_workers_config = read_workers_config
 
     def process(self, job: Dict[str, Any]) -> int:
         rid = job["request_id"]
@@ -179,8 +190,16 @@ class BoxCVWorker:
 
     def step(self) -> bool:
         """Один цикл long-poll. True — job оброблено, False — таймаут 204."""
-        job = self.client.claim()
+        cfg = self.get_workers_config()
+        poll_wait = float(cfg.get("CV_POLL_WAIT_SEC", 25.0))
+        check_interval = float(cfg.get("CV_CHECK_INTERVAL_SEC", 0.0))
+        try:
+            job = self.client.claim(wait_s=poll_wait)
+        except TypeError:
+            job = self.client.claim()
         if job is None:
+            if check_interval > 0:
+                self.sleep(check_interval)
             return False
         status = self.process(job)
         logger.info("job %s result posted: HTTP %s", job["request_id"], status)
@@ -192,7 +211,9 @@ class BoxCVWorker:
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "running", False))
         while self.running:
-            if HEARTBEAT_S > 0 and time.monotonic() - last_beat >= HEARTBEAT_S:
+            cfg = self.get_workers_config()
+            heartbeat_s = float(cfg.get("CV_HEARTBEAT_S", HEARTBEAT_S))
+            if heartbeat_s > 0 and time.monotonic() - last_beat >= heartbeat_s:
                 logger.info("heartbeat: alive, polling (errors=%d)", self.errors)
                 last_beat = time.monotonic()
             try:

@@ -292,12 +292,14 @@ async def main():
                               ("evening", 19, 0), ("night", 23, 30)):
         scheduler.add_job(flow.process, "cron", hour=hour, minute=minute,
                           args=[CHAT_ID], kwargs={"trigger": "timer", "job": job}, id=job)
-    scheduler.add_job(flow.process_cv_results, "interval", seconds=10, id="cv_results",
+    cv_results_interval = int(os.getenv("CV_RESULTS_INTERVAL_SEC", "10"))
+    admin_tasks_announce_interval = int(os.getenv("ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC", "60"))
+    scheduler.add_job(flow.process_cv_results, "interval", seconds=cv_results_interval, id="cv_results",
                       max_instances=1, coalesce=True)
     scheduler.add_job(flow.check_expired_offload_requests, "interval", minutes=1,
                       args=[CHAT_ID], id="check_offload_expiry")
     scheduler.add_job(flow.prune_old_logs, "cron", hour=0, minute=10, id="prune_old_logs")
-    scheduler.add_job(flow.announce_admin_tasks, "interval", minutes=1, args=[CHAT_ID],
+    scheduler.add_job(flow.announce_admin_tasks, "interval", seconds=admin_tasks_announce_interval, args=[CHAT_ID],
                       id="admin_task_rejections", max_instances=1, coalesce=True)
     scheduler.start()
     logging.info("Scheduler started (00:05 settle, 00:10 prune_old_logs, 08:30, 15:00, 19:00, 23:30 Kyiv).")

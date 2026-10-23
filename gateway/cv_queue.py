@@ -78,7 +78,13 @@ async def handle_claim(request: web.Request) -> web.Response:
     app = request.app
     store = app[STORE_KEY]
     event = app[CV_EVENT_KEY]
-    deadline = time.monotonic() + app[CV_WAIT_KEY]
+    wait_s = app[CV_WAIT_KEY]
+    if "wait" in request.query:
+        try:
+            wait_s = max(0.0, min(120.0, float(request.query["wait"])))
+        except (ValueError, TypeError):
+            pass
+    deadline = time.monotonic() + wait_s
     while True:
         job = await asyncio.to_thread(store.claim_cv_job, app[CV_LEASE_KEY])
         if job:

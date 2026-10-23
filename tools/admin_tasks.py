@@ -46,8 +46,10 @@ class AdminTasksClient:
             raise RuntimeError(f"list failed: HTTP {code} {data[:200]!r}")
         return json.loads(data)["tasks"]
 
-    def claim(self) -> Optional[dict]:
-        code, data = self._request("GET", "/admin_tasks/claim", timeout=40)
+    def claim(self, wait_s: Optional[float] = None) -> Optional[dict]:
+        query = {"wait": str(wait_s)} if wait_s is not None else None
+        timeout = max(40.0, (float(wait_s) + 15.0) if wait_s is not None else 40.0)
+        code, data = self._request("GET", "/admin_tasks/claim", query=query, timeout=timeout)
         if code == 204:
             return None
         if code != 200:
@@ -66,7 +68,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("list"); p.add_argument("--status")
-    sub.add_parser("claim")
+    p = sub.add_parser("claim"); p.add_argument("--wait", type=float, default=None)
     p = sub.add_parser("done"); p.add_argument("id", type=int); p.add_argument("--commit", required=True); p.add_argument("--note", default=""); p.add_argument("--note-file", help="UTF-8 файл з нотаткою (замість --note)")
     p = sub.add_parser("reject"); p.add_argument("id", type=int); p.add_argument("--note", default=""); p.add_argument("--note-file", help="UTF-8 файл з нотаткою (замість --note)")
     args = ap.parse_args(argv)
@@ -92,7 +94,7 @@ def main(argv=None) -> int:
     if args.cmd == "list":
         out = client.list(args.status)
     elif args.cmd == "claim":
-        out = client.claim()
+        out = client.claim(wait_s=args.wait)
     elif args.cmd == "done":
         out = client.result(args.id, "done_pending_deploy", args.commit, note)
     else:
