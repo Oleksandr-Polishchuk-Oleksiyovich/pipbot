@@ -546,6 +546,19 @@ class Store:
         logger.info("Attempt recorded: %s %s %s reps=%s best=%s", date_iso, slug, exercise, reps, best)
         return best
 
+    def set_attempt(self, date_iso: str, slug: str, exercise: str, reps: int) -> int:
+        """Ручне встановлення/перезарахування спроби дня (точне значення best_reps = reps)."""
+        val = max(0, int(reps))
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO daily_attempts (date, user_slug, exercise, best_reps) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(date, user_slug) DO UPDATE SET best_reps = excluded.best_reps, "
+                "exercise = excluded.exercise, updated_at = CURRENT_TIMESTAMP",
+                (date_iso, slug, exercise, val),
+            )
+        logger.info("Attempt manually set: %s %s %s best_reps=%s", date_iso, slug, exercise, val)
+        return val
+
     def get_best_attempt(self, date_iso: str, slug: str) -> Optional[int]:
         with self._connect() as con:
             row = con.execute("SELECT best_reps FROM daily_attempts WHERE date = ? AND user_slug = ?",
@@ -1383,6 +1396,41 @@ class Store:
                 (user_slug, date_str, f"{date_str}%"),
             ).fetchone()
         return bool(row)
+
+    def override_today_video_check(
+        self,
+        user_slug: str,
+        date_iso: Union[str, Any],
+        reps: int,
+        valid: bool,
+        exercise: Optional[str] = None,
+    ) -> Optional[VideoCheck]:
+        """Оновлює останній запис video_checks учасника за вказану дату (ручне перезарахування тренером/адміном)."""
+        if hasattr(date_iso, "strftime"):
+            date_str = date_iso.strftime("%Y-%m-%d")
+        elif hasattr(date_iso, "isoformat"):
+            date_str = date_iso.isoformat()[:10]
+        else:
+            date_str = str(date_iso)[:10]
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT id, request_id FROM video_checks WHERE user_slug = ? AND (substr(created_at, 1, 10) = ? OR created_at LIKE ?) ORDER BY id DESC LIMIT 1",
+                (user_slug, date_str, f"{date_str}%"),
+            ).fetchone()
+            if not row:
+                return None
+            check_id = int(row[0])
+            if exercise is not None:
+                con.execute(
+                    "UPDATE video_checks SET reps = ?, valid = ?, exercise = ?, status = 'done', finished_at = COALESCE(finished_at, datetime('now')) WHERE id = ?",
+                    (max(0, int(reps)), 1 if valid else 0, exercise, check_id),
+                )
+            else:
+                con.execute(
+                    "UPDATE video_checks SET reps = ?, valid = ?, status = 'done', finished_at = COALESCE(finished_at, datetime('now')) WHERE id = ?",
+                    (max(0, int(reps)), 1 if valid else 0, check_id),
+                )
+        return self.get_video_check_by_id(check_id)
 
     # --- OFFLOAD REQUESTS ---
     def create_offload_request(

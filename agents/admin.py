@@ -217,24 +217,97 @@ class AdminAgent(PromptAgent):
             actions.append(f"swap_today_exercise({before_exercise}->{after_exercise})")
             return f"Вправу сьогодні змінено: {before_exercise} -> {after_exercise}. {_today_tomorrow_summary()}"
 
-        def set_progress(participant: str, done: bool, report_date: str = "") -> str:
+        def _parse_day(report_date: str) -> tuple[str, date]:
+            raw = (report_date or "").strip()
+            if not raw:
+                return today.isoformat(), today
+            try:
+                d = date.fromisoformat(raw[:10])
+                return d.isoformat(), d
+            except ValueError:
+                return raw, today
+
+        def recount_reps(
+            participant: str,
+            reps: int,
+            done: Optional[bool] = None,
+            report_date: str = "",
+        ) -> str:
+            """
+            Ручне перезарахування повторів учасника (зокрема після відеозвіту): встановлює точну кількість
+            виконаних повторів за день (YYYY-MM-DD або порожньо для сьогодні), оновлює запис video_checks
+            за цей день (якщо є) та зараховує або знімає виконання денної норми (якщо done не передано —
+            визначається автоматично за умовою reps >= target).
+            :param participant: ключ slug або ім'я учасника.
+            :param reps: кількість виконаних повторів (ціле число >= 0).
+            :param done: примусово зарахувати (True) чи не зарахувати (False) норму; якщо None — автоматично за reps >= target.
+            :param report_date: дата YYYY-MM-DD (порожньо — сьогодні).
+            """
+            from datetime import timedelta
+            from core.progression import next_norm
+
+            slug = challenge.normalize_participant(participant, store)
+            if not slug:
+                return f"Помилка: невідомий учасник '{participant}'."
+            day, day_date = _parse_day(report_date)
+            exercise = challenge.day_exercise(store, day_date)
+            targets = challenge.day_targets(store, day_date)
+            target = targets.get(slug, 0)
+            reps_val = max(0, int(reps))
+            is_done = bool(done) if done is not None else (reps_val >= target and target > 0)
+
+            store.set_attempt(day, slug, exercise, reps_val)
+            store.set_done(slug, is_done, day)
+            vc = store.override_today_video_check(slug, day, reps=reps_val, valid=is_done, exercise=exercise)
+
+            if store.get_state("progression_settled_through", "") >= day and target > 0:
+                nxt = next_norm(target, is_done, reps_val)
+                store.set_next_norm(slug, exercise, nxt, (day_date + timedelta(days=1)).isoformat(), day)
+
+            actions.append(f"recount_reps({slug}, {day}, reps={reps_val}, done={is_done})")
+            p_info = challenge.participants_map(store).get(slug, {"name": slug})
+            ex_word = challenge.exercise_word(exercise, reps_val)
+            vc_note = " (відеозвіт оновлено)" if vc is not None else ""
+            status_str = "виконано ✅" if is_done else "не виконано ❌"
+            return (
+                f"Перезараховано {p_info['name']} на {day}: {reps_val} {ex_word} із норми {target}"
+                f"{vc_note} — {status_str}."
+            )
+
+        def set_progress(
+            participant: str,
+            done: bool,
+            report_date: str = "",
+            reps: Optional[int] = None,
+        ) -> str:
             """
             Вручну зарахувати або скасувати виконання норми.
             :param participant: ключ slug / ім'я учасника або 'all' (для всіх активних учасників).
             :param done: True — зарахувати, False — скасувати.
             :param report_date: дата YYYY-MM-DD (порожньо — сьогодні).
+            :param reps: точна кількість повторів (опціонально; якщо вказано — також оновлює daily_attempts та video_checks).
             """
-            day = report_date or today.isoformat()
+            day, day_date = _parse_day(report_date)
             if participant.lower().strip() in ("all", "всі", "усі", "обом"):
                 slugs = [u.slug for u in store.list_users(status="active")]
                 for s in slugs:
                     store.set_done(s, bool(done), day)
                 actions.append(f"set_progress(all={slugs}, {done}, {day})")
                 return f"Статус усіх учасників ({', '.join(slugs)}) на {day}: {'виконано' if done else 'не виконано'}."
+            if reps is not None:
+                return recount_reps(participant=participant, reps=int(reps), done=bool(done), report_date=day)
             p = challenge.normalize_participant(participant, store)
             if not p:
                 return f"Помилка: невідомий учасник '{participant}'."
+            exercise = challenge.day_exercise(store, day_date)
+            target = challenge.day_targets(store, day_date).get(p, 0)
             store.set_done(p, bool(done), day)
+            if done and store.has_video_check_today(p, day):
+                best = store.get_best_attempt(day, p) or 0
+                credited_reps = max(best, target)
+                if credited_reps > 0:
+                    store.record_attempt(day, p, exercise, credited_reps)
+                store.override_today_video_check(p, day, reps=credited_reps, valid=True, exercise=exercise)
             actions.append(f"set_progress({p}, {done}, {day})")
             return f"Статус {p} на {day}: {'виконано' if done else 'не виконано'}."
 
@@ -419,7 +492,7 @@ class AdminAgent(PromptAgent):
 
         return [
             _logged_tool(t) for t in (
-                set_lives, set_targets, set_schedule, swap_today_exercise, set_progress, update_user_profile,
+                set_lives, set_targets, set_schedule, swap_today_exercise, recount_reps, set_progress, update_user_profile,
                 get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
                 set_bot_text, list_bot_texts, create_admin_task,
             )

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 export PYTHONIOENCODING=utf-8
+export CV_HEAVY_BIN="${CV_HEAVY_BIN:-/workspace/bin/heavy}"
 # Supervisor loop for the box CV worker (box has no systemd --user / cron).
 #   start:  nohup cv_worker/run_box_worker.sh >/dev/null 2>&1 &
 #   stop:   kill "$(cat /tmp/sportnerd-boxcv.pid)"   (kills only this supervisor + its child)
@@ -13,9 +14,20 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "already running (pid $(cat "$PIDFILE"))"; exit 0
 fi
 echo $$ > "$PIDFILE"
+if [ ! -e /usr/local/bin/heavy ] && [ -x /workspace/bin/heavy ]; then
+    sudo -n ln -sf /workspace/bin/heavy /usr/local/bin/heavy 2>/dev/null || true
+fi
+ensure_venv() {
+    if [ ! -x "$PY" ]; then
+        echo "$(date -Is) $PY missing; bootstrapping .venv via uv" >>"$LOG"
+        uv venv .venv --python /usr/bin/python3.13 >>"$LOG" 2>&1 && \
+            uv pip install --python .venv/bin/python -r requirements-cv.txt >>"$LOG" 2>&1
+    fi
+}
 child=""
 trap '[ -n "$child" ] && kill "$child" 2>/dev/null; rm -f "$PIDFILE"; exit 0' TERM INT
 while true; do
+    ensure_venv
     "$PY" -m cv_worker.box_worker >>"$LOG" 2>&1 &
     child=$!
     wait "$child"

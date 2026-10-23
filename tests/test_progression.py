@@ -148,3 +148,53 @@ async def test_stale_admin_task_reminder_not_cancel(tmp_path):
     await flow.announce_admin_tasks(-1)  # не частіше ніж раз на 24 год
     assert len(sender.texts) == n
     assert st.get_admin_task(tid)["status"] == "claimed"
+
+
+def test_manual_recount_reps_overrides_attempt_and_video_check(tmp_path):
+    from agents.admin import AdminAgent
+    from agents.coach import CoachAgent
+    from agents.router import RouterAgent
+
+    st = _store(tmp_path)
+    day_iso = D.isoformat()  # норма Льоші = 37
+    # Імітуємо невдалий відеозвіт Льоші (CV нарахував лише 12 замість 41)
+    st.record_attempt(day_iso, "lyosha", "pushups", 12)
+    with st._connect() as con:
+        con.execute(
+            "INSERT INTO video_checks (request_id, chat_id, message_id, user_slug, exercise, reps, confidence, flags, valid, status, created_at) "
+            "VALUES ('vc-1', -1, 10, 'lyosha', 'pushup', 12, 0.85, '[]', 0, 'done', ?)",
+            (f"{day_iso} 18:00:00",),
+        )
+    assert st.has_video_check_today("lyosha", day_iso) is True
+    assert st.get_day_progress(day_iso)["lyosha"] is False
+
+    # Адмін/тренер вручну перезараховує 41 повтор через recount_reps
+    actions = []
+    admin = AdminAgent(None, st, editor=None)
+    tools = {fn.__name__: fn for fn in admin._tools(D, "Саша", actions)}
+    msg = tools["recount_reps"]("Льоша", 41)
+    assert "41" in msg and "виконано ✅" in msg
+    assert st.get_best_attempt(day_iso, "lyosha") == 41
+    assert st.get_day_progress(day_iso)["lyosha"] is True
+    vc = st.get_video_check("vc-1")
+    assert vc.reps == 41 and vc.valid is True
+
+    # Перевіряємо, що ручне зменшення повторів (наприклад до 20) теж перезаписує best_reps і знімає залік
+    msg_low = tools["recount_reps"]("lyosha", 20)
+    assert st.get_best_attempt(day_iso, "lyosha") == 20
+    assert st.get_day_progress(day_iso)["lyosha"] is False
+    assert "не виконано ❌" in msg_low
+
+    # Повертаємо 41 через set_progress(..., reps=41) і перевіряємо розрахунок прогресії о 00:05
+    tools["set_progress"]("lyosha", True, reps=41)
+    assert st.get_best_attempt(day_iso, "lyosha") == 41
+    res = settle_progression(st, D)
+    assert res["lyosha"]["next"] == (41 + 37) // 2 + 1 == 40
+    assert res["lyosha"]["xp_gain"] == 1 + 2 * (41 - 37) == 9
+
+    # Перевіряємо, що тренер бачить XP/рівень та спробу у системному промпті, а роутер класифікує команду як quick
+    st.set_attempt(day_iso, "lyosha", "pushups", 41)
+    coach_prompt = CoachAgent(None, st).build_system_prompt(D)
+    assert "XP: 9/100 (рівень 0)" in coach_prompt
+    assert "найкраща спроба: 41" in coach_prompt
+    assert RouterAgent.classify_admin_tier("перезарахуй Льоші 41 повтор за відео") == "quick"

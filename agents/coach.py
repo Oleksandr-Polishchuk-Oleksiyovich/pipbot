@@ -54,9 +54,13 @@ class CoachAgent(PromptAgent):
         lives_parts = []
         any_lives = False
 
+        today_iso = today.isoformat()
         for slug, info in participants.items():
             status_str = "ВИКОНАНО ✅" if info["done"] else "ЩЕ НЕ ЗДАВ ❌"
-            participant_lines.append(f"- {info['emoji']} {info['name']}: норма {info['target']} -> {status_str}")
+            best = self.store.get_best_attempt(today_iso, slug)
+            best_part = f" (найкраща спроба: {best})" if best is not None else ""
+            xp_part = f" | ⭐ XP: {info.get('xp', 0)}/100 (рівень {info.get('level', 0)})"
+            participant_lines.append(f"- {info['emoji']} {info['name']}: норма {info['target']} -> {status_str}{best_part}{xp_part}")
             if info.get("description"):
                 profile_lines.append(f"- {info['name']} ({slug}): {info['description']}")
             if info.get("lives") is not None:
