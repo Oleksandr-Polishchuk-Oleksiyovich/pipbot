@@ -18,7 +18,7 @@ import os
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import pytz
 
@@ -117,7 +117,8 @@ class ChatFlow:
                  obey_media_dir: str = OBEY_MEDIA_DIR,
                  offload_client: Optional[RoutineOffloadClient] = None,
                  trust_mode: Optional[bool] = None,
-                 rollover: Optional[Tuple[int, int]] = None):
+                 rollover: Optional[Tuple[int, int]] = None,
+                 waker: Optional[Any] = None):
         self.store = store
         self.llm = llm
         self.sender = sender
@@ -131,6 +132,9 @@ class ChatFlow:
         self.rollover = tuple(rollover) if rollover is not None else (DAY_ROLLOVER_HOUR, DAY_ROLLOVER_MINUTE)
         self._lock = asyncio.Lock()
         self._chat_members_cache: Dict = {}
+        # пробудження box перед відео (core.wake.BoxWaker); None — вимкнено
+        self.waker = waker
+        self._wake_tasks: set = set()
 
         self.router = RouterAgent(llm, store)
         self.onboarding = OnboardingAgent(llm, store)
@@ -348,7 +352,34 @@ class ChatFlow:
         await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
         if self.cv_offload:
             self.store.mark_cv_job(request_id, "processing_sent_at")
+            self._spawn_box_wake(chat_id, message_id)
         return True, reply
+
+    def _spawn_box_wake(self, chat_id: int, message_id: int) -> None:
+        """Фоново: переконатись, що box worker поллить (вебхук з ретраями). Job лишається в черзі й нікуди не зникає."""
+        if self.waker is None:
+            return
+        task = asyncio.ensure_future(self._ensure_box_awake(chat_id, message_id))
+        self._wake_tasks.add(task)
+        task.add_done_callback(self._wake_tasks.discard)
+
+    async def _ensure_box_awake(self, chat_id: int, message_id: int) -> str:
+        try:
+            result = await self.waker.ensure_awake()
+            if result == "timeout" and self.waker.should_notify():
+                await self._say_reply(chat_id, self.bot_texts.get("box_waking"), reply_to_message_id=message_id)
+            return result
+        except Exception as e:
+            logger.warning("box wake failed: %s", e)
+            return "error"
+
+    async def wait_box_wake(self) -> None:
+        """Для тестів/graceful shutdown: дочекатись фонових пробуджень."""
+        if self._wake_tasks:
+            await asyncio.gather(*list(self._wake_tasks), return_exceptions=True)
+
+    async def box_wake_watchdog(self) -> str:
+        return await self.waker.watchdog() if self.waker is not None else "disabled"
 
     async def process_cv_results(self, still_counting_min: Optional[int] = None) -> int:
         """

@@ -39,8 +39,12 @@ Telegram-бот «Спорт Зануда» (`@SportNerdBot`) для щоден�
   Supervisor-скрипти — звичайні `nohup`-цикли (на box немає systemd --user/cron), тому **після рестарту box їх треба
   запустити вручну**: `nohup cv_worker/run_box_worker.sh &` та `nohup tools/run_admin_tasks_worker.sh &`.
 - **Відомі обмеження box:** у простої box може бути призупинений (suspended) — тоді воркери не поллять, відео й admin-задачі
-  чекають у черзі на VM (бот «ще рахую», потім результат приходить після пробудження). Ідея на майбутнє: wake-up webhook,
-  який будить box при появі нового `cv_jobs`/`admin_tasks`. Зараз цього немає.
+  чекають у черзі на VM. Для відео це закрито **wake-механізмом** (`core/wake.py`): коли відео ставиться в чергу, а CV worker
+  не поллить довше `WAKE_STALE_S` (45 с), VM сама б'є вебхуком Grok Bot routine «SportNerdBot box wake» (3 спроби, backoff 2/5/10 с,
+  будь-який 2xx = прийнято), чекає до `WAKE_WAIT_S` (90 с) на свіжий `/cv/claim`, за потреби повторює; watchdog у боті повторює
+  не частіше ніж раз на 5 хв, поки job висить. Job увесь час лишається `queued` і ніколи не губиться; якщо worker так і не
+  прокинувся — чат отримує **одне** м'яке повідомлення (`box_waking`). Без секрету вебхука або з `WAKE_ENABLED=0` фіча — no-op.
+  Для `admin_tasks` аналогічного wake немає.
 
 ## 3. Компоненти
 
@@ -52,7 +56,9 @@ Telegram-бот «Спорт Зануда» (`@SportNerdBot`) для щоден�
 | SQLite | VM | Усі дані | `database/store.py`, `migrations/` | `sqlite3 … 'select count(*) from cv_jobs'` |
 | CV worker | box | Забирає відео з черги, рахує повтори (MediaPipe Pose) | `cv_worker/box_worker.py`, `cv_worker/cv_job.py`, `core/cv/` | `/tmp/sportnerd-boxcv.log`, `/tmp/sportnerd-boxcv.pid`, `heavy --status` |
 | Admin-tasks worker | box | Забирає admin-задачі, шле у вебхук | `tools/admin_tasks_worker.py` | `/tmp/sportnerd-admintasks.log`, heartbeat кожні 300 с |
-| Grok Bot routine | Grok Bot cloud | Будить агента на box із payload задачі | (налаштовується в Grok Bot; URL/ключ — `ADMIN_TASKS_WEBHOOK_URL/KEY`) | Лог admin-tasks worker: «delivered to webhook (HTTP 2xx)» |
+| Box wake | VM (бот + gateway) | Будить box вебхуком, коли відео в черзі, а CV worker мовчить; watchdog; одне повідомлення в чат | `core/wake.py`, `app/flow.py: _ensure_box_awake`, `bot.py: build_waker`, `gateway/cv_queue.py` | Лог бота: «wake webhook attempt N/3 accepted»; `GET /cv/worker_status` |
+| Grok Bot routine «SportNerdBot box wake» | Grok Bot cloud | Будить агента на box: запускає воркери, якщо їх нема, і чекає, поки cv_worker почне поллити | `tools/ensure_workers.sh`, `tools/cv_worker_status.py`; секрет вебхука на VM кладе `tools/set_wake_webhook.py` | `python tools/cv_worker_status.py` |
+| Grok Bot routine Будить агента на box із payload задачі | (налаштовується в Grok Bot; URL/ключ — `ADMIN_TASKS_WEBHOOK_URL/KEY`) | Лог admin-tasks worker: «delivered to webhook (HTTP 2xx)» |
 | Агент розробки | box | Правки через `agy`, тести, commit/push, закриття задачі | `skills/admin_dev.md`, `tools/admin_tasks.py` | `python tools/admin_tasks.py list` |
 | GitHub | GitHub | Репозиторій, `origin/main` | — | `git ls-remote origin main` |
 | Gemini | Google | LLM / vision | `core/llm.py` | Помилки `LLMUnavailable` у `bot.log` |
@@ -113,12 +119,15 @@ optionToConsider/        старі плани/дослідження (див. R
   `ROUTINE_*` (legacy). Значення ніколи не коммітяться.
 - **`deploy/vm_config.env`** (у git, автодеплой синхронізує непротектовані ключі в `/etc/sportnerdbot/env` і перезапускає
   сервіси): `AUTODEPLOY_INTERVAL`, `CV_CLAIM_WAIT_S`, `CV_RESULTS_INTERVAL_SEC`, `ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC`,
-  `TRUST_MODE`, `DAY_ROLLOVER_HOUR`, `DAY_ROLLOVER_MINUTE`.
+  `TRUST_MODE`, `DAY_ROLLOVER_HOUR`, `DAY_ROLLOVER_MINUTE`, `WAKE_ENABLED`, `WAKE_STALE_S`, `WAKE_WAIT_S`.
+  Секрет вебхука пробудження (URL і ключ) **не** тут і не в git: він лежить лише на VM у `/var/lib/sportnerdbot/wake_webhook.json`
+  (mode 0600), куди його кладе `tools/set_wake_webhook.py` через `POST /admin/secrets/wake` (значення з env box
+  `WAKE_WEBHOOK_URL`/`WAKE_WEBHOOK_KEY`, ніколи не друкуються).
 - **`config/workers.env`** (у git, читається box-воркерами щоразу): `CV_POLL_WAIT_SEC`, `CV_CHECK_INTERVAL_SEC`, `CV_HEARTBEAT_S`,
   `ADMIN_TASKS_POLL_WAIT_SEC`, `ADMIN_TASKS_CHECK_INTERVAL_SEC`, `ADMIN_TASKS_HEARTBEAT_S`. Керується `tools/worker_timers.py`
   (`status [--remote]`, `set`, `trigger-deploy`).
 - Інші параметри з `core/config.py`: `CV_OFFLOAD`, `CV_LEASE_S`, `CV_STILL_COUNTING_MIN`, `CV_VIDEO_DIR`, `ADMIN_DEV_RATE_LIMIT_HOUR`,
-  `ADMIN_TASK_STALE_HOURS`, `LOG_RETENTION_DAYS`.
+  `ADMIN_TASK_STALE_HOURS`, `LOG_RETENTION_DAYS`, `WAKE_ATTEMPTS`, `WAKE_WATCHDOG_INTERVAL_S`, `WAKE_SECRET_FILE`.
 
 ## 7. Gateway (VM)
 
@@ -131,6 +140,8 @@ optionToConsider/        старі плани/дослідження (див. R
 | `POST /cv/claim` | box CV worker | long-poll (до `CV_CLAIM_WAIT_S`=25 с): 200 job або 204 |
 | `GET /cv/jobs/{rid}/video` | box CV worker | байти відео (gateway сам качав із Telegram — box не знає `BOT_TOKEN`) |
 | `POST /cv/jobs/{rid}/result` | box CV worker | `{claim_token, ok, result, error}` |
+| `GET /cv/worker_status` | box CLI, діагностика | `last_poll_age_s`, `queued`, `claimed`, `worker_polling`, `wake_configured` (будь-який `/cv/claim`, зокрема порожній long-poll, оновлює `bot_state: cv_last_poll_ts`) |
+| `POST /admin/secrets/wake`, `GET /admin/secrets/wake` | `tools/set_wake_webhook.py` | зберегти URL/ключ вебхука пробудження (лише https, файл 0600; значення не логуються й не повертаються) / `{configured}` |
 | `GET /admin_tasks`, `GET /admin_tasks/claim`, `POST /admin_tasks/{id}/result` | box (worker, CLI) | список / long-poll claim / результат (`done_pending_deploy` + `fix_commit` або `rejected`) |
 | `GET /autodeploy/status` | `tools/worker_timers.py status --remote` | `{deployed_sha, failed_sha}` |
 | `POST /autodeploy/trigger` | `tools/worker_timers.py trigger-deploy` | торкається `/var/lib/sportnerdbot/autodeploy_trigger` + `systemctl start` → 202 |

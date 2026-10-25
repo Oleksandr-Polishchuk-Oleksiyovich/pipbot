@@ -41,6 +41,9 @@ DEFAULT_VM_CONFIG: Dict[str, str] = {
     "TRUST_MODE": "1",
     "DAY_ROLLOVER_HOUR": "2",
     "DAY_ROLLOVER_MINUTE": "30",
+    "WAKE_ENABLED": "1",
+    "WAKE_STALE_S": "45",
+    "WAKE_WAIT_S": "90",
 }
 
 

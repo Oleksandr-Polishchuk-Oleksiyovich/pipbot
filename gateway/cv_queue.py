@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from aiohttp import web
 
 from core.signing import NonceCache, verify_request
+from core.wake import POLL_TS_KEY, load_wake_config, store_wake_secret
 
 logger = logging.getLogger("gateway.cv")
 
@@ -41,6 +42,14 @@ async def _auth(request: web.Request) -> Optional[web.Response]:
         logger.warning("CV endpoint auth failed (%s %s): %s", request.method, request.path, reason)
         return web.json_response({"error": "unauthorized", "detail": reason}, status=401)
     return None
+
+
+async def _touch_poll(store) -> None:
+    """Фіксує «box worker живий» (будь-який /cv/claim, зокрема порожній long-poll, і /result). Спільна SQLite з ботом."""
+    try:
+        await asyncio.to_thread(store.set_state, POLL_TS_KEY, f"{time.time():.3f}")
+    except Exception as e:  # лічильник живості не має ламати claim
+        logger.warning("failed to record worker poll ts: %s", e)
 
 
 def notify_job_enqueued(app: web.Application) -> None:
@@ -85,6 +94,7 @@ async def handle_claim(request: web.Request) -> web.Response:
         except (ValueError, TypeError):
             pass
     deadline = time.monotonic() + wait_s
+    await _touch_poll(store)
     while True:
         job = await asyncio.to_thread(store.claim_cv_job, app[CV_LEASE_KEY])
         if job:
@@ -107,6 +117,7 @@ async def handle_claim(request: web.Request) -> web.Response:
             })
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            await _touch_poll(store)
             return web.Response(status=204)
         event.clear()
         try:
@@ -139,6 +150,7 @@ async def handle_result(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid_json"}, status=400)
     store = request.app[STORE_KEY]
+    await _touch_poll(store)
     ok = bool(data.get("ok"))
     result = data.get("result") or {}
     new_status = store.complete_cv_job(rid, str(data.get("claim_token", "")), ok=ok,
@@ -169,6 +181,68 @@ async def handle_result(request: web.Request) -> web.Response:
     return web.json_response({"status": new_status, "request_id": rid})
 
 
+async def handle_worker_status(request: web.Request) -> web.Response:
+    """GET /cv/worker_status — живість box CV worker-а й стан черги (HMAC, як /cv/claim)."""
+    from gateway.app import STORE_KEY
+    from core.config import WAKE_STALE_S
+    denied = await _auth(request)
+    if denied:
+        return denied
+    store = request.app[STORE_KEY]
+
+    def _snapshot():
+        raw = store.get_state(POLL_TS_KEY, "")
+        try:
+            age = max(0.0, time.time() - float(raw)) if raw else None
+        except ValueError:
+            age = None
+        return {
+            "last_poll_age_s": None if age is None else round(age, 1),
+            "queued": store.count_cv_jobs("queued"),
+            "claimed": store.count_cv_jobs("claimed"),
+            "oldest_queued_age_s": store.oldest_queued_cv_age_s(),
+            "stale_after_s": WAKE_STALE_S,
+            "wake_configured": load_wake_config() is not None,
+        }
+    snap = await asyncio.to_thread(_snapshot)
+    snap["worker_polling"] = snap["last_poll_age_s"] is not None and snap["last_poll_age_s"] <= WAKE_STALE_S
+    if snap["oldest_queued_age_s"] is not None:
+        snap["oldest_queued_age_s"] = round(snap["oldest_queued_age_s"], 1)
+    return web.json_response(snap)
+
+
+async def handle_set_wake_secret(request: web.Request) -> web.Response:
+    """
+    POST /admin/secrets/wake {url, key} — зберегти вебхук пробудження box у root-only файл на VM (mode 0600, поза git).
+    Автентифікація — HMAC+nonce (як /cv/claim). Значення НЕ логуються і НЕ повертаються.
+    """
+    denied = await _auth(request)
+    if denied:
+        return denied
+    try:
+        data = json.loads((await request.read()).decode("utf-8") or "{}")
+        url, key = str(data.get("url") or ""), str(data.get("key") or "")
+    except Exception:
+        return web.json_response({"error": "invalid_request"}, status=400)
+    try:
+        await asyncio.to_thread(store_wake_secret, url, key)
+    except ValueError:
+        return web.json_response({"error": "invalid_url_or_key"}, status=400)
+    except OSError as e:
+        logger.error("wake secret write failed: %s", type(e).__name__)
+        return web.json_response({"error": "write_failed"}, status=500)
+    logger.info("wake webhook secret stored (values not logged)")
+    return web.json_response({"status": "stored"})
+
+
+async def handle_get_wake_secret(request: web.Request) -> web.Response:
+    """GET /admin/secrets/wake — лише чи налаштовано (без значень)."""
+    denied = await _auth(request)
+    if denied:
+        return denied
+    return web.json_response({"configured": load_wake_config() is not None})
+
+
 def setup_cv_routes(app: web.Application, *, claim_wait_s: Optional[float] = None, lease_s: Optional[int] = None,
                     video_dir: Optional[str] = None, video_fetcher: Optional[Callable] = None) -> None:
     from core.config import CV_CLAIM_WAIT_S, CV_LEASE_S, CV_VIDEO_DIR
@@ -181,3 +255,6 @@ def setup_cv_routes(app: web.Application, *, claim_wait_s: Optional[float] = Non
     app.router.add_post("/cv/claim", handle_claim)
     app.router.add_get("/cv/jobs/{rid}/video", handle_video)
     app.router.add_post("/cv/jobs/{rid}/result", handle_result)
+    app.router.add_get("/cv/worker_status", handle_worker_status)
+    app.router.add_post("/admin/secrets/wake", handle_set_wake_secret)
+    app.router.add_get("/admin/secrets/wake", handle_get_wake_secret)

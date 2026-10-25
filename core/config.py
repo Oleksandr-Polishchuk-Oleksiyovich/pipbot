@@ -72,6 +72,13 @@ CV_LEASE_S = int(os.getenv("CV_LEASE_S", "300"))
 CV_VIDEO_DIR = os.getenv("CV_VIDEO_DIR", os.path.join(os.path.dirname(DB_PATH), "cv_videos"))
 CV_STILL_COUNTING_MIN = int(os.getenv("CV_STILL_COUNTING_MIN", "5"))
 
+# Пробудження box перед відео (VM будить Grok Bot box вебхуком, див. core/wake.py). Секрети — НЕ тут (файл/env, не в git).
+WAKE_ENABLED = os.getenv("WAKE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+WAKE_STALE_S = float(os.getenv("WAKE_STALE_S", "45"))          # воркер «мовчить», якщо останній /cv/claim старший за це
+WAKE_WAIT_S = float(os.getenv("WAKE_WAIT_S", "90"))            # скільки чекати на claim після вебхука
+WAKE_ATTEMPTS = int(os.getenv("WAKE_ATTEMPTS", "3"))           # ретраї вебхука (backoff 2/5/10 с)
+WAKE_WATCHDOG_INTERVAL_S = float(os.getenv("WAKE_WATCHDOG_INTERVAL_S", "300"))  # watchdog: не частіше ніж раз на 5 хв
+
 # Режим довіри (TRUST_MODE) — М'ЯКИЙ РЕЖИМ «до виправлення» (замінити, коли CV покращиться): вірити заявленій кількості
 # у підписі/повідомленні та оспорюванню підрахунку (слова людини пріоритетніші за CV); CV лише інформує, ніколи не відхиляє.
 TRUST_MODE = os.getenv("TRUST_MODE", "1").strip().lower() not in ("0", "false", "no", "off", "")

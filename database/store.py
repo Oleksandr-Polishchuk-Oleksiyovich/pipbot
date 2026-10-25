@@ -765,6 +765,28 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def count_cv_jobs(self, status: str) -> int:
+        with self._connect() as con:
+            return int(con.execute("SELECT COUNT(*) FROM cv_jobs WHERE status = ?", (status,)).fetchone()[0])
+
+    def oldest_queued_cv_age_s(self) -> Optional[float]:
+        """Вік (с) найстарішого queued job або None, якщо черга порожня."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT (julianday('now') - julianday(MIN(created_at))) * 86400.0 FROM cv_jobs WHERE status='queued'"
+            ).fetchone()
+        return None if row is None or row[0] is None else max(0.0, float(row[0]))
+
+    def has_active_cv_claim(self, lease_s: float) -> bool:
+        """Є claimed job, взятий у межах lease — воркер працює над ним (під час CV він не поллить)."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM cv_jobs WHERE status='claimed' AND claimed_at IS NOT NULL "
+                "AND (julianday('now') - julianday(claimed_at)) * 86400.0 <= ? LIMIT 1",
+                (float(lease_s),),
+            ).fetchone()
+        return row is not None
+
     def list_cv_jobs_overdue(self, minutes: int) -> List[Dict[str, Any]]:
         with self._connect() as con:
             con.row_factory = sqlite3.Row

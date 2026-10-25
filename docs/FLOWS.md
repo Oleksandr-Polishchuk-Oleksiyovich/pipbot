@@ -122,11 +122,15 @@ sequenceDiagram
   participant GW as Gateway (VM)
   participant W as CV worker (box)
   participant H as heavy lock (box)
+  participant RT as Grok Bot cloud (routine box wake)
   U->>TG: відео / кружечок (+ підпис з числом)
   TG->>BOT: update
   BOT->>BOT: gate: не GIF, ≥5 с, ≤20 MB, дедуп file_unique_id
   BOT->>DB: video_checks(offloaded) + cv_jobs(queued) + video_caption:<rid>
   BOT-->>U: «Беру попкорну і йду дивитись відео»
+  BOT->>DB: cv_last_poll_ts застарілий? (worker мовчить довше 45 с)
+  BOT->>RT: webhook пробудження (3 спроби, 2xx = прийнято)
+  RT->>W: запуск воркерів box, перевірка poll
   W->>GW: POST /cv/claim (long-poll 25 с)
   GW->>TG: getFile + завантаження відео (на claim)
   GW-->>W: job {request_id, claim_token}
@@ -151,6 +155,7 @@ sequenceDiagram
 | 1 | Відео/кружечок у чаті | user | Telegram | — |
 | 2 | Gate: відхиляє GIF, <5 с, >20 MB, дублікат за `file_unique_id` («хеш-дедуп»); підпис зберігається в `bot_state: video_caption:<rid>` | Telegram → bot process | VM | `bot.py: on_message` → `flow.handle_video` |
 | 3 | `video_checks(status=offloaded, location=box)` + `enqueue_cv_job`; відповідь `processing` | bot process | VM | `Store.create_video_check`, `enqueue_cv_job` |
+| 3a | **Wake box:** якщо `cv_last_poll_ts` старший за `WAKE_STALE_S` (45 с) і немає `claimed` job у межах lease — вебхук Grok Bot routine «SportNerdBot box wake» (3 спроби, backoff 2/5/10 с, будь-який 2xx = прийнято), чекання до `WAKE_WAIT_S` (90 с) на свіжий `/cv/claim`, за потреби ще раунд. Job лишається `queued` увесь час. Якщо worker не прокинувся — **одне** повідомлення `box_waking` на епізод; watchdog (раз на хв, вебхук не частіше ніж раз на 5 хв) продовжує, поки job висить. Без секрету / `WAKE_ENABLED=0` — no-op | bot process (VM) → Grok Bot cloud → box | VM → Grok Bot cloud webhook → box | `core/wake.py: BoxWaker.ensure_awake/watchdog`, `flow._ensure_box_awake` |
 | 4 | Long-poll claim; gateway підтягує відео з Telegram (box не знає `BOT_TOKEN`); lease `CV_LEASE_S` | box worker → gateway | box → VM → Telegram | `cv_worker/box_worker.py`, `gateway/cv_queue.py: handle_claim` |
 | 5 | Завантаження відео | box worker | box ← VM | `GET /cv/jobs/{rid}/video` |
 | 6 | CV під lock-ом `heavy` (одна важка задача на box): MediaPipe Pose по кадрах відео → exercise/reps/confidence/flags (Gemini-vision `cv_worker/vision.py` у box-шляху не викликається) | box worker | box (+ Gemini) | `heavy_cv_command`, `cv_worker/cv_job.py`, `core/cv/rep_counter.py: analyze_video` |
@@ -163,7 +168,8 @@ sequenceDiagram
 
 **Обмеження box:** якщо box у простої призупинений, воркер не поллить — відео лишається `queued` у `cv_jobs`, бот пише «ще рахую»,
 результат прийде після пробудження (або lease поверне job у чергу). Автодеплой також відкладає викочування, поки є
-`queued/claimed` CV-job. Задум: wake-up webhook при появі нового job (поки не реалізовано).
+`queued/claimed` CV-job. Тому VM сама будить box (крок 3a); якщо вебхук недоступний чи секрет не налаштований, відео просто
+чекає в черзі — нічого не губиться.
 Диспут про відео вже підсумованого дня (після 02:30) не обробляється — потрібен відкат XP/життів; такі випадки правляться адміном (`recount_reps`/`set_progress`).
 
 ---

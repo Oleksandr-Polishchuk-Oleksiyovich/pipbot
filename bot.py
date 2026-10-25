@@ -126,7 +126,7 @@ def build_app():
     llm = GeminiLLM.from_api_key(GEMINI_API_KEY, CANDIDATE_MODELS) if GEMINI_API_KEY else None
     if llm is None:
         logging.error("GEMINI_API_KEY is empty — bot will run on deterministic fallbacks only")
-    flow = ChatFlow(store, llm, TelegramSender(bot))
+    flow = ChatFlow(store, llm, TelegramSender(bot), waker=build_waker(store))
 
     async def reply_command(message: Message, text: str, markdown: bool = True) -> None:
         user = message.from_user
@@ -283,6 +283,15 @@ def build_app():
     return bot, dp, flow
 
 
+def build_waker(store):
+    """BoxWaker із конфігу (WAKE_*); без секрету вебхука — no-op (попередження в лог раз)."""
+    from core import config as _cfg
+    from core.wake import BoxWaker
+    return BoxWaker(store, enabled=_cfg.WAKE_ENABLED, stale_s=_cfg.WAKE_STALE_S, wait_s=_cfg.WAKE_WAIT_S,
+                    attempts=_cfg.WAKE_ATTEMPTS, watchdog_interval_s=_cfg.WAKE_WATCHDOG_INTERVAL_S,
+                    lease_s=_cfg.CV_LEASE_S)
+
+
 def timer_schedule(rollover):
     """(job, hour, minute) таймерів челенджу (Europe/Kyiv); підсумок дня 'settle' — на межі дня (за замовчуванням 02:30)."""
     roll_h, roll_m = rollover
@@ -304,6 +313,8 @@ async def main():
     cv_results_interval = int(os.getenv("CV_RESULTS_INTERVAL_SEC", "10"))
     admin_tasks_announce_interval = int(os.getenv("ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC", "60"))
     scheduler.add_job(flow.process_cv_results, "interval", seconds=cv_results_interval, id="cv_results",
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(flow.box_wake_watchdog, "interval", seconds=60, id="box_wake_watchdog",
                       max_instances=1, coalesce=True)
     scheduler.add_job(flow.check_expired_offload_requests, "interval", minutes=1,
                       args=[CHAT_ID], id="check_offload_expiry")
