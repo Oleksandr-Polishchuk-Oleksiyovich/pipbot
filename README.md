@@ -116,6 +116,28 @@ sudo -u sportnerd /usr/local/bin/sportnerd-deploy.sh origin/main
 
 ---
 
+## 📚 Документація
+
+**Поточний стан (актуально):**
+* [docs/SPEC.md](docs/SPEC.md) — специфікація застосунку: що де працює (Telegram / VM / box / GitHub / Grok Bot), компоненти, карта репозиторію, таблиці БД, конфіги, gateway, правила челенджу (прогресія, XP, trust-режим, межа дня 02:30).
+* [docs/FLOWS.md](docs/FLOWS.md) — потоки з mermaid-діаграмами й таблицями кроків: звичайне повідомлення, адмін-режим, відеозвіт (з диспутами), патч і деплой.
+* [docs/RUNBOOK.md](docs/RUNBOOK.md) — експлуатація: деплой, відкат, бекап і відновлення.
+* [deploy/README.md](deploy/README.md) — розгортання VM: gateway, Caddy, autodeploy, скрипти.
+* [skills/admin_dev.md](skills/admin_dev.md) — інструкція агента розробки на box (admin_dev).
+
+**Частково застаріле / історичне:**
+* [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — «цільова» архітектура фаз 0–5; загальні принципи актуальні, але CV на VM і webhook-офлоад `admin_dev` замінені (див. SPEC/FLOWS).
+* [CLOUD_DEPLOYMENT.md](CLOUD_DEPLOYMENT.md) — довідка з GCP-інфраструктури (VM, доступи); деплой-кроки в ній частково старі.
+
+**Старі плани та дослідження (не описують поточний стан):**
+* [optionToConsider/ARCHITECTURE.md](optionToConsider/ARCHITECTURE.md) — початковий проєкт архітектури.
+* [optionToConsider/PLANNING_BRIEF.md](optionToConsider/PLANNING_BRIEF.md) — планувальний бриф.
+* [optionToConsider/TASKS.md](optionToConsider/TASKS.md) — початковий беклог задач T-xx.
+* [optionToConsider/grokbot-webhook-offload.md](optionToConsider/grokbot-webhook-offload.md) — ідея офлоаду на Grok Bot через webhook.
+* [optionToConsider/computer-vision-rep-counting.md](optionToConsider/computer-vision-rep-counting.md), [optionToConsider/mediapipe_limits.md](optionToConsider/mediapipe_limits.md), [optionToConsider/HANDOFF.md](optionToConsider/HANDOFF.md) — дослідження CV-лічильника.
+
+---
+
 ## 🧪 Локальне тестування
 
 Проєкт покритий повним набором офлайн юніт-тестів, які не потребують підключення до Telegram або зовнішніх мереж:
