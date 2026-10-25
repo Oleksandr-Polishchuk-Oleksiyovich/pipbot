@@ -38,6 +38,9 @@ DEFAULT_VM_CONFIG: Dict[str, str] = {
     "CV_CLAIM_WAIT_S": "25",
     "CV_RESULTS_INTERVAL_SEC": "10",
     "ADMIN_TASKS_ANNOUNCE_INTERVAL_SEC": "60",
+    "TRUST_MODE": "1",
+    "DAY_ROLLOVER_HOUR": "2",
+    "DAY_ROLLOVER_MINUTE": "30",
 }
 
 

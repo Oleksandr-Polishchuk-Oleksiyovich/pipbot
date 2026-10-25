@@ -40,10 +40,17 @@ class Clock:
         return self.value
 
 
-def make_flow(tmp_path, llm):
+def make_flow(tmp_path, llm, trust_mode: bool = False):
     clock = Clock(NOW)
     sender = FakeSender()
-    flow = ChatFlow(Store(str(tmp_path / "flow.db")), llm, sender, now=clock, obey_media_dir=str(tmp_path / "none"))
+    flow = ChatFlow(
+        Store(str(tmp_path / "flow.db")),
+        llm,
+        sender,
+        now=clock,
+        obey_media_dir=str(tmp_path / "none"),
+        trust_mode=trust_mode,
+    )
     flow.init_storage()
     return flow, sender, clock
 

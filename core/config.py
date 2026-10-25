@@ -72,6 +72,9 @@ CV_LEASE_S = int(os.getenv("CV_LEASE_S", "300"))
 CV_VIDEO_DIR = os.getenv("CV_VIDEO_DIR", os.path.join(os.path.dirname(DB_PATH), "cv_videos"))
 CV_STILL_COUNTING_MIN = int(os.getenv("CV_STILL_COUNTING_MIN", "5"))
 
+# Режим довіри (Trust Mode): вірити заявленій кількості у підписі/повідомленні, CV ніколи не відхиляє.
+TRUST_MODE = os.getenv("TRUST_MODE", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
 # Grok Bot box routine webhook offload конфігурація
 ROUTINE_WEBHOOK_URL = os.getenv("ROUTINE_WEBHOOK_URL", "")
 ROUTINE_SENDER_KEY = os.getenv("ROUTINE_SENDER_KEY", "")
@@ -79,6 +82,18 @@ ROUTINE_SHARED_SECRET = os.getenv("ROUTINE_SHARED_SECRET", "")
 ROUTINE_TIMEOUT_SECONDS = int(os.getenv("ROUTINE_TIMEOUT_SECONDS", "900"))  # 15 хвилин за замовчуванням
 
 TIMEZONE = pytz.timezone("Europe/Kyiv")
+
+# Межа дня челенджу / час підсумку дня (Europe/Kyiv). Усе, що надіслано до цього часу, зараховується до ПОПЕРЕДНЬОГО дня.
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+    return v if lo <= v <= hi else default
+
+
+DAY_ROLLOVER_HOUR = _env_int("DAY_ROLLOVER_HOUR", 2, 0, 23)
+DAY_ROLLOVER_MINUTE = _env_int("DAY_ROLLOVER_MINUTE", 30, 0, 59)
 START_DATE = date(2026, 8, 31)
 
 QUOTES_DIR = os.path.join(BASE_DIR, "quotes")

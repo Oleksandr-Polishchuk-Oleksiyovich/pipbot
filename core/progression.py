@@ -16,6 +16,7 @@ import logging
 from datetime import date, timedelta
 from typing import Dict, Optional, Tuple
 
+from core import dayroll
 from database.store import Store
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ def _best_from_video_checks(store: Store, slug: str, day: date, exercise: str) -
         best = None
         for created, ex, reps in store.video_reps_rows(slug, since):
             local = datetime.strptime(created[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).astimezone(TZ)
-            if local.date() == day and challenge.CV_EXERCISE_KEYS.get(ex or "") == exercise:
+            if dayroll.challenge_date(local) == day and challenge.CV_EXERCISE_KEYS.get(ex or "") == exercise:
                 best = max(best or 0, reps)
         return best
     except Exception as e:  # noqa: BLE001

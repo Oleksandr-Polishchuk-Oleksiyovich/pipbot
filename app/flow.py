@@ -19,6 +19,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
+import pytz
+
 from agents.admin import AdminAgent
 from agents.coach import CoachAgent
 from agents.onboarding import OnboardingAgent
@@ -26,9 +28,22 @@ from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptM
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
-from core import challenge, progression
+from core import challenge, dayroll, progression
 from core.bot_texts import BotTexts
-from core.config import ADMIN_TASK_STALE_HOURS, CV_OFFLOAD, CV_STILL_COUNTING_MIN, DB_PATH, IS_PRODUCTION, LOG_RETENTION_DAYS, OBEY_MEDIA_DIR, TIMEZONE
+from core.claims import parse_claimed_exercise, parse_claimed_reps
+from core.config import (
+    ADMIN_TASK_STALE_HOURS,
+    CV_OFFLOAD,
+    CV_STILL_COUNTING_MIN,
+    DB_PATH,
+    IS_PRODUCTION,
+    LOG_RETENTION_DAYS,
+    OBEY_MEDIA_DIR,
+    TIMEZONE,
+    TRUST_MODE,
+    DAY_ROLLOVER_HOUR,
+    DAY_ROLLOVER_MINUTE,
+)
 from core.guardrails import (
     check_active_request_limit,
     check_admin_rate_limit,
@@ -93,7 +108,9 @@ class ChatFlow:
     def __init__(self, store: Store, llm: Optional[GeminiLLM], sender: Sender,
                  now: Callable[[], datetime] = lambda: datetime.now(TIMEZONE),
                  obey_media_dir: str = OBEY_MEDIA_DIR,
-                 offload_client: Optional[RoutineOffloadClient] = None):
+                 offload_client: Optional[RoutineOffloadClient] = None,
+                 trust_mode: Optional[bool] = None,
+                 rollover: Optional[Tuple[int, int]] = None):
         self.store = store
         self.llm = llm
         self.sender = sender
@@ -102,6 +119,9 @@ class ChatFlow:
         self.offload_client = offload_client or RoutineOffloadClient(store, now_fn=self.now)
         self.bot_texts = BotTexts(store)
         self.cv_offload = CV_OFFLOAD
+        self.trust_mode = TRUST_MODE if trust_mode is None else bool(trust_mode)
+        # межа дня челенджу (год, хв, Europe/Kyiv): відео до неї належать попередньому дню
+        self.rollover = tuple(rollover) if rollover is not None else (DAY_ROLLOVER_HOUR, DAY_ROLLOVER_MINUTE)
         self._lock = asyncio.Lock()
         self._chat_members_cache: Dict = {}
 
@@ -148,7 +168,7 @@ class ChatFlow:
         if any(deleted.values()):
             logger.info("Startup log pruning (older than %dd): %s", LOG_RETENTION_DAYS, deleted)
 
-        today = self.now().date()
+        today = self._today()
         logger.info(
             "Startup: db_path=%s participants=%d schedule_mode=%s today_exercise=%s",
             os.path.abspath(DB_PATH),
@@ -225,6 +245,10 @@ class ChatFlow:
         return deleted
 
     # --- допоміжне ---
+    def _today(self):
+        """Поточний ДЕНЬ ЧЕЛЕНДЖУ (не календарна дата): до межі rollover (02:30) ще триває попередній день."""
+        return dayroll.challenge_date(self.now(), *self.rollover)
+
     def _yesterday_cutoff(self) -> str:
         return (self.now() - timedelta(days=1)).strftime("%Y-%m-%d 23:55:00")
 
@@ -232,7 +256,7 @@ class ChatFlow:
         return (self.now() - timedelta(days=LOG_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _day_start(self) -> str:
-        return self.now().strftime("%Y-%m-%d 00:00:00")
+        return dayroll.day_start_ts(self._today(), *self.rollover)
 
     async def _call(self, fn, *args):
         if self.llm is None:
@@ -264,6 +288,7 @@ class ChatFlow:
         file_unique_id: Optional[str] = None,
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
+        caption: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Gate для вхідного відео/GIF (T-30):
@@ -296,6 +321,8 @@ class ChatFlow:
                 return False, reply
 
         request_id = str(uuid.uuid4())
+        if caption and caption.strip():
+            self.store.set_state(f"video_caption:{request_id}", caption.strip())
         self.store.create_video_check(
             request_id=request_id,
             chat_id=chat_id,
@@ -355,7 +382,10 @@ class ChatFlow:
             logger.warning("Video check %s not found in database", request_id)
             return None
 
-        today = self.now().date()
+        if self.trust_mode:
+            return await self._handle_video_callback_trust(check, request_id)
+
+        today = self._today()
         user_slug = check.user_slug or "lyosha"
         targets = challenge.day_targets(self.store, today)
         target = targets.get(user_slug, 10)
@@ -416,6 +446,201 @@ class ChatFlow:
             self.store.save_message(chat_id, COACH_NAME, "coach", reply_text, format_ts(self.now()))
         except Exception as e:
             logger.warning("Failed to send video reply directly (%s) — queuing in pending_replies", e)
+            self.store.add_pending_reply(
+                request_id=f"vid_rep_{request_id}",
+                chat_id=chat_id,
+                text=reply_text,
+                reply_to_message_id=reply_to_msg_id,
+            )
+
+        return reply_text
+
+    async def _handle_video_callback_trust(self, check, request_id: str) -> Optional[str]:
+        today = self._today()
+        today_iso = today.isoformat()
+        user_slug = check.user_slug or "lyosha"
+
+        # Claim lookup: caption (state key) first
+        caption = self.store.get_state(f"video_caption:{request_id}", "") or ""
+        claimed_reps = parse_claimed_reps(caption) if caption else None
+        claimed_ex = parse_claimed_exercise(caption) if caption else None
+
+        # Otherwise author's plain text messages in chat_history from up to 10 min before check.created_at
+        if claimed_reps is None or claimed_ex is None:
+            try:
+                utc_str = (check.created_at or "").split(".")[0]
+                utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
+                check_local = utc_dt.astimezone(TIMEZONE)
+            except Exception:
+                check_local = self.now()
+
+            ref_dt = self.now() if check_local.date() != self.now().date() else check_local
+            window_start = ref_dt - timedelta(minutes=10)
+            window_end = self.now()
+            if window_end < ref_dt:
+                window_end = ref_dt
+
+            window_start_str = format_ts(window_start)
+            window_end_str = format_ts(window_end)
+
+            messages = self.store.messages_since(check.chat_id, window_start_str)
+            matching_messages = []
+            for m in messages:
+                if m.role != "user":
+                    continue
+                if m.text.startswith("[Надіслано"):
+                    continue
+                if m.created_at > window_end_str:
+                    continue
+                if challenge.normalize_participant(m.user_name, self.store) != user_slug:
+                    continue
+                matching_messages.append(m)
+
+            if claimed_reps is None:
+                for m in reversed(matching_messages):
+                    val = parse_claimed_reps(m.text)
+                    if val is not None:
+                        claimed_reps = val
+                        if claimed_ex is None:
+                            claimed_ex = parse_claimed_exercise(m.text)
+                        break
+
+            if claimed_ex is None:
+                for m in reversed(matching_messages):
+                    ex = parse_claimed_exercise(m.text)
+                    if ex is not None:
+                        claimed_ex = ex
+                        break
+
+        # Trust logic
+        day_ex = challenge.day_exercise(self.store, today)
+        counted_ex = claimed_ex or day_ex
+
+        if counted_ex == day_ex:
+            targets = challenge.day_targets(self.store, today)
+            target = targets.get(user_slug, 10)
+        else:
+            nn = self.store.get_next_norm(user_slug, counted_ex)
+            if nn is not None:
+                target = nn[0]
+            else:
+                targets = challenge.day_targets(self.store, today)
+                target = targets.get(user_slug, 10)
+
+        cv_reps = check.reps or 0
+        cv_ex = challenge.CV_EXERCISE_KEYS.get(check.exercise or "")
+
+        credited_reps = claimed_reps if claimed_reps is not None else cv_reps
+
+        if counted_ex == day_ex:
+            if credited_reps > 0:
+                self.store.record_attempt(today_iso, user_slug, day_ex, credited_reps)
+            if credited_reps >= target:
+                self.store.set_done(user_slug, True, today_iso)
+
+        # Reply composition (always in this order: a, b, c, d, e)
+        parts: List[str] = []
+
+        # (a) "seen" part, friendly: if cv_reps>0 and cv_ex matches counted_ex: "Побачив {cv_reps} {exercise_word} з {target}";
+        # if the CV saw a different exercise or 0: "Побачив {cv_reps} {cv exercise word} — це інша вправа / рахувати складно" style without a target comparison.
+        cv_word = challenge.exercise_word(cv_ex or counted_ex, cv_reps)
+        if cv_reps > 0 and cv_ex == counted_ex and counted_ex == day_ex:
+            seen_text = self.bot_texts.get(
+                "trust_seen",
+                cv_reps=cv_reps,
+                reps=cv_reps,
+                target=target,
+                exercise=cv_word,
+            )
+        else:
+            seen_text = self.bot_texts.get(
+                "trust_seen_other",
+                cv_reps=cv_reps,
+                reps=cv_reps,
+                cv_exercise=cv_word,
+                exercise=cv_word,
+            )
+        if seen_text:
+            parts.append(seen_text)
+
+        # (b) if claimed and claimed != cv_reps: add light phrase "я побачив {cv_reps}, але вірю твоєму слову" and credit text "Зарахував {claimed} {word}".
+        if claimed_reps is not None and claimed_reps != cv_reps:
+            claimed_word = challenge.exercise_word(counted_ex, claimed_reps)
+            diff_text = self.bot_texts.get(
+                "trust_claim_diff",
+                cv_reps=cv_reps,
+                reps=cv_reps,
+                claimed=claimed_reps,
+                exercise=claimed_word,
+                word=claimed_word,
+            )
+            if diff_text:
+                parts.append(diff_text)
+
+        # (c) praise/credit: target met -> "норму зараховано" + praise;
+        # target missed -> "записав {credited_reps} {word} у спробу дня, до норми {target} трохи не вистачило — але я в тебе вірю" (NEVER "не зараховано", never suspicion of cheating, never REDO words from prompts.REDO_WORDS).
+        credited_word = challenge.exercise_word(counted_ex, credited_reps)
+        if counted_ex == day_ex:
+            if credited_reps >= target:
+                credit_text = self.bot_texts.get(
+                    "trust_credit_met",
+                    target=target,
+                    credited=credited_reps,
+                    credited_reps=credited_reps,
+                    reps=credited_reps,
+                    exercise=credited_word,
+                    word=credited_word,
+                )
+            else:
+                credit_text = self.bot_texts.get(
+                    "trust_credit_missed",
+                    target=target,
+                    credited=credited_reps,
+                    credited_reps=credited_reps,
+                    reps=credited_reps,
+                    exercise=credited_word,
+                    word=credited_word,
+                )
+        else:
+            counted_name = challenge.EXERCISES.get(counted_ex, {}).get("name", counted_ex)
+            day_name = challenge.EXERCISES.get(day_ex, {}).get("name", day_ex)
+            credit_text = self.bot_texts.get(
+                "trust_other_exercise",
+                counted_exercise=counted_name,
+                day_exercise=day_name,
+                exercise=counted_name,
+            )
+        if credit_text:
+            parts.append(credit_text)
+
+        # (d) if no claim and CV reps < target add light tip "наступного разу напиши кількість у підписі до відео — зарахую її на слово".
+        if claimed_reps is None and cv_reps < target and counted_ex == day_ex:
+            tip_text = self.bot_texts.get("trust_no_claim_tip")
+            if tip_text:
+                parts.append(tip_text)
+
+        # (e) if flags contain low_camera_angle / unreliable_camera_angle / low_body_visibility or confidence < 0.6, append the angle hint line "зарахую, але наступного разу зніми так, аби тебе було видно цілком" (new bot_text key trust_angle_hint).
+        flags = check.flags or []
+        has_angle_flag = any(f in flags for f in ("low_camera_angle", "unreliable_camera_angle", "low_body_visibility"))
+        low_conf = (check.confidence is not None and check.confidence < 0.6)
+        if has_angle_flag or low_conf:
+            angle_text = self.bot_texts.get("trust_angle_hint")
+            if angle_text:
+                parts.append(angle_text)
+
+        reply_text = "\n".join(parts)
+
+        chat_id = check.chat_id
+        reply_to_msg_id = check.message_id
+
+        try:
+            if reply_to_msg_id is not None:
+                await self.sender.send_text(chat_id, reply_text, reply_to_message_id=reply_to_msg_id)
+            else:
+                await self.sender.send_text(chat_id, reply_text)
+            self.store.save_message(chat_id, COACH_NAME, "coach", reply_text, format_ts(self.now()))
+        except Exception as e:
+            logger.warning("Failed to send trust video reply directly (%s) — queuing in pending_replies", e)
             self.store.add_pending_reply(
                 request_id=f"vid_rep_{request_id}",
                 chat_id=chat_id,
@@ -574,7 +799,7 @@ class ChatFlow:
                     await self._handle_timer(chat_id, job)
 
     async def _handle_pending(self, chat_id: int, pending: List[ChatMessage], trigger: str = "push") -> None:
-        today_iso = self.now().date().isoformat()
+        today_iso = self._today().isoformat()
         history = self.store.messages_since(chat_id, self._day_start())
 
         # Програмна перевірка авторів: якщо автора немає в БД — він створюється як 'uninitialized'.
@@ -646,7 +871,7 @@ class ChatFlow:
         pending: List[ChatMessage],
         history: List[ChatMessage],
     ) -> None:
-        today = self.now().date()
+        today = self._today()
         try:
             reply, _ = await self._call(self.onboarding.interview, today, user, pending, history)
         except LLMUnavailable as e:
@@ -767,7 +992,7 @@ class ChatFlow:
         try:
             reply, actions = await self._call(
                 self.admin.execute,
-                self.now().date(),
+                self._today(),
                 decision.directive,
                 decision.sender,
                 pending,
@@ -897,7 +1122,7 @@ class ChatFlow:
         return success, reply
 
     async def _handle_coach(self, chat_id: int, pending: List[ChatMessage], history: List[ChatMessage]) -> None:
-        today = self.now().date()
+        today = self._today()
         done_before = self.store.get_day_progress(today.isoformat())
         llm_ok = True
         try:
@@ -964,7 +1189,7 @@ class ChatFlow:
 
     # --- таймери ---
     async def _handle_timer(self, chat_id: int, job: str) -> None:
-        today = self.now().date()
+        today = self._today()
         if job == "settle":
             await self._settle_lives(chat_id, challenge.yesterday(today))
             return

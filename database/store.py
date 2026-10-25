@@ -1391,9 +1391,10 @@ class Store:
         else:
             date_str = str(date_iso)[:10]
         with self._connect() as con:
+            lo, hi = _challenge_day_utc_bounds(date_str)
             row = con.execute(
-                "SELECT 1 FROM video_checks WHERE user_slug = ? AND (substr(created_at, 1, 10) = ? OR created_at LIKE ?) LIMIT 1",
-                (user_slug, date_str, f"{date_str}%"),
+                "SELECT 1 FROM video_checks WHERE user_slug = ? AND created_at >= ? AND created_at < ? LIMIT 1",
+                (user_slug, lo, hi),
             ).fetchone()
         return bool(row)
 
@@ -1413,9 +1414,10 @@ class Store:
         else:
             date_str = str(date_iso)[:10]
         with self._connect() as con:
+            lo, hi = _challenge_day_utc_bounds(date_str)
             row = con.execute(
-                "SELECT id, request_id FROM video_checks WHERE user_slug = ? AND (substr(created_at, 1, 10) = ? OR created_at LIKE ?) ORDER BY id DESC LIMIT 1",
-                (user_slug, date_str, f"{date_str}%"),
+                "SELECT id, request_id FROM video_checks WHERE user_slug = ? AND created_at >= ? AND created_at < ? ORDER BY id DESC LIMIT 1",
+                (user_slug, lo, hi),
             ).fetchone()
             if not row:
                 return None
@@ -1713,6 +1715,13 @@ class Store:
             {"key": r[0], "content": r[1], "version": r[2], "updated_by": r[3], "updated_at": r[4]}
             for r in rows
         ]
+
+
+def _challenge_day_utc_bounds(date_str: str):
+    """UTC-межі дня челенджу (з урахуванням DAY_ROLLOVER 02:30 Kyiv) для video_checks.created_at (UTC)."""
+    from datetime import date as _date
+    from core import dayroll
+    return dayroll.day_utc_bounds(_date.fromisoformat(date_str[:10]))
 
 
 def format_ts(dt: datetime) -> str:

@@ -162,7 +162,7 @@ def build_app():
 
     @dp.message(Command("status"))
     async def cmd_status(message: Message):
-        s = challenge.status_snapshot(store, flow.now().date())
+        s = challenge.status_snapshot(store, flow._today())
         lines = [f"📊 **СТАТУС НА СЬОГОДНІ ({s['date']}) — {s['exercise_name'].upper()}:**\n"]
         for p, meta in s["participants"].items():
             state = "✅ ВИКОНАНО" if meta["done"] else f"❌ Ще потрібно `{meta['target']}`"
@@ -266,6 +266,7 @@ def build_app():
                 file_unique_id=file_unique_id,
                 duration=float(duration) if duration is not None else None,
                 file_size=file_size,
+                caption=getattr(message, "caption", None),
             )
             return
 
@@ -282,14 +283,22 @@ def build_app():
     return bot, dp, flow
 
 
+def timer_schedule(rollover):
+    """(job, hour, minute) таймерів челенджу (Europe/Kyiv); підсумок дня 'settle' — на межі дня (за замовчуванням 02:30)."""
+    roll_h, roll_m = rollover
+    return (("settle", roll_h, roll_m), ("morning", 8, 30), ("afternoon", 15, 0),
+            ("evening", 19, 0), ("night", 23, 30))
+
+
 async def main():
     setup_logging()
     bot, dp, flow = build_app()
     flow.init_storage()
 
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    for job, hour, minute in (("settle", 0, 5), ("morning", 8, 30), ("afternoon", 15, 0),
-                              ("evening", 19, 0), ("night", 23, 30)):
+    # підсумок дня (settle) — о DAY_ROLLOVER_HOUR:DAY_ROLLOVER_MINUTE (02:30 Kyiv), а не о півночі
+    roll_h, roll_m = flow.rollover
+    for job, hour, minute in timer_schedule(flow.rollover):
         scheduler.add_job(flow.process, "cron", hour=hour, minute=minute,
                           args=[CHAT_ID], kwargs={"trigger": "timer", "job": job}, id=job)
     cv_results_interval = int(os.getenv("CV_RESULTS_INTERVAL_SEC", "10"))
@@ -302,7 +311,7 @@ async def main():
     scheduler.add_job(flow.announce_admin_tasks, "interval", seconds=admin_tasks_announce_interval, args=[CHAT_ID],
                       id="admin_task_rejections", max_instances=1, coalesce=True)
     scheduler.start()
-    logging.info("Scheduler started (00:05 settle, 00:10 prune_old_logs, 08:30, 15:00, 19:00, 23:30 Kyiv).")
+    logging.info("Scheduler started (%02d:%02d settle/day rollover, 00:10 prune_old_logs, 08:30, 15:00, 19:00, 23:30 Kyiv).", roll_h, roll_m)
 
     try:
         await flow.drain_pending_replies()
