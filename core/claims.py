@@ -132,3 +132,64 @@ def parse_claimed_reps(text: Optional[str]) -> Optional[int]:
         return candidates[0][0]
 
     return max(val for val, _ in candidates)
+
+
+# --- Оспорювання підрахунку (TRUST_MODE, м'який режим «до виправлення»): слова людини важливіші за CV ---
+_RE_REPLY_PREFIX = re.compile(r"^\s*\[У відповідь на ([^\]]*?): «(.*?)»\]\s*", re.DOTALL)
+
+# Маркери оспорювання (нижній регістр; укр. + рос. + англ.)
+_DISPUTE_PATTERNS = [re.compile(p) for p in (
+    r"неправильн", r"невірн", r"не\s+вірн", r"неточн", r"помил", r"недораху", r"недосчита", r"не\s+так\s+(?:порах|рахув)",
+    r"це\s+не\s+так", r"не\s+так\b", r"не\s+те\s+порах", r"не\s+порахував", r"не\s+порахувало", r"не\s+порахувала",
+    r"зарахуй", r"перерахуй", r"перепорахуй", r"порахуй\s+(?:ще|знову|ще\s+раз)", r"перевір\s+(?:ще|знову)",
+    r"(?:зробив|зробила|було|вийшло)\s+більше", r"насправді", r"а\s+не\s+\d", r"не\s+\d+\s*,?\s*а\s+\d",
+    r"ошиб", r"неправильно\s+посчит", r"не\s+посчита", r"засчитай", r"пересчитай", r"не\s+так\s+посчит",
+    r"\bwrong\b", r"miscount", r"mistake", r"recount", r"you\s+counted",
+)]
+# Слова «я зробив N» — оспорювання лише якщо в тексті є число
+_NUMBERED_CLAIM_PATTERNS = [re.compile(p) for p in (
+    r"(?:я\s+)?(?:зробив|зробила|вийшло|вийшов|було|набралось|набралося|відтиснувся|відтиснулась)", r"(?:сделал|сделала|получилось|было)",
+)]
+
+
+def split_reply_context(text: Optional[str]) -> Tuple[Optional[str], Optional[str], str]:
+    """(автор цитованого, цитований текст, решта) з describe_message; (None, None, text) якщо це не reply."""
+    if not text:
+        return None, None, ""
+    m = _RE_REPLY_PREFIX.match(text)
+    if not m:
+        return None, None, text.strip()
+    return m.group(1).strip(), m.group(2).strip(), text[m.end():].strip()
+
+
+def parse_dispute_reps(text: Optional[str]) -> Optional[int]:
+    """
+    Число, яким людина виправляє підрахунок: «не 4 а 40» -> 40, «40, а не 4» -> 40, «я зробив 50» -> 50.
+    Числа після «не» (заперечені) відкидаються. None — числа немає.
+    """
+    if not text:
+        return None
+    _, _, rest = split_reply_context(text)
+    cleaned = re.sub(r"(?i)\bне\s+\d+", " ", rest)
+    return parse_claimed_reps(cleaned)
+
+
+def is_dispute(text: Optional[str], reply_to_bot_count: bool = False) -> bool:
+    """
+    Чи оспорює повідомлення підрахунок на відео. reply_to_bot_count — це reply на повідомлення бота «Побачив N…»
+    (тоді достатньо числа). Без маркера й без числа — не оспорювання.
+    """
+    if not text:
+        return False
+    _, _, rest = split_reply_context(text)
+    low = rest.lower()
+    if not low:
+        return False
+    has_number = parse_dispute_reps(text) is not None
+    if any(p.search(low) for p in _DISPUTE_PATTERNS):
+        return True
+    if has_number and any(p.search(low) for p in _NUMBERED_CLAIM_PATTERNS):
+        return True
+    if reply_to_bot_count and has_number:
+        return True
+    return False

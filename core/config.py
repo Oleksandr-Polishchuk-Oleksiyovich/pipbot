@@ -72,7 +72,8 @@ CV_LEASE_S = int(os.getenv("CV_LEASE_S", "300"))
 CV_VIDEO_DIR = os.getenv("CV_VIDEO_DIR", os.path.join(os.path.dirname(DB_PATH), "cv_videos"))
 CV_STILL_COUNTING_MIN = int(os.getenv("CV_STILL_COUNTING_MIN", "5"))
 
-# Режим довіри (Trust Mode): вірити заявленій кількості у підписі/повідомленні, CV ніколи не відхиляє.
+# Режим довіри (TRUST_MODE) — М'ЯКИЙ РЕЖИМ «до виправлення» (замінити, коли CV покращиться): вірити заявленій кількості
+# у підписі/повідомленні та оспорюванню підрахунку (слова людини пріоритетніші за CV); CV лише інформує, ніколи не відхиляє.
 TRUST_MODE = os.getenv("TRUST_MODE", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 # Grok Bot box routine webhook offload конфігурація

@@ -1285,6 +1285,16 @@ class Store:
             ).fetchone()
         return _row_to_video_check(row) if row else None
 
+    def video_checks_between(self, user_slug: str, lo_utc: str, hi_utc: str) -> List[VideoCheck]:
+        """video_checks автора з created_at (UTC) у [lo, hi), за зростанням id — для оспорювання/перерахунку дня."""
+        with self._connect() as con:
+            rows = con.execute(
+                f"SELECT {_VIDEO_CHECK_COLS} FROM video_checks WHERE user_slug = ? AND created_at >= ? AND created_at < ? "
+                "ORDER BY id ASC",
+                (user_slug, lo_utc, hi_utc),
+            ).fetchall()
+        return [_row_to_video_check(r) for r in rows]
+
     def get_video_check_by_id(self, check_id: int) -> Optional[VideoCheck]:
         with self._connect() as con:
             row = con.execute(

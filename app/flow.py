@@ -11,6 +11,7 @@ timer:           morning / afternoon / evening — шаблони; night — Coa
 """
 import asyncio
 import glob
+import json
 import logging
 import re
 import os
@@ -30,7 +31,13 @@ from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
 from core import challenge, dayroll, progression
 from core.bot_texts import BotTexts
-from core.claims import parse_claimed_exercise, parse_claimed_reps
+from core.claims import (
+    is_dispute,
+    parse_claimed_exercise,
+    parse_claimed_reps,
+    parse_dispute_reps,
+    split_reply_context,
+)
 from core.config import (
     ADMIN_TASK_STALE_HOURS,
     CV_OFFLOAD,
@@ -531,6 +538,8 @@ class ChatFlow:
         cv_ex = challenge.CV_EXERCISE_KEYS.get(check.exercise or "")
 
         credited_reps = claimed_reps if claimed_reps is not None else cv_reps
+        # Запам'ятовуємо, скільки зараховано саме за це відео (для оспорювання/перерахунку дня).
+        self.store.set_state(f"video_credit:{request_id}", json.dumps({"reps": credited_reps, "ex": counted_ex}))
 
         if counted_ex == day_ex:
             if credited_reps > 0:
@@ -649,6 +658,130 @@ class ChatFlow:
             )
 
         return reply_text
+
+    # --- TRUST_MODE (м'який режим «до виправлення»): людина оспорює підрахунок CV -> вірить людині ---
+    def _check_local_ts(self, check) -> str:
+        """Час відео в локальному форматі chat_history ('YYYY-MM-DD HH:MM:SS', Europe/Kyiv)."""
+        try:
+            utc_dt = datetime.strptime((check.created_at or "").split(".")[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
+            return format_ts(utc_dt.astimezone(TIMEZONE))
+        except Exception:
+            return ""
+
+    def _day_video_checks(self, slug: str, day) -> list:
+        lo, hi = dayroll.day_utc_bounds(day, *self.rollover)
+        return self.store.video_checks_between(slug, lo, hi)
+
+    def _video_credit(self, check) -> Tuple[int, Optional[str]]:
+        """(зараховані повтори, вправа) для відео: запис довіри або (CV reps, CV вправа)."""
+        raw = self.store.get_state(f"video_credit:{check.request_id}", "")
+        if raw:
+            try:
+                d = json.loads(raw)
+                return int(d.get("reps") or 0), d.get("ex")
+            except (ValueError, TypeError):
+                pass
+        return int(check.reps or 0), challenge.CV_EXERCISE_KEYS.get(check.exercise or "")
+
+    async def _handle_disputes(self, chat_id: int, pending: List[ChatMessage]) -> List[ChatMessage]:
+        """
+        Людина оспорює підрахунок на відео -> її слова важливіші за CV. З числом — виправляємо залік; без числа —
+        один раз м'яко питаємо «скільки вийшло?» і зараховуємо те, що вона відповість. Повертає повідомлення, що лишились
+        для звичайної обробки. Працює і після того, як бот уже відповів (аж до кінця дня челенджу).
+        """
+        today = self._today()
+        today_iso = today.isoformat()
+        remaining: List[ChatMessage] = []
+        for m in pending:
+            slug = challenge.normalize_participant(m.user_name, self.store)
+            if not slug or (m.text or "").startswith("[Надіслано"):
+                remaining.append(m)
+                continue
+            quoted_sender, quoted_text, _rest = split_reply_context(m.text)
+            reply_to_bot = bool(quoted_text) and (
+                "Побачив" in quoted_text or "Зануда" in (quoted_sender or "") or "зарахов" in quoted_text.lower()
+            )
+            number = parse_dispute_reps(m.text)
+            wait_key = f"dispute_wait:{slug}"
+            wait = None
+            raw = self.store.get_state(wait_key, "")
+            if raw:
+                try:
+                    wait = json.loads(raw)
+                except ValueError:
+                    wait = None
+                if not isinstance(wait, dict) or wait.get("day") != today_iso:
+                    wait = None
+            disputed = is_dispute(m.text, reply_to_bot_count=reply_to_bot)
+            if not disputed and not (wait and number is not None):
+                remaining.append(m)
+                continue
+
+            checks = [c for c in self._day_video_checks(slug, today)
+                      if c.status == "done" and self._check_local_ts(c) <= (m.created_at or "9999")]
+            target_check = None
+            if wait:
+                target_check = next((c for c in checks if c.request_id == wait.get("rid")), None)
+            if target_check is None and checks:
+                target_check = checks[-1]
+            if target_check is None:
+                remaining.append(m)  # немає відео, яке можна оспорювати -> звичайна обробка
+                continue
+
+            if number is None:
+                if wait:
+                    logger.info("Dispute from %s without number — already asked, waiting", slug)
+                else:
+                    self.store.set_state(wait_key, json.dumps({"rid": target_check.request_id, "day": today_iso}))
+                    await self._say(chat_id, self.bot_texts.get("trust_dispute_ask"))
+                continue
+
+            await self._apply_video_correction(chat_id, target_check, slug, number, m.text)
+            if wait:
+                self.store.set_state(wait_key, "")
+        return remaining
+
+    async def _apply_video_correction(self, chat_id: int, check, slug: str, reps: int, text: str) -> str:
+        """
+        Виправляє залік до числа людини (воно ЗАВЖДИ перемагає CV, і вище, і нижче). Змінює лише денну спробу/статус —
+        XP, життя й наступну норму рахує звичайний settle за best_reps дня, тож подвійного нарахування немає.
+        """
+        today = self._today()
+        today_iso = today.isoformat()
+        day_ex = challenge.day_exercise(self.store, today)
+        _, prev_ex = self._video_credit(check)
+        ex = parse_claimed_exercise(text) or prev_ex or day_ex
+        self.store.set_state(f"video_credit:{check.request_id}",
+                             json.dumps({"reps": int(reps), "ex": ex, "disputed": True}))
+        target = challenge.day_targets(self.store, today).get(slug, 10)
+        ex_word = challenge.exercise_word(ex, reps)
+        parts = [self.bot_texts.get("trust_dispute_fix", claimed=reps, exercise=ex_word, reps=reps)]
+        if ex == day_ex:
+            best = 0
+            for c in self._day_video_checks(slug, today):
+                if c.status != "done":
+                    continue
+                c_reps, c_ex = self._video_credit(c)
+                if c_ex == day_ex:
+                    best = max(best, c_reps)
+            self.store.set_attempt(today_iso, slug, day_ex, best)
+            met = best >= target
+            self.store.set_done(slug, met, today_iso)
+            key = "trust_credit_met" if met else "trust_credit_missed"
+            parts.append(self.bot_texts.get(key, target=target, credited=best, credited_reps=best, reps=best,
+                                            exercise=challenge.exercise_word(day_ex, best),
+                                            word=challenge.exercise_word(day_ex, best)))
+        else:
+            parts.append(self.bot_texts.get(
+                "trust_other_exercise",
+                counted_exercise=challenge.EXERCISES.get(ex, {}).get("name", ex),
+                day_exercise=challenge.EXERCISES.get(day_ex, {}).get("name", day_ex),
+                exercise=challenge.EXERCISES.get(ex, {}).get("name", ex),
+            ))
+        reply = "\n".join(p for p in parts if p)
+        await self._say(chat_id, reply)
+        logger.info("Dispute applied: %s %s reps=%s ex=%s (request %s)", slug, today_iso, reps, ex, check.request_id)
+        return reply
 
     def resolve_hint_text(self, key: str) -> str:
         """Текст підказки за ключем: BotTexts (БД bot_texts -> дефолт із prompts.DEFAULT_BOT_TEXTS)."""
@@ -846,6 +979,9 @@ class ChatFlow:
                 await self.handle_rollback(chat_id, user, reply_to_message_id=m.id)
                 active_pending.remove(m)
                 continue
+
+        if self.trust_mode and active_pending:
+            active_pending = await self._handle_disputes(chat_id, active_pending)
 
         if not active_pending:
             return
