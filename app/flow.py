@@ -1383,14 +1383,7 @@ class ChatFlow:
         missing_str = [f"{p[m]['emoji']} {p[m]['name']} (`{targets[m]}` {ex['genitive']})" for m in missing if m in p]
 
         if job == "morning":
-            from core.leave import leave_on
-            def _norm_entry(slug, meta):
-                lv = leave_on(self.store, slug, today)
-                if lv:
-                    mark = "🏖 у відпустці" if lv["kind"] == "vacation" else "🤒 на лікарняному"
-                    return f"{meta['emoji']} {meta['name']}: `{targets[slug]}` ({mark})"
-                return f"{meta['emoji']} {meta['name']}: `{targets[slug]}`"
-            norms_lines = "\n".join(_norm_entry(slug, meta) for slug, meta in p.items())
+            norms_lines = challenge.status_board(self.store, today, bold=True)
             text = (f"☀️ **День {challenge.day_index(today) + 1} ({today.strftime('%d.%m.%Y')})**\n\n"
                     f"{ex['emoji']} **Сьогодні {ex['name'].upper()}!**\n\n"
                     f"🎯 **Норма на сьогодні:**\n{norms_lines}\n\n"

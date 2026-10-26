@@ -195,6 +195,6 @@ def test_manual_recount_reps_overrides_attempt_and_video_check(tmp_path):
     # Перевіряємо, що тренер бачить XP/рівень та спробу у системному промпті, а роутер класифікує команду як quick
     st.set_attempt(day_iso, "lyosha", "pushups", 41)
     coach_prompt = CoachAgent(None, st).build_system_prompt(D)
-    assert "XP: 9/100 (рівень 0)" in coach_prompt
-    assert "найкраща спроба: 41" in coach_prompt
+    assert "⭐ 9/100 XP" in coach_prompt and "🆙 рів. 0" in coach_prompt
+    assert "виконано (41)" in coach_prompt
     assert RouterAgent.classify_admin_tier("перезарахуй Льоші 41 повтор за відео") == "quick"

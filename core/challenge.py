@@ -338,6 +338,7 @@ def status_snapshot(store: Store, day: date) -> Dict:
         leave_info = (
             {
                 "kind": leave_rec["kind"],
+                "since": leave_rec["start_date"],
                 "until": leave_rec["end_date"],
                 "set_by": leave_rec.get("set_by"),
             }
@@ -356,6 +357,8 @@ def status_snapshot(store: Store, day: date) -> Dict:
             "max_lives": max_lives.get(u.slug),
             "xp": store.get_xp(u.slug)[0],
             "level": store.get_xp(u.slug)[1],
+            "best": store.get_best_attempt(day_iso, u.slug),
+            "streak": streak_days(store, u, day),
             "leave": leave_info,
         }
     return {
@@ -384,37 +387,85 @@ def status_snapshot(store: Store, day: date) -> Dict:
     }
 
 
+STREAK_LOOKBACK_DAYS = 120
+
+
+def streak_days(store: Store, user: User, day: date) -> int:
+    """Серія закритих днів поспіль: сьогодні (якщо вже зараховано) + попередні дні.
+    Дні відпустки/лікарняного серію не рвуть і не додають; день до приєднання учасника — межа."""
+    count = 0
+    cursor = day
+    joined = getattr(user, "joined_date", "") or ""
+    for i in range(STREAK_LOOKBACK_DAYS):
+        iso = cursor.isoformat()
+        if joined and iso < joined:
+            break
+        if store.get_day_progress(iso).get(user.slug, False):
+            count += 1
+        elif store.get_leave_on(user.slug, iso):
+            pass
+        elif i == 0:
+            pass  # сьогодні ще не закрито — серія не рветься до кінця дня
+        else:
+            break
+        cursor -= timedelta(days=1)
+    return count
+
+
+def _fmt_dm(iso: Optional[str]) -> str:
+    try:
+        return date.fromisoformat(str(iso)[:10]).strftime("%d.%m")
+    except Exception:
+        return str(iso or "")
+
+
+def leave_status_str(leave: Optional[Dict]) -> str:
+    """«🤒 на лікарняному з 26.10 (безстроково)» / «🏖 у відпустці з 01.11 до 10.11»."""
+    if not leave:
+        return ""
+    icon, word = ("🤒", "на лікарняному") if leave.get("kind") == "sick" else ("🏖", "у відпустці")
+    since = f" з {_fmt_dm(leave['since'])}" if leave.get("since") else ""
+    until = f" до {_fmt_dm(leave['until'])}" if leave.get("until") else " (безстроково)"
+    return f"{icon} {word}{since}{until}"
+
+
+def participant_status_line(info: Dict, bold: bool = False) -> str:
+    """ЄДИНИЙ формат рядка учасника для будь-якого статусу/зведення: імʼя, норма, зроблено/спроба, життя,
+    XP/рівень, серія, відпустка/лікарняний. Генерується кодом — LLM лише дослівно передає."""
+    name = f"**{info['name']}**" if bold else info["name"]
+    leave = info.get("leave")
+    best = info.get("best")
+    if info.get("done"):
+        state = "✅ виконано" + (f" ({best})" if best else "")
+    elif leave:
+        state = leave_status_str(leave)
+        if best:
+            state += f" (спроба: {best})"
+    else:
+        state = "❌ ще не здав" + (f" (найкраща спроба: {best})" if best else "")
+    norm = f"`{info['target']}`" if bold else str(info["target"])  # bold=True — Telegram-markdown (команди/таймери)
+    parts = [f"{info.get('emoji', '')} {name}: норма {norm} — {state}".strip()]
+    if info.get("done") and leave:
+        parts[0] += f" | {leave_status_str(leave)}"
+    lives, max_l = info.get("lives"), info.get("max_lives")
+    if lives is not None:
+        parts.append(f"❤️ {lives}/{max_l}" if max_l else f"❤️ {lives}")
+    parts.append(f"⭐ {info.get('xp', 0)}/100 XP")
+    parts.append(f"🆙 рів. {info.get('level', 0)}")
+    parts.append(f"🔥 серія {info.get('streak', 0)}")
+    return " | ".join(parts)
+
+
+def status_board(store: Store, day: date, bold: bool = False, snapshot: Optional[Dict] = None) -> str:
+    """Рядки всіх активних учасників (без заголовка) — єдине джерело для /status, коуча, ранкового повідомлення."""
+    s = snapshot or status_snapshot(store, day)
+    return "\n".join(participant_status_line(info, bold=bold) for info in s["participants"].values())
+
+
 def status_text(store: Store, day: date) -> str:
     s = status_snapshot(store, day)
-    lines = [f"Дата: {s['date']} (День {s['day_num']} челенджу). Вправа дня: {s['exercise_name'].upper()}."]
-    for slug, info in s["participants"].items():
-        if info["done"]:
-            mark = "ВИКОНАНО ✅"
-        elif info.get("leave"):
-            kind = info["leave"]["kind"]
-            until = info["leave"].get("until")
-            until_str = ""
-            if until:
-                try:
-                    d_until = date.fromisoformat(str(until)[:10])
-                    until_str = f" (до {d_until.strftime('%d.%m')})"
-                except Exception:
-                    until_str = f" (до {until})"
-            if kind == "sick":
-                mark = f"🤒 на лікарняному{until_str}"
-            else:
-                mark = f"🏖 у відпустці{until_str}"
-        else:
-            mark = "НЕ виконано ❌"
-        lives = info["lives"]
-        max_l = info["max_lives"]
-        if lives is not None:
-            lives_str = f" | Життя: {lives}/{max_l}" if max_l else f" | Життя: {lives}"
-        else:
-            lives_str = ""
-        lines.append(f"{info['emoji']} {info['name']}: норма {info['target']} | Статус: {mark}{lives_str}"
-                     f" | XP {info.get('xp', 0)}/100 | Рівень {info.get('level', 0)}")
-    return "\n".join(lines)
+    head = f"Дата: {s['date']} (День {s['day_num']} челенджу). Вправа дня: {s['exercise_name'].upper()}."
+    return head + "\n" + status_board(store, day, snapshot=s)
 
 
 def missing_participants(store: Store, day: date) -> List[str]:

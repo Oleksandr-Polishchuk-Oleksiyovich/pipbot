@@ -200,6 +200,7 @@ def test_missing_participants_and_status_text(tmp_path):
     snap = challenge.status_snapshot(st, D)
     assert snap["participants"]["lyosha"]["leave"] == {
         "kind": "sick",
+        "since": D.isoformat(),
         "until": "2026-10-30",
         "set_by": "doctor",
     }
@@ -207,8 +208,8 @@ def test_missing_participants_and_status_text(tmp_path):
 
     # status_text
     txt = challenge.status_text(st, D)
-    assert "🤒 на лікарняному (до 30.10)" in txt
-    assert "НЕ виконано ❌" in txt  # для Саші
+    assert "🤒 на лікарняному з " in txt and "до 30.10" in txt
+    assert "❌ ще не здав" in txt  # для Саші
 
     # describe
     assert describe(snap["participants"]["lyosha"]["leave"]) == "на лікарняному до 30.10"

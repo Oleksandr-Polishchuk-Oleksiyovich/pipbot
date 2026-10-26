@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from aiohttp import web
@@ -96,6 +96,15 @@ def snapshot(store, since_days: int, date_iso: Optional[str], log_lines: int) ->
                                                                       "OR key LIKE 'ops:%' OR key LIKE 'video_credit:%' OR key LIKE 'autodeploy%'", _STATE_ALLOW)}
         if date_iso:
             out["day"] = date_iso
+    # Той самий детермінований статус, що йде в /status і в промпт коуча (read-only, без повідомлень у чат).
+    try:
+        from core import challenge, dayroll
+        from core.config import TIMEZONE
+        day = date.fromisoformat(date_iso) if date_iso else dayroll.challenge_date(datetime.now(TIMEZONE))
+        out["status_board"] = challenge.status_board(store, day).splitlines()
+        out["leaves"] = store.list_leaves(include_cancelled=True)
+    except Exception as e:  # noqa: BLE001
+        out["status_board_error"] = str(e)[:200]
     return out
 
 

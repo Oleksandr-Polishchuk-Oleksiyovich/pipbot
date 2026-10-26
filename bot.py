@@ -164,14 +164,7 @@ def build_app():
     async def cmd_status(message: Message):
         s = challenge.status_snapshot(store, flow._today())
         lines = [f"📊 **СТАТУС НА СЬОГОДНІ ({s['date']}) — {s['exercise_name'].upper()}:**\n"]
-        for p, meta in s["participants"].items():
-            state = "✅ ВИКОНАНО" if meta["done"] else f"❌ Ще потрібно `{meta['target']}`"
-            if meta["lives"] is not None:
-                lives = f" | ❤️ {meta['lives']}/{meta['max_lives']}" if meta.get("max_lives") else f" | ❤️ {meta['lives']}"
-            else:
-                lives = ""
-            xp_str = flow.bot_texts.get("status_xp", xp=meta.get("xp", 0), level=meta.get("level", 0)) or ""
-            lines.append(f"{meta['emoji']} **{meta['name']}:** {state}{lives}{xp_str}")
+        lines.append(challenge.status_board(store, flow._today(), bold=True, snapshot=s))
         if s.get("uninitialized"):
             names = ", ".join(u["display_name"] for u in s["uninitialized"])
             lines.append(f"\n🆕 *Очікують на завершення реєстрації:* {names}")

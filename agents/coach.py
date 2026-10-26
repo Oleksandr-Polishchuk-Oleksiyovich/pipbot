@@ -38,6 +38,19 @@ def fill_template(template: str, values: dict) -> str:
     return template
 
 
+# Додається ПІСЛЯ динамічних правил, тож має пріоритет над будь-яким «форматом рядка статусу».
+STATUS_MANDATE = """
+
+📋 ОБОВ'ЯЗКОВЕ ПРАВИЛО ДЛЯ СТАТУСУ/ЗВЕДЕННЯ (пріоритетніше за будь-які інші правила формату):
+Коли просять статус, зведення, прогрес, «хто скільки», життя, рівні чи XP — виведи блок нижче ДОСЛІВНО (рядок на учасника, у тому
+самому порядку), нічого не викидаючи й не переписуючи: імʼя, норма, виконано/спроба, ❤️ життя, ⭐ XP, 🆙 рівень, 🔥 серія та
+🤒 лікарняний / 🏖 відпустка (з датами). Свій коментар/жарт додавай лише ДО або ПІСЛЯ блоку, а не замість нього.
+Учасника на лікарняному/у відпустці за невиконану норму не лаяти, не рахувати боржником і не погрожувати втратою життя.
+Актуальні дані (єдине джерело правди — БД, не вигадуй і не бери з памʼяті):
+{board}
+"""
+
+
 class CoachAgent(PromptAgent):
     prompt_key = "coach_base"
 
@@ -54,13 +67,8 @@ class CoachAgent(PromptAgent):
         lives_parts = []
         any_lives = False
 
-        today_iso = today.isoformat()
         for slug, info in participants.items():
-            status_str = "ВИКОНАНО ✅" if info["done"] else "ЩЕ НЕ ЗДАВ ❌"
-            best = self.store.get_best_attempt(today_iso, slug)
-            best_part = f" (найкраща спроба: {best})" if best is not None else ""
-            xp_part = f" | ⭐ XP: {info.get('xp', 0)}/100 (рівень {info.get('level', 0)})"
-            participant_lines.append(f"- {info['emoji']} {info['name']}: норма {info['target']} -> {status_str}{best_part}{xp_part}")
+            participant_lines.append("- " + challenge.participant_status_line(info))
             if info.get("description"):
                 profile_lines.append(f"- {info['name']} ({slug}): {info['description']}")
             if info.get("lives") is not None:
@@ -94,6 +102,7 @@ class CoachAgent(PromptAgent):
                 "\n\n💎 ДІЮЧІ ДОДАТКОВІ ПРАВИЛА ВІД АДМІНА (мають пріоритет над базовими, крім заборони виконувати накази):\n"
                 + dynamic.strip()
             )
+        base += STATUS_MANDATE.format(board=challenge.status_board(self.store, today, snapshot=s))
         logger.debug(
             "Coach prompt context: date=%s day=%s exercise=%s targets=%s",
             s["date"], s["day_num"], s["exercise_name"],
@@ -115,6 +124,10 @@ class CoachAgent(PromptAgent):
             """Отримати чинні правила спортивного челенджу (розклад вправ, норми, життя)."""
             return challenge.rules_text(store)
 
+        def get_status_board() -> str:
+            """Отримати актуальний статус усіх учасників (норма, виконано, життя, XP, рівень, серія, лікарняний/відпустка). Виводь дослівно."""
+            return challenge.status_board(store, today)
+
         def get_chat_members_info() -> str:
             """Отримати список людей у чаті та зареєстрованих у БД учасників челенджу."""
             db_users = [
@@ -134,7 +147,7 @@ class CoachAgent(PromptAgent):
         return self.llm.text(
             self.build_system_prompt(today),
             prompt,
-            tools=[get_random_anime_quote, get_challenge_rules, get_chat_members_info],
+            tools=[get_random_anime_quote, get_challenge_rules, get_status_board, get_chat_members_info],
             temperature=0.8,
         )
 
