@@ -176,3 +176,65 @@ def _patched_init(orig):
         kw["poster"] = wake.post_webhook
         orig(self, store, **kw)
     return init
+
+
+@pytest.mark.asyncio
+async def test_leave_ops_idempotent(tmp_path):
+    client, store = await _client(tmp_path)
+    try:
+        _user(store, slug="dima")
+        # 1. set_leave
+        st, out = await _ops(
+            client,
+            op="set_leave",
+            key="t-leave-1",
+            params={
+                "slug": "dima",
+                "kind": "sick",
+                "start_date": "2026-10-26",
+                "end_date": "2026-10-30",
+                "set_by": "tester",
+                "reason": "cold",
+            },
+        )
+        assert st == 200 and out["status"] == "done"
+        rec = out["record"]["result"]["leave"]
+        assert rec["kind"] == "sick"
+        assert rec["start_date"] == "2026-10-26"
+        assert rec["end_date"] == "2026-10-30"
+
+        # Ідемпотентність: повторний виклик з тим же key
+        _, again = await _ops(
+            client,
+            op="set_leave",
+            key="t-leave-1",
+            params={"slug": "dima", "kind": "sick"},
+        )
+        assert again["status"] == "already_done"
+
+        # Перевіряємо в БД
+        assert store.get_leave_on("dima", "2026-10-27") is not None
+
+        # 2. end_leave
+        st, out_end = await _ops(
+            client,
+            op="end_leave",
+            key="t-leave-end-1",
+            params={"slug": "dima", "from_day": "2026-10-28", "ended_by": "tester"},
+        )
+        assert st == 200 and out_end["status"] == "done"
+        end_rec = out_end["record"]["result"]["leave"]
+        assert end_rec["end_date"] == "2026-10-27"
+        assert store.get_leave_on("dima", "2026-10-28") is None
+        assert store.get_leave_on("dima", "2026-10-27") is not None
+
+        # Ідемпотентність end_leave
+        _, again_end = await _ops(
+            client,
+            op="end_leave",
+            key="t-leave-end-1",
+            params={"slug": "dima", "from_day": "2026-10-28"},
+        )
+        assert again_end["status"] == "already_done"
+    finally:
+        await client.close()

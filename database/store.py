@@ -504,6 +504,21 @@ class Store:
                     reason      TEXT,
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS leaves (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_slug   TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    start_date  TEXT NOT NULL,
+                    end_date    TEXT,
+                    set_by      TEXT,
+                    reason      TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    ended_at    TIMESTAMP,
+                    ended_by    TEXT,
+                    cancelled   INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_leaves_user_start ON leaves(user_slug, start_date);
             """)
 
     # --- ADMIN TASKS (запити до розробника, яких не покривають вузькі адмін-тули) ---
@@ -1747,6 +1762,104 @@ class Store:
             {"key": r[0], "content": r[1], "version": r[2], "updated_by": r[3], "updated_at": r[4]}
             for r in rows
         ]
+
+    # --- LEAVES (відпустка / лікарняний) ---
+    _LEAVE_COLS = (
+        "id", "user_slug", "kind", "start_date", "end_date",
+        "set_by", "reason", "created_at", "ended_at", "ended_by", "cancelled"
+    )
+
+    def _leave_row(self, row) -> Optional[Dict[str, Any]]:
+        return dict(zip(self._LEAVE_COLS, row)) if row else None
+
+    def add_leave(
+        self,
+        slug: str,
+        kind: str,
+        start_date: str,
+        end_date: Optional[str] = None,
+        set_by: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> int:
+        with self._connect() as con:
+            cur = con.execute(
+                "INSERT INTO leaves (user_slug, kind, start_date, end_date, set_by, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (slug, kind, start_date, end_date, set_by, reason),
+            )
+            return int(cur.lastrowid)
+
+    def find_leave(
+        self,
+        slug: str,
+        kind: str,
+        start_date: str,
+        end_date: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        query = "SELECT " + ", ".join(self._LEAVE_COLS) + " FROM leaves WHERE user_slug = ? AND kind = ? AND start_date = ? AND cancelled = 0"
+        params: List[Any] = [slug, kind, start_date]
+        if end_date is None:
+            query += " AND end_date IS NULL"
+        else:
+            query += " AND end_date = ?"
+            params.append(end_date)
+        query += " ORDER BY id DESC LIMIT 1"
+        with self._connect() as con:
+            row = con.execute(query, tuple(params)).fetchone()
+        return self._leave_row(row)
+
+    def get_leave(self, leave_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT " + ", ".join(self._LEAVE_COLS) + " FROM leaves WHERE id = ?",
+                (int(leave_id),),
+            ).fetchone()
+        return self._leave_row(row)
+
+    def get_leave_on(self, slug: str, day_iso: str) -> Optional[Dict[str, Any]]:
+        query = (
+            "SELECT " + ", ".join(self._LEAVE_COLS) + " FROM leaves "
+            "WHERE user_slug = ? AND start_date <= ? AND (end_date IS NULL OR ? <= end_date) AND cancelled = 0 "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        with self._connect() as con:
+            row = con.execute(query, (slug, day_iso, day_iso)).fetchone()
+        return self._leave_row(row)
+
+    def list_leaves(
+        self,
+        slug: Optional[str] = None,
+        active_on: Optional[str] = None,
+        include_cancelled: bool = False,
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if slug:
+            clauses.append("user_slug = ?")
+            params.append(slug)
+        if active_on:
+            clauses.append("start_date <= ? AND (end_date IS NULL OR ? <= end_date)")
+            params.extend([active_on, active_on])
+        if not include_cancelled:
+            clauses.append("cancelled = 0")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"SELECT {', '.join(self._LEAVE_COLS)} FROM leaves{where} ORDER BY start_date DESC, id DESC"
+        with self._connect() as con:
+            rows = con.execute(query, tuple(params)).fetchall()
+        return [dict(zip(self._LEAVE_COLS, r)) for r in rows]
+
+    def update_leave_end(self, leave_id: int, end_date: Optional[str], ended_by: Optional[str] = None) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE leaves SET end_date = ?, ended_at = CURRENT_TIMESTAMP, ended_by = ? WHERE id = ?",
+                (end_date, ended_by, int(leave_id)),
+            )
+
+    def cancel_leave(self, leave_id: int, ended_by: Optional[str] = None) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE leaves SET cancelled = 1, ended_at = CURRENT_TIMESTAMP, ended_by = ? WHERE id = ?",
+                (ended_by, int(leave_id)),
+            )
 
 
 def _challenge_day_utc_bounds(date_str: str):

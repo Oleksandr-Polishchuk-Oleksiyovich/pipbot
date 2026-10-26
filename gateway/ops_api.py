@@ -286,6 +286,27 @@ def _op_wake_test(store, p: Dict[str, Any]) -> Dict[str, Any]:
     return {"fired": True, "accepted_2xx": accepted, "poll_age_before_s": None if age_before is None else round(age_before, 1)}
 
 
+def _op_set_leave(store, p: Dict[str, Any]) -> Dict[str, Any]:
+    from core.leave import set_leave
+    slug = str(p["slug"])
+    kind = str(p["kind"])
+    start_date = p.get("start_date") or None
+    end_date = p.get("end_date") or None
+    set_by = p.get("set_by") or "ops"
+    reason = p.get("reason") or None
+    leave = set_leave(store, slug, kind, start=start_date, end=end_date, set_by=set_by, reason=reason)
+    return {"slug": slug, "leave": leave}
+
+
+def _op_end_leave(store, p: Dict[str, Any]) -> Dict[str, Any]:
+    from core.leave import end_leave
+    slug = str(p["slug"])
+    from_day = p.get("from_day") or None
+    ended_by = p.get("ended_by") or "ops"
+    leave = end_leave(store, slug, from_day=from_day, ended_by=ended_by)
+    return {"slug": slug, "leave": leave}
+
+
 def _run_op(store, op: str, key: str, params: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
     if op == "cv_cleanup":
         return _op_cv_cleanup(store, params, dry_run)
@@ -301,6 +322,10 @@ def _run_op(store, op: str, key: str, params: Dict[str, Any], dry_run: bool) -> 
         return _op_wake_test(store, params)
     if op == "admin_task_add":
         return _op_admin_task_add(store, params)
+    if op == "set_leave":
+        return _op_set_leave(store, params)
+    if op == "end_leave":
+        return _op_end_leave(store, params)
     raise ValueError(f"unknown op {op}")
 
 

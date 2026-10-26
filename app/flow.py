@@ -1383,7 +1383,14 @@ class ChatFlow:
         missing_str = [f"{p[m]['emoji']} {p[m]['name']} (`{targets[m]}` {ex['genitive']})" for m in missing if m in p]
 
         if job == "morning":
-            norms_lines = "\n".join(f"{meta['emoji']} {meta['name']}: `{targets[slug]}`" for slug, meta in p.items())
+            from core.leave import leave_on
+            def _norm_entry(slug, meta):
+                lv = leave_on(self.store, slug, today)
+                if lv:
+                    mark = "🏖 у відпустці" if lv["kind"] == "vacation" else "🤒 на лікарняному"
+                    return f"{meta['emoji']} {meta['name']}: `{targets[slug]}` ({mark})"
+                return f"{meta['emoji']} {meta['name']}: `{targets[slug]}`"
+            norms_lines = "\n".join(_norm_entry(slug, meta) for slug, meta in p.items())
             text = (f"☀️ **День {challenge.day_index(today) + 1} ({today.strftime('%d.%m.%Y')})**\n\n"
                     f"{ex['emoji']} **Сьогодні {ex['name'].upper()}!**\n\n"
                     f"🎯 **Норма на сьогодні:**\n{norms_lines}\n\n"
@@ -1408,15 +1415,26 @@ class ChatFlow:
 
     async def _settle_lives(self, chat_id: int, day) -> None:
         # 1) мінус життя за незакритий день; 2) прогресія (норма/XP/рівні) — левел-ап відновлює життя.
+        from core.leave import leave_on
         changed = challenge.settle_missed_day(self.store, day)
         try:
             prog = progression.settle_progression(self.store, day)
         except Exception as e:
             logger.exception("Progression settlement failed for %s: %s", day, e)
             prog = {}
-        if not changed and not prog:
-            return
         pmap = challenge.participants_map(self.store)
+        skipped_leaves = []
+        for slug in pmap:
+            lv = leave_on(self.store, slug, day)
+            if lv and slug not in prog:
+                meta = pmap.get(slug, {})
+                name = meta.get("name", slug)
+                if lv["kind"] == "sick":
+                    skipped_leaves.append(f"🤒 {name} на лікарняному — життя й норма без змін")
+                else:
+                    skipped_leaves.append(f"🏖 {name} у відпустці — життя й норма без змін")
+        if not changed and not prog and not skipped_leaves:
+            return
         text = f"⚰️ **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n"
         if changed:
             lines = [
@@ -1424,6 +1442,8 @@ class ChatFlow:
                 for p, v in changed.items()
             ]
             text += "\n" + "\n".join(lines)
+        if skipped_leaves:
+            text += "\n" + "\n".join(skipped_leaves)
         if prog:
             plines, ups = [], []
             for slug, r in prog.items():

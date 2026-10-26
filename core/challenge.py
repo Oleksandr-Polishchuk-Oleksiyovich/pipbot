@@ -331,8 +331,20 @@ def status_snapshot(store: Store, day: date) -> Dict:
     lives = get_lives(store)
     max_lives = get_max_lives(store)
     exercise = day_exercise(store, day)
-    participants_info = {
-        u.slug: {
+    participants_info = {}
+    day_iso = day.isoformat()
+    for u in users:
+        leave_rec = store.get_leave_on(u.slug, day_iso)
+        leave_info = (
+            {
+                "kind": leave_rec["kind"],
+                "until": leave_rec["end_date"],
+                "set_by": leave_rec.get("set_by"),
+            }
+            if leave_rec
+            else None
+        )
+        participants_info[u.slug] = {
             "name": u.display_name,
             "telegram_name": u.telegram_name,
             "emoji": u.emoji,
@@ -344,9 +356,8 @@ def status_snapshot(store: Store, day: date) -> Dict:
             "max_lives": max_lives.get(u.slug),
             "xp": store.get_xp(u.slug)[0],
             "level": store.get_xp(u.slug)[1],
+            "leave": leave_info,
         }
-        for u in users
-    }
     return {
         "exercise": exercise,
         "exercise_name": EXERCISES[exercise]["name"],
@@ -377,7 +388,24 @@ def status_text(store: Store, day: date) -> str:
     s = status_snapshot(store, day)
     lines = [f"Дата: {s['date']} (День {s['day_num']} челенджу). Вправа дня: {s['exercise_name'].upper()}."]
     for slug, info in s["participants"].items():
-        mark = "ВИКОНАНО ✅" if info["done"] else "НЕ виконано ❌"
+        if info["done"]:
+            mark = "ВИКОНАНО ✅"
+        elif info.get("leave"):
+            kind = info["leave"]["kind"]
+            until = info["leave"].get("until")
+            until_str = ""
+            if until:
+                try:
+                    d_until = date.fromisoformat(str(until)[:10])
+                    until_str = f" (до {d_until.strftime('%d.%m')})"
+                except Exception:
+                    until_str = f" (до {until})"
+            if kind == "sick":
+                mark = f"🤒 на лікарняному{until_str}"
+            else:
+                mark = f"🏖 у відпустці{until_str}"
+        else:
+            mark = "НЕ виконано ❌"
         lives = info["lives"]
         max_l = info["max_lives"]
         if lives is not None:
@@ -391,7 +419,10 @@ def status_text(store: Store, day: date) -> str:
 
 def missing_participants(store: Store, day: date) -> List[str]:
     s = status_snapshot(store, day)
-    return [slug for slug, done in s["done"].items() if not done]
+    return [
+        slug for slug, done in s["done"].items()
+        if not done and not s["participants"].get(slug, {}).get("leave")
+    ]
 
 
 def settle_missed_day(store: Store, day: date) -> Dict[str, int]:
@@ -413,6 +444,8 @@ def settle_missed_day(store: Store, day: date) -> Dict[str, int]:
             continue
         cur_lives = lives.get(u.slug)
         if cur_lives is not None and not done.get(u.slug, False):
+            if store.get_leave_on(u.slug, day_iso):
+                continue
             new_val = max(0, cur_lives - 1)
             changed[u.slug] = new_val
             set_user_lives(store, u.slug, new_val)

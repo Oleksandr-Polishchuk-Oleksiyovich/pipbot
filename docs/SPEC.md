@@ -110,6 +110,7 @@ optionToConsider/        старі плани/дослідження (див. R
 | `admin_audit` | Аудит адмін-запитів |
 | `pending_replies` | Відповіді, що мають піти після рестарту/збою |
 | `offload_requests` | Legacy-журнал webhook-офлоаду |
+| `leaves` | Відпустки та лікарняні (`user_slug`, `kind`: sick/vacation, `start_date`, `end_date`, `set_by`, `reason`, `cancelled`) |
 | `schema_version` | Застосовані міграції |
 
 Міграції: `python -m database.migrate --db <path>`, policy expand-only, онлайн-бекап перед застосуванням.
@@ -143,7 +144,7 @@ optionToConsider/        старі плани/дослідження (див. R
 | `GET /cv/jobs/{rid}/video` | box CV worker | байти відео (gateway сам качав із Telegram — box не знає `BOT_TOKEN`) |
 | `POST /cv/jobs/{rid}/result` | box CV worker | `{claim_token, ok, result, error}` |
 | `GET /admin/diag` | `tools/vm_diag.py` | read-only знімок VM: cv_jobs/video_checks/daily_attempts/users/XP + хвіст логів із редакцією секретів |
-| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test` |
+| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test`, `set_leave`, `end_leave` |
 | `GET /cv/worker_status` | box CLI, діагностика | `last_poll_age_s`, `queued`, `claimed`, `worker_polling`, `wake_configured` (будь-який `/cv/claim`, зокрема порожній long-poll, оновлює `bot_state: cv_last_poll_ts`) |
 | `POST /admin/secrets/wake`, `GET /admin/secrets/wake` | `tools/set_wake_webhook.py` | зберегти URL/ключ вебхука пробудження (лише https, файл 0600; значення не логуються й не повертаються) / `{configured}` |
 | `GET /admin_tasks`, `GET /admin_tasks/claim`, `POST /admin_tasks/{id}/result` | box (worker, CLI) | список / long-poll claim / результат (`done_pending_deploy` + `fix_commit` або `rejected`) |
@@ -175,3 +176,22 @@ Lease CV: claimed без результату довше `CV_LEASE_S` (300 с) �
     подвійного нарахування немає. Диспути працюють після відповіді бота і для відео, зарахованого раніше того ж дня челенджу;
     для вже підсумованого дня — ні (потрібен відкат XP);
   - `TRUST_MODE=0` повертає стару CV-поведінку (`ReportJudgeAgent.judge_video_fact`).
+
+## 9. Відпустка/лікарняний (leaves)
+
+- **Таблиця:** `leaves` (`id`, `user_slug`, `kind`: `'sick'`|`'vacation'`, `start_date`, `end_date` [включно, NULL = безстроково], `set_by`, `reason`, `created_at`, `ended_at`, `ended_by`, `cancelled`).
+- **Тули:**
+  - Адмін-тули: `set_leave(participant, kind, start_date='', end_date='', reason='')`, `end_leave(participant, from_date='')`, `list_leaves()`.
+  - Gateway ops: `set_leave`, `end_leave` (ідемпотентні за `key`).
+- **Правила активності:**
+  - Запис активний у день `D`, якщо `start_date <= D` і (`end_date IS NULL` або `D <= end_date`) і `cancelled = 0`.
+  - Оголосити може сам учасник або будь-хто інший (вказується у `set_by`).
+  - При перетині з новою `set_leave` стара активна автоматично обрізається (`end_date = start_new - 1`) або скасовується, якщо ще не почалась.
+- **Вплив на розрахунок і статус:**
+  - `missing_participants` не включає учасника на лікарняному/у відпустці; нагадування (timers) його не згадують серед тих, хто заборгував;
+  - `settle_missed_day` **не знімає** життя за дні активного лікарняного чи відпустки;
+  - `settle_progression` для такого дня, якщо день не зараховано (`credited=False`), повністю пропускає учасника: норма не спадає, XP/рівень/життя не змінюються; якщо учасник виконав норму під час відпустки сам — нараховується звичайний прогрес;
+  - `status_snapshot` додає для учасника поле `leave = {"kind", "until", "set_by"}` або `None`;
+  - `status_text` виводить `🤒 на лікарняному (до DD.MM)` або `🏖 у відпустці (до DD.MM)` замість `НЕ виконано ❌`;
+  - підсумок дня (`flow._settle_lives`) додає рядки `🤒 {name} на лікарняному — життя й норма без змін` / `🏖 {name} у відпустці — життя й норма без змін` для тих, кого пропущено;
+  - завершення: автоматично за `end_date` або викликом `end_leave` (встановлює `end_date = from_day - 1 день`).

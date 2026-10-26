@@ -89,6 +89,8 @@ def settle_progression(store: Store, day: date) -> Dict[str, Dict]:
             continue
         target = targets[u.slug]
         credited = bool(done.get(u.slug, False))
+        if not credited and store.get_leave_on(u.slug, day_iso):
+            continue
         best = store.get_best_attempt(day_iso, u.slug)
         if best is None:
             best = _best_from_video_checks(store, u.slug, day, exercise)

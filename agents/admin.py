@@ -490,11 +490,72 @@ class AdminAgent(PromptAgent):
             actions.append("list_bot_texts()")
             return json.dumps(store.list_bot_texts(), ensure_ascii=False)
 
+        def set_leave(
+            participant: str,
+            kind: str,
+            start_date: str = "",
+            end_date: str = "",
+            reason: str = "",
+        ) -> str:
+            """
+            Встановити відпустку або лікарняний учаснику.
+            :param participant: slug або ім'я учасника.
+            :param kind: 'sick' (лікарняний, хвороба) або 'vacation' (відпустка).
+            :param start_date: дата початку YYYY-MM-DD (порожньо — сьогодні).
+            :param end_date: дата закінчення YYYY-MM-DD включно (порожньо — безстроково до end_leave).
+            :param reason: причина (опціонально).
+            """
+            from core.leave import describe, set_leave as core_set_leave
+            p = challenge.normalize_participant(participant, store)
+            if not p:
+                return f"Помилка: невідомий учасник '{participant}'."
+            st_d = start_date or today.isoformat()
+            try:
+                rec = core_set_leave(
+                    store,
+                    p,
+                    kind,
+                    start=st_d,
+                    end=end_date or None,
+                    set_by=author,
+                    reason=reason or None,
+                )
+            except ValueError as e:
+                return f"Помилка: {e}"
+            actions.append(f"set_leave({p}, {rec.get('kind')}, {rec.get('start_date')}, {rec.get('end_date')})")
+            return f"Встановлено статус для {p}: {describe(rec)}."
+
+        def end_leave(participant: str, from_date: str = "") -> str:
+            """
+            Завершити відпустку або лікарняний учасника.
+            :param participant: slug або ім'я учасника.
+            :param from_date: дата з якої норма знову діє YYYY-MM-DD (порожньо — сьогодні).
+            """
+            from core.leave import end_leave as core_end_leave
+            p = challenge.normalize_participant(participant, store)
+            if not p:
+                return f"Помилка: невідомий учасник '{participant}'."
+            from_d = from_date or today.isoformat()
+            try:
+                rec = core_end_leave(store, p, from_day=from_d, ended_by=author)
+            except ValueError as e:
+                return f"Помилка: {e}"
+            actions.append(f"end_leave({p}, {from_d})")
+            if rec.get("status") == "no_active_leave":
+                return f"Учасник {p} не має активної відпустки чи лікарняного."
+            return f"Відпустку/лікарняний для {p} завершено з {from_d} (сьогодні норма знову діє)."
+
+        def list_leaves() -> str:
+            """Отримати всі активні та заплановані відпустки й лікарняні (leaves)."""
+            actions.append("list_leaves()")
+            return json.dumps(store.list_leaves(include_cancelled=False), ensure_ascii=False)
+
         return [
             _logged_tool(t) for t in (
                 set_lives, set_targets, set_schedule, swap_today_exercise, recount_reps, set_progress, update_user_profile,
                 get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
                 set_bot_text, list_bot_texts, create_admin_task,
+                set_leave, end_leave, list_leaves,
             )
         ]
 
