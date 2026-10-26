@@ -121,6 +121,7 @@ sudo -u sportnerd /usr/local/bin/sportnerd-deploy.sh origin/main
 **Поточний стан (актуально):**
 * [docs/SPEC.md](docs/SPEC.md) — специфікація застосунку: що де працює (Telegram / VM / box / GitHub / Grok Bot), компоненти, карта репозиторію, таблиці БД, конфіги, gateway, правила челенджу (прогресія, XP, trust-режим, межа дня 02:30).
 * [docs/FLOWS.md](docs/FLOWS.md) — потоки з mermaid-діаграмами й таблицями кроків: звичайне повідомлення, адмін-режим, відеозвіт (з диспутами), патч і деплой.
+* [docs/SPEC_VM_BOX_INTERACTION.md](docs/SPEC_VM_BOX_INTERACTION.md) — нормативна специфікація взаємодії VM ↔ box: пробудження box, черги `cv_jobs`/`admin_tasks`, lease/ретраї/ідемпотентність, станові машини та діаграми послідовності, таблиця відповідності вимог (R1–R8), збої, прогалини й суперечності.
 * [docs/RUNBOOK.md](docs/RUNBOOK.md) — експлуатація: деплой, відкат, бекап і відновлення.
 * [deploy/README.md](deploy/README.md) — розгортання VM: gateway, Caddy, autodeploy, скрипти.
 * [skills/admin_dev.md](skills/admin_dev.md) — інструкція агента розробки на box (admin_dev).

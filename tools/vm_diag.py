@@ -28,7 +28,7 @@ def main(argv=None) -> int:
     if not url:
         raise SystemExit("CV_GATEWAY_URL is not set")
     client = AdminTasksClient(url, load_secret())
-    code, data = client._request("GET", f"/admin/diag?since_days={args.since_days}&log_lines={args.log_lines}")
+    code, data = client._request("GET", "/admin/diag", {"since_days": str(args.since_days), "log_lines": str(args.log_lines)})
     if code != 200:
         print(json.dumps({"http": code}))
         return 1

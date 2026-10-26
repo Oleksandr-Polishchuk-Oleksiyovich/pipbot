@@ -113,6 +113,9 @@ sequenceDiagram
 
 ## C. Відеозвіт
 
+> Нормативні деталі черги `cv_jobs`, пробудження box, lease/ретраїв, ідемпотентності результату й збоїв — у
+> [`SPEC_VM_BOX_INTERACTION.md`](SPEC_VM_BOX_INTERACTION.md).
+
 ```mermaid
 sequenceDiagram
   actor U as Учасник

@@ -26,11 +26,22 @@ ensure_venv() {
 }
 child=""
 trap '[ -n "$child" ] && kill "$child" 2>/dev/null; rm -f "$PIDFILE"; exit 0' TERM INT
+backoff=5
 while true; do
     ensure_venv
+    started=$(date +%s)
     "$PY" -m tools.admin_tasks_worker >>"$LOG.stderr" 2>&1 &
     child=$!
     wait "$child"
-    echo "$(date -Is) admin_tasks_worker exited ($?), restarting in 5s" >>"$LOG"
-    sleep 5
+    rc=$?
+    ran=$(( $(date +%s) - started ))
+    if [ "$rc" -eq 78 ]; then
+        echo "$(date -Is) admin_tasks_worker: CONFIG ERROR (exit 78, see log above); supervisor stops, fix env/.env and restart" >>"$LOG"
+        echo "admin_tasks_worker: CONFIG ERROR (CV_GATEWAY_URL/secret missing); see $LOG" >&2
+        rm -f "$PIDFILE"; exit 78
+    fi
+    # швидкий збій (<30 с) -> експоненційний backoff до 300 с; довга робота -> скидання
+    if [ "$ran" -lt 30 ]; then backoff=$(( backoff * 2 > 300 ? 300 : backoff * 2 )); else backoff=5; fi
+    echo "$(date -Is) admin_tasks_worker exited (rc=$rc after ${ran}s), restarting in ${backoff}s" >>"$LOG"
+    sleep "$backoff"
 done

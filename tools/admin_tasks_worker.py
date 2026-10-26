@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cv_worker.box_worker import load_secret  # noqa: E402  (also loads .env)
+from cv_worker.box_worker import EX_CONFIG, load_env, load_secret  # noqa: E402  (also loads .env)
 from tools.admin_tasks import AdminTasksClient  # noqa: E402
 
 logger = logging.getLogger("admin_tasks_worker")
@@ -148,10 +148,12 @@ def setup_logging() -> None:
 
 def main() -> None:
     setup_logging()
+    load_env()
     secret = load_secret()
     url = os.getenv("CV_GATEWAY_URL", "")
     if not url:
-        raise SystemExit("CV_GATEWAY_URL is not set")
+        logger.error("CONFIG ERROR: CV_GATEWAY_URL is not set (neither in the environment nor in .env)")
+        sys.exit(EX_CONFIG)
     worker = AdminTasksWorker(AdminTasksClient(url, secret))
 
     def _stop(*_):

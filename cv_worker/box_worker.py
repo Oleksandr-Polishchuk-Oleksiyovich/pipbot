@@ -34,15 +34,39 @@ CLAIM_HTTP_TIMEOUT_S = 40  # > серверних ~25 с long-poll
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+EX_CONFIG = 78  # sysexits EX_CONFIG: помилка конфігурації; supervisor не рестартить у циклі
+
+
+def load_env() -> None:
+    """Підвантажити <repo>/.env (або CV_ENV_FILE) у os.environ НЕЗАЛЕЖНО від середовища викликача.
+    Існуючі змінні середовища мають пріоритет (override=False). Без python-dotenv — мінімальний парсер."""
+    env_file = os.getenv("CV_ENV_FILE", os.path.join(REPO_DIR, ".env"))
+    if not os.path.isfile(env_file):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=False)
+        return
+    except ImportError:
+        pass
+    with open(env_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k.startswith("export "):
+                k = k[7:].strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            os.environ.setdefault(k, v)
+
+
 def load_secret() -> str:
     name = os.getenv("CV_HMAC_SECRET_ENV", "GATEWAY_HMAC_SECRET")
-    env_file = os.getenv("CV_ENV_FILE", os.path.join(REPO_DIR, ".env"))
-    if not os.getenv(name) and os.path.isfile(env_file):
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_file, override=False)
-        except ImportError:
-            pass
+    load_env()
     secret = os.getenv(name, "")
     if not secret:
         raise RuntimeError(f"HMAC secret env var {name} is not set")
@@ -228,9 +252,11 @@ class BoxCVWorker:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    load_env()
     url = os.getenv("CV_GATEWAY_URL", "")
     if not url:
-        raise SystemExit("CV_GATEWAY_URL is not set")
+        logger.error("CONFIG ERROR: CV_GATEWAY_URL is not set (neither in the environment nor in .env)")
+        sys.exit(EX_CONFIG)
     if os.getenv("CV_HEAVY", "1") != "0" and not shutil.which(os.getenv("CV_HEAVY_BIN", "heavy")):
         raise SystemExit("`heavy` not found on PATH: CV jobs must run through the box heavy lock")
     BoxCVWorker(GatewayClient(url, load_secret())).run()
