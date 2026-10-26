@@ -137,6 +137,12 @@ async def handle_diag(request: web.Request) -> web.Response:
             logs[f"journal:{unit}"] = j if j is not None else "unavailable"
         return logs
     data["logs"] = await asyncio.to_thread(_logs) if log_lines else {}
+    if q.get("host", "1") != "0":
+        try:
+            from gateway.host_info import host_snapshot
+            data["host"] = await asyncio.to_thread(host_snapshot)
+        except Exception as e:  # noqa: BLE001
+            data["host"] = {"error": f"{type(e).__name__}: {e}"[:200]}
     return web.json_response(data, dumps=lambda o: __import__("json").dumps(o, ensure_ascii=False, default=str))
 
 
