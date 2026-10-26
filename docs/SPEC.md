@@ -140,6 +140,8 @@ optionToConsider/        старі плани/дослідження (див. R
 | `POST /cv/claim` | box CV worker | long-poll (до `CV_CLAIM_WAIT_S`=25 с): 200 job або 204 |
 | `GET /cv/jobs/{rid}/video` | box CV worker | байти відео (gateway сам качав із Telegram — box не знає `BOT_TOKEN`) |
 | `POST /cv/jobs/{rid}/result` | box CV worker | `{claim_token, ok, result, error}` |
+| `GET /admin/diag` | `tools/vm_diag.py` | read-only знімок VM: cv_jobs/video_checks/daily_attempts/users/XP + хвіст логів із редакцією секретів |
+| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test` |
 | `GET /cv/worker_status` | box CLI, діагностика | `last_poll_age_s`, `queued`, `claimed`, `worker_polling`, `wake_configured` (будь-який `/cv/claim`, зокрема порожній long-poll, оновлює `bot_state: cv_last_poll_ts`) |
 | `POST /admin/secrets/wake`, `GET /admin/secrets/wake` | `tools/set_wake_webhook.py` | зберегти URL/ключ вебхука пробудження (лише https, файл 0600; значення не логуються й не повертаються) / `{configured}` |
 | `GET /admin_tasks`, `GET /admin_tasks/claim`, `POST /admin_tasks/{id}/result` | box (worker, CLI) | список / long-poll claim / результат (`done_pending_deploy` + `fix_commit` або `rejected`) |

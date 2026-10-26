@@ -260,6 +260,18 @@ class ChatFlow:
         """Поточний ДЕНЬ ЧЕЛЕНДЖУ (не календарна дата): до межі rollover (02:30) ще триває попередній день."""
         return dayroll.challenge_date(self.now(), *self.rollover)
 
+    def _video_day(self, check):
+        """
+        ДЕНЬ ЧЕЛЕНДЖУ, до якого належить відео (за часом його надходження, а не обробки): якщо результат прийшов
+        після rollover (чергу затримало), спроба все одно зараховується дню, коли відео надіслали.
+        """
+        try:
+            utc_dt = datetime.strptime((check.created_at or "").split(".")[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
+            vday = dayroll.challenge_date(utc_dt.astimezone(TIMEZONE), *self.rollover)
+        except Exception:
+            return self._today()
+        return min(vday, self._today())  # відео не може належати майбутньому дню
+
     def _yesterday_cutoff(self) -> str:
         return (self.now() - timedelta(days=1)).strftime("%Y-%m-%d 23:55:00")
 
@@ -423,7 +435,7 @@ class ChatFlow:
         if self.trust_mode:
             return await self._handle_video_callback_trust(check, request_id)
 
-        today = self._today()
+        today = self._video_day(check)
         user_slug = check.user_slug or "lyosha"
         targets = challenge.day_targets(self.store, today)
         target = targets.get(user_slug, 10)
@@ -494,7 +506,7 @@ class ChatFlow:
         return reply_text
 
     async def _handle_video_callback_trust(self, check, request_id: str) -> Optional[str]:
-        today = self._today()
+        today = self._video_day(check)
         today_iso = today.isoformat()
         user_slug = check.user_slug or "lyosha"
 
