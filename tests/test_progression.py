@@ -198,3 +198,26 @@ def test_manual_recount_reps_overrides_attempt_and_video_check(tmp_path):
     assert "⭐ 9/100 XP" in coach_prompt and "🆙 рів. 0" in coach_prompt
     assert "виконано (41)" in coach_prompt
     assert RouterAgent.classify_admin_tier("перезарахуй Льоші 41 повтор за відео") == "quick"
+
+
+@pytest.mark.asyncio
+async def test_settlement_header_has_no_coffin(tmp_path):
+    st = _store(tmp_path)
+    sender = FakeSender()
+    flow = ChatFlow(st, None, sender, now=Clock(NOW + timedelta(days=1)))
+    st.set_done("lyosha", True, D.isoformat())
+    await flow._settle_lives(-1, D)
+    text = sender.texts[-1]
+    assert text.startswith("📊 **Розрахунок за")
+    assert "⚰" not in text and "🪦" not in text
+
+
+def test_no_coffin_icons_in_user_facing_sources():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    banned = ("\u26b0", "\U0001faa6")
+    files = [root / "prompts.py", root / "bot.py"]
+    for d in ("app", "core", "agents", "migrations", "database", "gateway"):
+        files += (root / d).rglob("*.py")
+    bad = [str(f.relative_to(root)) for f in files if any(b in f.read_text(encoding="utf-8") for b in banned)]
+    assert not bad, bad

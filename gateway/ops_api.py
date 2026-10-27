@@ -94,6 +94,16 @@ def snapshot(store, since_days: int, date_iso: Optional[str], log_lines: int) ->
         marks = ",".join("?" for _ in _STATE_ALLOW)
         out["bot_state"] = {r["key"]: r["value"] for r in _rows(con, f"SELECT key, value FROM bot_state WHERE key IN ({marks}) "
                                                                       "OR key LIKE 'ops:%' OR key LIKE 'video_credit:%' OR key LIKE 'autodeploy%'", _STATE_ALLOW)}
+        # Де в БД лишилися заборонені іконки (труна/надгробок): лише ключі, без вмісту.
+        banned = ("\u26b0", "\U0001faa6")
+        scan: Dict[str, List[str]] = {"prompts": [], "bot_texts": []}
+        for r in _rows(con, "SELECT key, content FROM prompts"):
+            if any(b in (r["content"] or "") for b in banned):
+                scan["prompts"].append(r["key"])
+        for r in _rows(con, "SELECT key, text, variants FROM bot_texts"):
+            if any(b in ((r["text"] or "") + (r["variants"] or "")) for b in banned):
+                scan["bot_texts"].append(r["key"])
+        out["banned_icons_in_db"] = scan
         if date_iso:
             out["day"] = date_iso
     # Той самий детермінований статус, що йде в /status і в промпт коуча (read-only, без повідомлень у чат).

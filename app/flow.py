@@ -1428,7 +1428,7 @@ class ChatFlow:
                     skipped_leaves.append(f"🏖 {name} у відпустці — життя й норма без змін")
         if not changed and not prog and not skipped_leaves:
             return
-        text = f"⚰️ **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n"
+        text = f"📊 **Розрахунок за {day.strftime('%d.%m.%Y')}:**\n"
         if changed:
             lines = [
                 f"💔 **{pmap.get(p, {}).get('name', p)}** втрачає життя → залишилось **{v}** ❤️"

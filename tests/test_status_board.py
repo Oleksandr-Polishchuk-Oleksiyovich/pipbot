@@ -100,3 +100,11 @@ def test_diag_snapshot_exposes_status_board(tmp_path):
     assert "status_board_error" not in out, out.get("status_board_error")
     assert any("🤒" in l and "⭐" in l and "🆙" in l for l in out["status_board"])
     assert out["leaves"][0]["set_by"] == "owner"
+
+
+def test_diag_reports_banned_icons_in_db(tmp_path):
+    from gateway.ops_api import snapshot
+    st, _ = _setup(tmp_path)
+    st.save_prompt("coach_dynamic", "правило \u26b0", "test")
+    out = snapshot(st, 3, None, 0)
+    assert "coach_dynamic" in out["banned_icons_in_db"]["prompts"]
