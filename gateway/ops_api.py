@@ -104,6 +104,13 @@ def snapshot(store, since_days: int, date_iso: Optional[str], log_lines: int) ->
             if any(b in ((r["text"] or "") + (r["variants"] or "")) for b in banned):
                 scan["bot_texts"].append(r["key"])
         out["banned_icons_in_db"] = scan
+        if _has(con, "chat_history"):
+            # Останні повідомлення чату (read-only, текст урізано й проходить redact) — для розбору суперечок про залік.
+            hist = _rows(con, "SELECT id, user_name, role, text, created_at FROM chat_history "
+                              "WHERE created_at >= ? ORDER BY id DESC LIMIT 120", (since,))
+            for h in hist:
+                h["text"] = redact((h["text"] or "")[:400])
+            out["chat_history_recent"] = list(reversed(hist))
         if date_iso:
             out["day"] = date_iso
     # Той самий детермінований статус, що йде в /status і в промпт коуча (read-only, без повідомлень у чат).
