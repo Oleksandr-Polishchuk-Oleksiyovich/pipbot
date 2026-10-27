@@ -238,3 +238,78 @@ async def test_leave_ops_idempotent(tmp_path):
         assert again_end["status"] == "already_done"
     finally:
         await client.close()
+
+
+def _dima_settled_state(store, lives=7, max_lives=7, xp=2, level=2):
+    """Стан Діми після розрахунку 26.10: best=50 (замість 23), +89 XP, левел-ап 1->2, next pushups 29."""
+    _user(store, slug="kovdimay", lives=lives, max_lives=max_lives)
+    store.set_attempt("2026-10-26", "kovdimay", "pushups", 50)
+    store.set_done("kovdimay", True, "2026-10-26")
+    store.set_xp("kovdimay", xp, level)
+    store.add_xp_log("2026-10-26", "kovdimay", 89, "target=6 best=50 credited=True")
+    store.set_next_norm("kovdimay", "pushups", 29, "2026-10-27", "2026-10-26")
+    store.set_state("progression_settled_through", "2026-10-26")
+    store.set_state("video_credit:rid-dima", json.dumps({"reps": 50, "ex": "pushups", "disputed": True}))
+
+
+_FIX23 = {"slug": "kovdimay", "date": "2026-10-26", "exercise": "pushups", "reps": 23, "request_id": "rid-dima"}
+
+
+@pytest.mark.asyncio
+async def test_correct_settlement_dima_dry_run_then_apply_idempotent(tmp_path):
+    client, store = await _client(tmp_path)
+    try:
+        _dima_settled_state(store)
+        st, out = await _ops(client, op="correct_settlement", key="fix-dry", params=_FIX23, dry_run=True)
+        assert st == 200 and out["status"] == "dry_run"
+        plan = out["result"]
+        assert plan["before"]["xp"] == 2 and plan["before"]["level"] == 2 and plan["before"]["next_norm"] == 29
+        assert plan["after"] == {"attempt": 23, "done": True, "settle_xp_gain": 35, "xp": 48, "level": 1,
+                                 "lives": 6, "max_lives": 6, "next_norm": 15}
+        assert plan["xp_log_delta"] == -54
+        assert store.get_best_attempt("2026-10-26", "kovdimay") == 50      # dry-run нічого не міняє
+        assert store.get_xp("kovdimay") == (2, 2)
+
+        st, out = await _ops(client, op="correct_settlement", key="ops-fix23", params=_FIX23)
+        assert st == 200 and out["status"] == "done"
+        assert store.get_best_attempt("2026-10-26", "kovdimay") == 23
+        assert store.get_day_progress("2026-10-26")["kovdimay"] is True
+        assert store.get_xp("kovdimay") == (48, 1)
+        u = store.get_user("kovdimay")
+        assert (u.lives, u.max_lives) == (6, 6)
+        assert store.get_next_norm("kovdimay", "pushups") == (15, "2026-10-27")
+        assert json.loads(store.get_state("video_credit:rid-dima", "")) == {"reps": 23, "ex": "pushups", "disputed": True}
+        with store._connect() as con:
+            rows = con.execute("SELECT delta, reason FROM xp_log WHERE user_slug='kovdimay' ORDER BY id").fetchall()
+        assert [r[0] for r in rows] == [89, -54] and rows[1][1].startswith("correction-settlement")
+
+        # той самий key -> already_done; інший key -> noop за станом (XP не зсувається вдруге)
+        st, out = await _ops(client, op="correct_settlement", key="ops-fix23", params=_FIX23)
+        assert out["status"] == "already_done"
+        st, out = await _ops(client, op="correct_settlement", key="ops-fix23-again", params=_FIX23)
+        assert out["status"] == "done" and out["record"]["result"]["noop"] is True
+        assert store.get_xp("kovdimay") == (48, 1)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_correct_settlement_guards(tmp_path):
+    client, store = await _client(tmp_path)
+    try:
+        _dima_settled_state(store)
+        # день ще не розраховано -> помилка
+        store.set_state("progression_settled_through", "2026-10-25")
+        st, out = await _ops(client, op="correct_settlement", key="ops-g1", params=_FIX23)
+        assert st == 422 and "not settled" in out["error"]
+        store.set_state("progression_settled_through", "2026-10-26")
+        # next_norms уже перезаписано пізнішим розрахунком -> не чіпаємо
+        store.set_next_norm("kovdimay", "pushups", 40, "2026-10-29", "2026-10-28")
+        st, out = await _ops(client, op="correct_settlement", key="ops-g2", params=_FIX23)
+        assert out["status"] == "done" and out["record"]["result"]["next_norm_updated"] is False
+        assert store.get_next_norm("kovdimay", "pushups") == (40, "2026-10-29")
+        # погана вправа
+        st, out = await _ops(client, op="correct_settlement", key="ops-g3", params={**_FIX23, "exercise": "планка"})
+        assert st == 422
+    finally:
+        await client.close()

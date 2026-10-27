@@ -144,7 +144,7 @@ optionToConsider/        старі плани/дослідження (див. R
 | `GET /cv/jobs/{rid}/video` | box CV worker | байти відео (gateway сам качав із Telegram — box не знає `BOT_TOKEN`) |
 | `POST /cv/jobs/{rid}/result` | box CV worker | `{claim_token, ok, result, error}` |
 | `GET /admin/diag` | `tools/vm_diag.py` | read-only знімок VM: cv_jobs/video_checks/daily_attempts/users/XP + хвіст логів із редакцією секретів |
-| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test`, `set_leave`, `end_leave` |
+| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test`, `set_leave`, `end_leave`, `correct_settlement` (виправлення вже проведеного розрахунку дня; `dry_run` дає план before/after) |
 | `GET /cv/worker_status` | box CLI, діагностика | `last_poll_age_s`, `queued`, `claimed`, `worker_polling`, `wake_configured` (будь-який `/cv/claim`, зокрема порожній long-poll, оновлює `bot_state: cv_last_poll_ts`) |
 | `POST /admin/secrets/wake`, `GET /admin/secrets/wake` | `tools/set_wake_webhook.py` | зберегти URL/ключ вебхука пробудження (лише https, файл 0600; значення не логуються й не повертаються) / `{configured}` |
 | `GET /admin_tasks`, `GET /admin_tasks/claim`, `POST /admin_tasks/{id}/result` | box (worker, CLI) | список / long-poll claim / результат (`done_pending_deploy` + `fix_commit` або `rejected`) |
@@ -175,6 +175,22 @@ Lease CV: claimed без результату довше `CV_LEASE_S` (300 с) �
     Повірю твоєму слову») і зараховує відповідь. XP/життя/норма рахуються лише в `settle_progression` від `best_reps`, тож
     подвійного нарахування немає. Диспути працюють після відповіді бота і для відео, зарахованого раніше того ж дня челенджу;
     для вже підсумованого дня — ні (потрібен відкат XP);
+  - **Число повторів розбирає LLM-тул `report_reps`, а не regex** (`agents/reps_claim.py`): `report_reps(user, count, exercise,
+    corrects_existing_video, request_id, confidence)`. `count` — ціле 1..1000; `exercise` — `pushups|squats` або порожньо
+    (лише якщо людина сама назвала вправу); `request_id` — відео з контексту; `user` — slug автора (claim-и про інших людей
+    відкидаються). LLM розуміє цифри, слова й сленг («двадцять три», «півсотні», «десь 20»), жарти і заперечення
+    («50 там і не пахне, я 23 зробив»). Тул валідує аргументи й повертає claim; застосовує його `ChatFlow`
+    (`_apply_video_correction`: спроба дня = рівно це число, вище чи нижче; done; `video_credit`; вправа = названа людиною →
+    під яку вже зараховано відео → вправа дня; XP/норму потім рахує settle). Шляхи:
+    1. **Підпис/текст до відео** (`_extract_video_claim`): LLM бачить підпис, повідомлення автора за 10 хв до відео та відео-контекст;
+       немає виклику тулу (`llm_none`) = числа немає (regex НЕ підміняє рішення LLM);
+    2. **Повідомлення після відео** (`_handle_disputes`): префільтр (`is_dispute`/цифра/слово-число/відповідь на бота/очікування
+       числа) -> LLM-тул (`_llm_dispute_claim`); без числа — одне запитання «Скільки вийшло?»;
+    3. **Coach**: `report_reps` є в списку тулів coach (`agents/coach.py`, правила `REPS_CLAIM_MANDATE` у промпті — claim-и
+       людини перемагають, не перепитувати, якщо число ясне, одне запитання якщо числа немає); claim-и застосовуються тихо.
+    Regex (`core/claims.py`) — лише дешевий фолбек, якщо LLM недоступний/не налаштований. Шлях логується
+    (`Claim extraction path=…`, `Dispute path=…`: `llm`/`llm_none`/`regex`/`regex_fallback`), для відео пишеться
+    `bot_state: video_claim_path:<request_id>`. Промпт модуля — `prompts.py: REPS_CLAIM_PROMPT` (ключ `reps_claim`).
   - `TRUST_MODE=0` повертає стару CV-поведінку (`ReportJudgeAgent.judge_video_fact`).
 
 ## 9. Відпустка/лікарняний (leaves)

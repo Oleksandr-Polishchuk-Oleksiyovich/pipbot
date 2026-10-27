@@ -258,3 +258,10 @@ sequenceDiagram
 - `core/claims.parse_dispute_reps(text, exclude=cv_reps)`: числа в клаузах-запереченнях («50 там і не пахне») відкидаються,
   пріоритет — клауза «я N зробив»; число, що збігається з CV, відкидається за наявності іншого. Нижче число так само валідне:
   `_apply_video_correction` ставить спробу рівно цим числом на вправу дня (або названу людиною).
+
+## Число повторів: LLM-тул `report_reps` (Task 9b)
+
+Повідомлення/підпис -> (префільтр) -> `RepsClaimAgent.extract` (LLM викликає `report_reps`) -> `RepsClaim` -> `ChatFlow._apply_video_correction`
+(спроба дня = рівно назване число, вправа: названа → кредит відео → вправа дня, `done`, `video_credit`). LLM недоступний → regex
+(`parse_dispute_reps`/`parse_claimed_reps`), шлях видно в логах. Для вже проведеного розрахунку дня — op `correct_settlement` (лише за
+підтвердженням власника).

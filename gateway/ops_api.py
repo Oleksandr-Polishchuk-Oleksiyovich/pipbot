@@ -339,9 +339,116 @@ def _op_end_leave(store, p: Dict[str, Any]) -> Dict[str, Any]:
     return {"slug": slug, "leave": leave}
 
 
+def _op_correct_settlement(store, p: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+    """
+    Виправлення вже проведеного розрахунку дня (напр. спробу зараховано 50 замість 23). Ідемпотентно за станом БД
+    (повторний запуск, навіть з іншим key, нічого не змінює: «старий» XP береться з xp_log з урахуванням попередніх корекцій).
+    params: slug, date (день розрахунку), exercise (pushups|squats), reps (правильна найкраща спроба),
+            request_id (опц.: video_credit цього відео), lives_pre (опц.: життя ДО левел-апу, інакше min(життя, новий max)).
+    Змінює: daily_attempts, user_progress(done), video_credit, user_xp/level (через суму XP), xp_log (рядок корекції),
+    max_lives/lives (левел-апи, яких більше немає), next_norms (лише якщо норму ще не перезаписав пізніший розрахунок).
+    dry_run -> лише план (before/after).
+    """
+    from datetime import date as _d, timedelta as _td
+    from core import challenge
+    from core.progression import XP_PER_LEVEL, next_norm, xp_gain
+    slug, date_iso, exercise, reps = str(p["slug"]), str(p["date"]), str(p["exercise"]), int(p["reps"])
+    if reps < 0 or reps > 1000:
+        raise ValueError("reps out of range")
+    if exercise not in ("pushups", "squats"):
+        raise ValueError("exercise must be pushups|squats")
+    if store.get_state("progression_settled_through", "") < date_iso:
+        raise ValueError(f"day {date_iso} is not settled yet — use credit_attempt instead")
+    user = store.get_user(slug)
+    if user is None:
+        raise ValueError(f"unknown user {slug}")
+    import re as _re
+    with store._connect() as con:
+        rows = con.execute("SELECT delta, reason FROM xp_log WHERE date = ? AND user_slug = ? ORDER BY id",
+                           (date_iso, slug)).fetchall()
+    orig = [r for r in rows if str(r[1]).startswith("target=")]
+    if not orig:
+        raise ValueError("no settlement xp_log row for this user/day")
+    m = _re.match(r"target=(\d+) best=(\S+) credited=(True|False)", str(orig[0][1]))
+    if not m:
+        raise ValueError("cannot parse settlement xp_log reason")
+    target = int(m.group(1))
+    old_best = None if m.group(2) == "None" else int(m.group(2))
+    old_gain = sum(int(r[0]) for r in rows if str(r[1]).startswith("target=") or str(r[1]).startswith("correction-settlement"))
+    credited_new = reps >= target
+    new_gain = xp_gain(target, credited_new, reps)
+    xp, level = store.get_xp(slug)
+    total = level * XP_PER_LEVEL + xp
+    pre_total = total - old_gain
+    new_total = pre_total + new_gain
+    if pre_total < 0 or new_total < 0:
+        raise ValueError("xp arithmetic went negative")
+    ups_old = (pre_total + old_gain) // XP_PER_LEVEL - pre_total // XP_PER_LEVEL
+    ups_new = (pre_total + new_gain) // XP_PER_LEVEL - pre_total // XP_PER_LEVEL
+    new_level, new_xp = divmod(new_total, XP_PER_LEVEL)
+    lives, max_lives = user.lives, user.max_lives
+    new_max, new_lives = max_lives, lives
+    if max_lives is not None:
+        new_max = max_lives - (ups_old - ups_new)
+        if "lives_pre" in p and ups_new < ups_old:
+            new_lives = int(p["lives_pre"])
+        elif lives is not None:
+            new_lives = min(lives, new_max) if ups_new < ups_old else lives
+        if new_lives is not None:
+            new_lives = min(new_lives, new_max)
+    new_next = next_norm(target, credited_new, reps)
+    nn = store.get_next_norm(slug, exercise)
+    nn_row = None
+    with store._connect() as con:
+        nn_row = con.execute("SELECT target, effective_from, source_date FROM next_norms WHERE user_slug = ? AND exercise = ?",
+                             (slug, exercise)).fetchone()
+    nn_touch = bool(nn_row) and str(nn_row[2]) == date_iso
+    plan = {
+        "slug": slug, "date": date_iso, "exercise": exercise, "target": target,
+        "before": {
+            "attempt": store.get_best_attempt(date_iso, slug), "settled_best": old_best,
+            "done": bool(store.get_day_progress(date_iso).get(slug, False)), "settle_xp_gain": old_gain,
+            "xp": xp, "level": level, "lives": lives, "max_lives": max_lives,
+            "next_norm": (nn_row[0] if nn_row else None),
+        },
+        "after": {
+            "attempt": reps, "done": credited_new, "settle_xp_gain": new_gain, "xp": new_xp, "level": new_level,
+            "lives": new_lives, "max_lives": new_max,
+            "next_norm": (new_next if nn_touch else (nn_row[0] if nn_row else None)),
+        },
+        "xp_log_delta": new_gain - old_gain, "next_norm_updated": nn_touch,
+        "level_ups_before": ups_old, "level_ups_after": ups_new,
+        "noop": (store.get_best_attempt(date_iso, slug) == reps and new_gain == old_gain),
+    }
+    if dry_run:
+        plan["dry_run"] = True
+        return plan
+    if plan["noop"]:
+        return plan
+    store.set_attempt(date_iso, slug, exercise, reps)
+    store.set_done(slug, credited_new, date_iso)
+    rid = str(p.get("request_id") or "")
+    if rid:
+        store.set_state(f"video_credit:{rid}", json.dumps({"reps": reps, "ex": exercise, "disputed": True}))
+    if new_gain != old_gain:
+        store.set_xp(slug, new_xp, new_level)
+        store.add_xp_log(date_iso, slug, new_gain - old_gain,
+                         f"correction-settlement: best {old_best}->{reps} (owner-confirmed)")
+    if max_lives is not None and (new_max != max_lives or new_lives != lives):
+        challenge.set_user_lives(store, slug, new_lives, new_max)
+    if nn_touch:
+        store.set_next_norm(slug, exercise, new_next, (_d.fromisoformat(date_iso) + _td(days=1)).isoformat(), date_iso)
+    u2 = store.get_user(slug)
+    plan["applied"] = {"xp": store.get_xp(slug), "lives": u2.lives, "max_lives": u2.max_lives,
+                       "attempt": store.get_best_attempt(date_iso, slug)}
+    return plan
+
+
 def _run_op(store, op: str, key: str, params: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
     if op == "cv_cleanup":
         return _op_cv_cleanup(store, params, dry_run)
+    if op == "correct_settlement":
+        return _op_correct_settlement(store, params, dry_run)
     if dry_run:
         return {"dry_run": True, "op": op, "params": {k: (v if k != "text" else str(v)[:200]) for k, v in params.items()}}
     if op == "adjust_user":

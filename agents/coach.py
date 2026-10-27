@@ -8,6 +8,7 @@ from datetime import date
 from typing import Callable, List, Optional
 
 from agents.base import PromptAgent, render_messages
+from agents.reps_claim import RepsClaim, make_report_reps_tool
 from core import challenge
 from core.config import QUOTES_DIR
 from database.store import ChatMessage
@@ -48,6 +49,18 @@ STATUS_MANDATE = """
 Учасника на лікарняному/у відпустці за невиконану норму не лаяти, не рахувати боржником і не погрожувати втратою життя.
 Актуальні дані (єдине джерело правди — БД, не вигадуй і не бери з памʼяті):
 {board}
+"""
+
+
+# Правила тулу report_reps (додаються в код, а не в БД-промпт, щоб кастомний coach_base їх не втратив).
+REPS_CLAIM_MANDATE = """
+
+🔢 ПРАВИЛО ПРО ЧИСЛА ПОВТОРІВ (тул report_reps):
+Коли учасник сам називає або виправляє кількість СВОЇХ повторів у будь-якій формі (цифри, слова: «двадцять три», «півсотні»,
+«десь 20», «я 23 зробив, а не 50», з жартами чи запереченнями на кшталт «50 там і не пахне») — виклич report_reps(user, count,
+exercise, corrects_existing_video, request_id, confidence). Слова людини важливіші за підрахунок бота (і вище, і нижче).
+Не перепитуй, якщо число зрозуміле; якщо числа немає — постав ОДНЕ коротке запитання «скільки вийшло?». Вправу вказуй лише якщо
+людина її назвала. Не викликай тул для норм, часу, ваги, чужих результатів.
 """
 
 
@@ -103,6 +116,7 @@ class CoachAgent(PromptAgent):
                 + dynamic.strip()
             )
         base += STATUS_MANDATE.format(board=challenge.status_board(self.store, today, snapshot=s))
+        base += REPS_CLAIM_MANDATE
         logger.debug(
             "Coach prompt context: date=%s day=%s exercise=%s targets=%s",
             s["date"], s["day_num"], s["exercise_name"],
@@ -110,7 +124,8 @@ class CoachAgent(PromptAgent):
         )
         return base
 
-    def reply(self, today: date, history: List[ChatMessage], judge_notes: List[str]) -> str:
+    def reply(self, today: date, history: List[ChatMessage], judge_notes: List[str],
+              claim_sink: Optional[List[RepsClaim]] = None) -> str:
         notes = "\n".join(f"- {n}" for n in judge_notes) or "- Нових зарахувань немає."
         prompt = (
             f"ЖУРНАЛ ЧАТУ ЗА СЬОГОДНІ:\n---\n{render_messages(history)}\n---\n\n"
@@ -144,10 +159,14 @@ class CoachAgent(PromptAgent):
             tg_info = fetcher() if fetcher else {}
             return json.dumps({"db_users": db_users, "telegram_chat": tg_info}, ensure_ascii=False)
 
+        # Тул report_reps лише збирає claim-и в claim_sink; залік (спроба/done/video_credit) застосовує ChatFlow після відповіді.
+        report_reps = make_report_reps_tool(
+            store, claim_sink if claim_sink is not None else [],
+        )
         return self.llm.text(
             self.build_system_prompt(today),
             prompt,
-            tools=[get_random_anime_quote, get_challenge_rules, get_status_board, get_chat_members_info],
+            tools=[get_random_anime_quote, get_challenge_rules, get_status_board, get_chat_members_info, report_reps],
             temperature=0.8,
         )
 

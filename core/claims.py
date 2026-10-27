@@ -231,3 +231,24 @@ def is_dispute(text: Optional[str], reply_to_bot_count: bool = False) -> bool:
     if reply_to_bot_count and has_number:
         return True
     return False
+
+
+# Слова-числа (укр./рос. корені) — дешевий префільтр: чи МОЖЕ повідомлення називати кількість (щоб не кликати LLM на кожну репліку)
+_NUMBER_WORD_ROOTS = (
+    "один", "одна", "одне", "два", "дві", "три", "чотири", "п'ят", "пʼят", "п’ят", "шіст", "сім", "вісім", "дев'ят", "дев’ят",
+    "десят", "десь", "двадцят", "тридцят", "сорок", "п'ятдесят", "пʼятдесят", "п’ятдесят", "шістдесят", "сімдесят", "вісімдесят",
+    "дев'яност", "дев’яност", "сто", "сотн", "сотк", "сотня", "півсот", "пів сот", "півтор", "тисяч",
+    "одиннадцат", "двенадцат", "двадцать", "тридцать", "пятьдесят", "полсотни", "сорок",
+    "twenty", "thirty", "forty", "fifty", "hundred",
+)
+
+
+def looks_like_count(text: Optional[str]) -> bool:
+    """Чи може текст містити кількість повторів (цифра або слово-число). Лише префільтр перед LLM-тулом report_reps."""
+    if not text:
+        return False
+    _, _, rest = split_reply_context(text)
+    low = rest.lower()
+    if re.search(r"\d", low):
+        return True
+    return any(root in low for root in _NUMBER_WORD_ROOTS)

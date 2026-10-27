@@ -26,6 +26,7 @@ from agents.admin import AdminAgent
 from agents.coach import CoachAgent
 from agents.onboarding import OnboardingAgent
 from agents.prompt_editor import CoachPromptEditor, PromptConflictAgent, PromptMergerAgent, PromptVerifierAgent
+from agents.reps_claim import RepsClaim, RepsClaimAgent, last_claim_for
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
@@ -33,6 +34,7 @@ from core import challenge, dayroll, progression
 from core.bot_texts import BotTexts
 from core.claims import (
     is_dispute,
+    looks_like_count,
     parse_claimed_exercise,
     parse_claimed_reps,
     parse_dispute_reps,
@@ -111,6 +113,9 @@ def commit_is_deployed(fix_commit: Optional[str], deployed: Optional[set]) -> bo
         return False
     return any(c.startswith(fc) or fc.startswith(c) for c in deployed if len(c) >= 7)
 
+_EX_UNSET = object()  # «вправу не передано — розібрати regex-ом»
+
+
 class ChatFlow:
     def __init__(self, store: Store, llm: Optional[GeminiLLM], sender: Sender,
                  now: Callable[[], datetime] = lambda: datetime.now(TIMEZONE),
@@ -139,6 +144,7 @@ class ChatFlow:
         self.router = RouterAgent(llm, store)
         self.onboarding = OnboardingAgent(llm, store)
         self.judge = ReportJudgeAgent(llm, store)
+        self.claims_agent = RepsClaimAgent(llm, store)
         self.coach = CoachAgent(llm, store, chat_members_fetcher=lambda: self._chat_members_cache)
         self.editor = CoachPromptEditor(PromptConflictAgent(llm, store), PromptMergerAgent(llm, store),
                                         PromptVerifierAgent(llm, store))
@@ -510,57 +516,9 @@ class ChatFlow:
         today_iso = today.isoformat()
         user_slug = check.user_slug or "lyosha"
 
-        # Claim lookup: caption (state key) first
+        # Заявлене число/вправа: LLM-тул report_reps (цифри, слова, сленг, заперечення); regex — лише фолбек без LLM.
         caption = self.store.get_state(f"video_caption:{request_id}", "") or ""
-        claimed_reps = parse_claimed_reps(caption) if caption else None
-        claimed_ex = parse_claimed_exercise(caption) if caption else None
-
-        # Otherwise author's plain text messages in chat_history from up to 10 min before check.created_at
-        if claimed_reps is None or claimed_ex is None:
-            try:
-                utc_str = (check.created_at or "").split(".")[0]
-                utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
-                check_local = utc_dt.astimezone(TIMEZONE)
-            except Exception:
-                check_local = self.now()
-
-            ref_dt = self.now() if check_local.date() != self.now().date() else check_local
-            window_start = ref_dt - timedelta(minutes=10)
-            window_end = self.now()
-            if window_end < ref_dt:
-                window_end = ref_dt
-
-            window_start_str = format_ts(window_start)
-            window_end_str = format_ts(window_end)
-
-            messages = self.store.messages_since(check.chat_id, window_start_str)
-            matching_messages = []
-            for m in messages:
-                if m.role != "user":
-                    continue
-                if m.text.startswith("[Надіслано"):
-                    continue
-                if m.created_at > window_end_str:
-                    continue
-                if challenge.normalize_participant(m.user_name, self.store) != user_slug:
-                    continue
-                matching_messages.append(m)
-
-            if claimed_reps is None:
-                for m in reversed(matching_messages):
-                    val = parse_claimed_reps(m.text)
-                    if val is not None:
-                        claimed_reps = val
-                        if claimed_ex is None:
-                            claimed_ex = parse_claimed_exercise(m.text)
-                        break
-
-            if claimed_ex is None:
-                for m in reversed(matching_messages):
-                    ex = parse_claimed_exercise(m.text)
-                    if ex is not None:
-                        claimed_ex = ex
-                        break
+        claimed_reps, claimed_ex, claim_path = await self._extract_video_claim(check, request_id, caption, user_slug)
 
         # Trust logic
         day_ex = challenge.day_exercise(self.store, today)
@@ -713,6 +671,106 @@ class ChatFlow:
 
         return reply_text
 
+    # --- Заявлене число: LLM-тул report_reps (основний шлях) + regex-фолбек ---
+    def _nearby_author_messages(self, check, user_slug: str) -> List[ChatMessage]:
+        """Текстові повідомлення автора до 10 хв до відео (хронологічно)."""
+        try:
+            utc_str = (check.created_at or "").split(".")[0]
+            utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
+            check_local = utc_dt.astimezone(TIMEZONE)
+        except Exception:
+            check_local = self.now()
+        ref_dt = self.now() if check_local.date() != self.now().date() else check_local
+        window_start = ref_dt - timedelta(minutes=10)
+        window_end = self.now()
+        if window_end < ref_dt:
+            window_end = ref_dt
+        window_end_str = format_ts(window_end)
+        out = []
+        for m in self.store.messages_since(check.chat_id, format_ts(window_start)):
+            if m.role != "user" or m.text.startswith("[Надіслано") or m.created_at > window_end_str:
+                continue
+            if challenge.normalize_participant(m.user_name, self.store) != user_slug:
+                continue
+            out.append(m)
+        return out
+
+    def _videos_block(self, slug: str, day) -> Tuple[str, List[str]]:
+        """Відео автора за день: request_id, час (Kyiv), що порахував CV, що зараховано (для контексту LLM-тула)."""
+        lines, ids = [], []
+        for c in self._day_video_checks(slug, day):
+            if c.status != "done":
+                continue
+            credit_reps, credit_ex = self._video_credit(c)
+            lines.append(
+                f"- request_id={c.request_id}, час {self._check_local_ts(c)[11:16]}, бот порахував: {c.exercise or '?'} {int(c.reps or 0)}, "
+                f"зараховано: {credit_reps} {credit_ex or '?'}"
+            )
+            ids.append(c.request_id)
+        return "\n".join(lines), ids
+
+    def _recent_chat_text(self, chat_id: int, minutes: int = 60, limit: int = 12) -> str:
+        msgs = self.store.messages_since(chat_id, format_ts(self.now() - timedelta(minutes=minutes)))
+        return "\n".join(m.render() for m in msgs[-limit:])
+
+    def _regex_video_claim(self, caption: str, matching: List[ChatMessage]) -> Tuple[Optional[int], Optional[str]]:
+        """Старий regex-шлях (фолбек): підпис, потім повідомлення автора поруч."""
+        claimed_reps = parse_claimed_reps(caption) if caption else None
+        claimed_ex = parse_claimed_exercise(caption) if caption else None
+        if claimed_reps is None:
+            for m in reversed(matching):
+                val = parse_claimed_reps(m.text)
+                if val is not None:
+                    claimed_reps = val
+                    if claimed_ex is None:
+                        claimed_ex = parse_claimed_exercise(m.text)
+                    break
+        if claimed_ex is None:
+            for m in reversed(matching):
+                ex = parse_claimed_exercise(m.text)
+                if ex is not None:
+                    claimed_ex = ex
+                    break
+        return claimed_reps, claimed_ex
+
+    async def _extract_video_claim(self, check, request_id: str, caption: str, user_slug: str
+                                   ) -> Tuple[Optional[int], Optional[str], str]:
+        """(кількість, вправа, шлях): шлях 'llm' | 'llm_none' | 'regex' (LLM не налаштований) | 'regex_fallback' (LLM впав)."""
+        matching = self._nearby_author_messages(check, user_slug)
+        path = "regex"
+        reps: Optional[int] = None
+        ex: Optional[str] = None
+        if self.llm is not None and (caption or matching):
+            try:
+                day = self._video_day(check)
+                videos_block, ids = self._videos_block(user_slug, day)
+                if request_id not in ids:
+                    videos_block += f"\n- request_id={request_id} (це відео, до якого належать підпис і повідомлення)"
+                    ids.append(request_id)
+                user = self.store.find_user(user_slug)
+                target = "ПІДПИС ДО ВІДЕО: " + (caption or "(немає)") + "\nТЕКСТИ АВТОРА ПОРУЧ:\n" + (
+                    "\n".join(f"[{m.created_at}] {m.text}" for m in matching) or "(немає)")
+                claims = await self._call(
+                    self.claims_agent.extract, day, user_slug, (user.display_name if user else user_slug),
+                    "video", target, self._recent_chat_text(check.chat_id, 15), videos_block, ids,
+                )
+                claim = last_claim_for(claims, user_slug)
+                if claim:
+                    reps, ex, path = claim.count, claim.exercise, "llm"
+                else:
+                    path = "llm_none"
+            except Exception as e:  # LLMUnavailable та будь-яка інша збійна відповідь -> дешевий regex
+                logger.warning("Claim extraction via LLM failed (%s) — regex fallback (request %s)", e, request_id)
+                path = "regex_fallback"
+        if path in ("regex", "regex_fallback"):
+            reps, ex = self._regex_video_claim(caption, matching)
+        logger.info("Claim extraction path=%s request=%s user=%s reps=%s ex=%s", path, request_id, user_slug, reps, ex)
+        try:
+            self.store.set_state(f"video_claim_path:{request_id}", path)
+        except Exception:
+            pass
+        return reps, ex, path
+
     @staticmethod
     def _exercise_doubt(check, cv_ex: Optional[str], day_ex: str) -> bool:
         """CV не впевнений у вправі (ambiguous/mixed) або бачить іншу, ніж вправа дня, при реальних повторах."""
@@ -745,11 +803,46 @@ class ChatFlow:
                 pass
         return int(check.reps or 0), challenge.CV_EXERCISE_KEYS.get(check.exercise or "")
 
+    async def _llm_dispute_claim(self, chat_id: int, m: ChatMessage, slug: str, today) -> Tuple[Optional[RepsClaim], str]:
+        """
+        Тул report_reps для повідомлення після відео. (claim|None, шлях): 'llm' | 'llm_none' | 'regex_fallback' | 'regex'
+        ('regex*' — claim None, рішення приймає regex-шлях). Claim інших людей відкидається.
+        """
+        if self.llm is None:
+            return None, "regex"
+        try:
+            videos_block, ids = self._videos_block(slug, today)
+            user = self.store.find_user(slug)
+            claims = await self._call(
+                self.claims_agent.extract, today, slug, (user.display_name if user else slug), "dispute",
+                m.text or "", self._recent_chat_text(chat_id, 60), videos_block, ids,
+            )
+        except Exception as e:
+            logger.warning("Dispute claim via LLM failed (%s) — regex fallback", e)
+            return None, "regex_fallback"
+        claim = last_claim_for(claims, slug)
+        others = [c for c in claims if c.user != slug]
+        if others:
+            logger.info("Ignoring report_reps claims for other users: %s", [(c.user, c.count) for c in others])
+        return claim, ("llm" if claim else "llm_none")
+
+    def _pick_target_check(self, slug: str, today, before_ts: str, wait: Optional[dict], request_id: Optional[str] = None):
+        checks = [c for c in self._day_video_checks(slug, today)
+                  if c.status == "done" and self._check_local_ts(c) <= (before_ts or "9999")]
+        target = None
+        if request_id:
+            target = next((c for c in checks if c.request_id == request_id), None)
+        if target is None and wait:
+            target = next((c for c in checks if c.request_id == wait.get("rid")), None)
+        if target is None and checks:
+            target = checks[-1]
+        return target
+
     async def _handle_disputes(self, chat_id: int, pending: List[ChatMessage]) -> List[ChatMessage]:
         """
-        Людина оспорює підрахунок на відео -> її слова важливіші за CV. З числом — виправляємо залік; без числа —
-        один раз м'яко питаємо «скільки вийшло?» і зараховуємо те, що вона відповість. Повертає повідомлення, що лишились
-        для звичайної обробки. Працює і після того, як бот уже відповів (аж до кінця дня челенджу).
+        Людина називає/оспорює кількість на відео -> її слова важливіші за CV. Число розбирає LLM-тул report_reps (цифри, слова,
+        сленг, заперечення); regex — лише фолбек, якщо LLM недоступний. З числом — виправляємо залік; без числа — один раз
+        м'яко питаємо «скільки вийшло?». Повертає повідомлення, що лишились для звичайної обробки. Працює аж до кінця дня.
         """
         today = self._today()
         today_iso = today.isoformat()
@@ -763,7 +856,6 @@ class ChatFlow:
             reply_to_bot = bool(quoted_text) and (
                 "Побачив" in quoted_text or "Зануда" in (quoted_sender or "") or "зарахов" in quoted_text.lower()
             )
-            number = parse_dispute_reps(m.text)
             wait_key = f"dispute_wait:{slug}"
             wait = None
             raw = self.store.get_state(wait_key, "")
@@ -774,27 +866,40 @@ class ChatFlow:
                     wait = None
                 if not isinstance(wait, dict) or wait.get("day") != today_iso:
                     wait = None
-            disputed = is_dispute(m.text, reply_to_bot_count=reply_to_bot)
+            regex_disputed = is_dispute(m.text, reply_to_bot_count=reply_to_bot)
+            regex_number = parse_dispute_reps(m.text)
+            # дешевий префільтр, щоб не кликати LLM на кожну репліку
+            if not (regex_disputed or wait or reply_to_bot or looks_like_count(m.text)):
+                remaining.append(m)
+                continue
+            if self._pick_target_check(slug, today, m.created_at, wait) is None:
+                remaining.append(m)  # немає відео, яке можна оспорювати -> звичайна обробка
+                continue
+
+            claim, path = await self._llm_dispute_claim(chat_id, m, slug, today)
+            ex_hint = _EX_UNSET
+            if path == "llm":
+                number, disputed = claim.count, True
+                ex_hint = claim.exercise
+            elif path == "llm_none":
+                number, disputed = None, regex_disputed
+            else:
+                number, disputed = regex_number, regex_disputed
+            logger.info("Dispute path=%s user=%s number=%s ex=%s disputed=%s", path, slug, number,
+                        None if ex_hint is _EX_UNSET else ex_hint, disputed)
             if not disputed and not (wait and number is not None):
                 remaining.append(m)
                 continue
 
-            checks = [c for c in self._day_video_checks(slug, today)
-                      if c.status == "done" and self._check_local_ts(c) <= (m.created_at or "9999")]
-            target_check = None
-            if wait:
-                target_check = next((c for c in checks if c.request_id == wait.get("rid")), None)
-            if target_check is None and checks:
-                target_check = checks[-1]
-            if target_check is None:
-                remaining.append(m)  # немає відео, яке можна оспорювати -> звичайна обробка
-                continue
-
-            if number is not None:
-                # людина не погоджується з підрахунком CV: число, що збігається з CV, відкидаємо, якщо є інше (напр. «50 там і не пахне, я 23»)
+            target_check = self._pick_target_check(slug, today, m.created_at, wait, claim.request_id if claim else None)
+            if number is not None and path.startswith("regex"):
+                # людина не погоджується з підрахунком CV: число, що збігається з CV, відкидаємо, якщо є інше
                 number = parse_dispute_reps(m.text, exclude=int(target_check.reps or 0) or None)
 
             if number is None:
+                if path == "llm_none" and not regex_disputed and not wait:
+                    remaining.append(m)
+                    continue
                 if wait:
                     logger.info("Dispute from %s without number — already asked, waiting", slug)
                 else:
@@ -802,30 +907,49 @@ class ChatFlow:
                     await self._say(chat_id, self.bot_texts.get("trust_dispute_ask"))
                 continue
 
-            await self._apply_video_correction(chat_id, target_check, slug, number, m.text)
+            await self._apply_video_correction(chat_id, target_check, slug, number, m.text, explicit_ex=ex_hint)
             if wait:
                 self.store.set_state(wait_key, "")
         return remaining
 
-    async def _apply_video_correction(self, chat_id: int, check, slug: str, reps: int, text: str) -> str:
+    async def _apply_reported_claims(self, chat_id: int, claims: List[RepsClaim]) -> None:
+        """Claim-и, які coach-LLM передав тулом report_reps під час відповіді: застосовуємо тихо (відповідь coach уже є)."""
+        today = self._today()
+        seen = set()
+        for c in claims:
+            key = (c.user, c.request_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            check = self._pick_target_check(c.user, today, "9999", None, c.request_id)
+            if check is None:
+                logger.info("report_reps from coach for %s ignored: no video today", c.user)
+                continue
+            await self._apply_video_correction(chat_id, check, c.user, c.count, "", explicit_ex=c.exercise, say=False)
+
+    async def _apply_video_correction(self, chat_id: int, check, slug: str, reps: int, text: str,
+                                      explicit_ex=_EX_UNSET, say: bool = True) -> str:
         """
         Виправляє залік до числа людини (воно ЗАВЖДИ перемагає CV, і вище, і нижче). Змінює лише денну спробу/статус —
         XP, життя й наступну норму рахує звичайний settle за best_reps дня, тож подвійного нарахування немає.
+        explicit_ex: вправа, названа людиною ('pushups'|'squats'|None); _EX_UNSET -> розібрати regex-ом із text.
         """
         today = self._today()
         today_iso = today.isoformat()
         day_ex = challenge.day_exercise(self.store, today)
         # Вправа: названа людиною > вправа, під яку вже зараховано це відео (довіра) > вправа дня.
         # Вправу, яку «побачив» CV, ігноруємо: назване число зараховується на вправу дня (CV міг переплутати присідання/віджимання).
+        if explicit_ex is _EX_UNSET:
+            explicit_ex = parse_claimed_exercise(text)
         stored = self.store.get_state(f"video_credit:{check.request_id}", "")
         prev_ex = self._video_credit(check)[1] if stored else None
-        ex = parse_claimed_exercise(text) or prev_ex or day_ex
+        ex = explicit_ex or prev_ex or day_ex
         self.store.set_state(f"video_credit:{check.request_id}",
                              json.dumps({"reps": int(reps), "ex": ex, "disputed": True}))
         target = challenge.day_targets(self.store, today).get(slug, 10)
         ex_word = challenge.exercise_word(ex, reps)
         parts = [self.bot_texts.get("trust_dispute_fix", claimed=reps, exercise=ex_word, reps=reps)]
-        if ex == day_ex:
+        if ex == day_ex or prev_ex == day_ex:
             best = 0
             for c in self._day_video_checks(slug, today):
                 if c.status != "done":
@@ -836,6 +960,7 @@ class ChatFlow:
             self.store.set_attempt(today_iso, slug, day_ex, best)
             met = best >= target
             self.store.set_done(slug, met, today_iso)
+        if ex == day_ex:
             key = "trust_credit_met" if met else "trust_credit_missed"
             parts.append(self.bot_texts.get(key, target=target, credited=best, credited_reps=best, reps=best,
                                             exercise=challenge.exercise_word(day_ex, best),
@@ -848,7 +973,8 @@ class ChatFlow:
                 exercise=challenge.EXERCISES.get(ex, {}).get("name", ex),
             ))
         reply = "\n".join(p for p in parts if p)
-        await self._say(chat_id, reply)
+        if say:
+            await self._say(chat_id, reply)
         logger.info("Dispute applied: %s %s reps=%s ex=%s (request %s)", slug, today_iso, reps, ex, check.request_id)
         return reply
 
@@ -1341,7 +1467,12 @@ class ChatFlow:
         reply = None
         if llm_ok:
             try:
-                reply = await self._call(self.coach.reply, today, self.store.messages_since(chat_id, self._day_start()), notes)
+                claim_sink: List[RepsClaim] = []
+                reply = await self._call(
+                    self.coach.reply, today, self.store.messages_since(chat_id, self._day_start()), notes, claim_sink,
+                )
+                if claim_sink:
+                    await self._apply_reported_claims(chat_id, claim_sink)
             except LLMUnavailable as e:
                 logger.warning("Coach unavailable: %s", e)
         await self._say(chat_id, reply or self._template_reply(notes, today))
