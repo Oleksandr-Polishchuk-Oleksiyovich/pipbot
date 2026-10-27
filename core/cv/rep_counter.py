@@ -650,7 +650,16 @@ def _analyze_landmarks(
         flags=flags,
         valid=valid,
         elapsed_s=time.time() - t0,
+        rep_times=_event_times(events, seg_a, fps) if valid else None,
     )
+
+
+def _event_times(events: Any, offset: int, fps: float) -> List[float]:
+    """Індекси подій повторів (відносно сегмента) -> секунди від початку відео."""
+    try:
+        return [(int(offset) + int(e)) / float(fps) for e in events]
+    except (TypeError, ValueError, ZeroDivisionError):
+        return []
 
 
 def _make_result(
@@ -663,9 +672,10 @@ def _make_result(
     flags: List[str],
     valid: bool,
     elapsed_s: float,
+    rep_times: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """Форматує словник згідно з контрактом 8.3 (ARCHITECTURE)."""
-    return {
+    res = {
         "contract_version": "1.0",
         "request_id": request_id,
         "file_unique_id": file_unique_id,
@@ -680,3 +690,6 @@ def _make_result(
         "analyzer_version": "cv-1.0",
         "elapsed_s": round(float(elapsed_s), 2),
     }
+    if rep_times:
+        res["rep_times"] = [round(float(t), 2) for t in rep_times][:400]  # для дедуплікації (core/dedup.py)
+    return res

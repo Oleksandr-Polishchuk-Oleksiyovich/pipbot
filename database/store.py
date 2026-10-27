@@ -519,6 +519,22 @@ class Store:
                     cancelled   INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_leaves_user_start ON leaves(user_slug, start_date);
+
+                CREATE TABLE IF NOT EXISTS video_fingerprints (
+                    request_id  TEXT PRIMARY KEY,
+                    user_slug   TEXT,
+                    file_unique_id TEXT,
+                    file_size   INTEGER,
+                    width       INTEGER,
+                    height      INTEGER,
+                    duration_s  REAL,
+                    file_name   TEXT,
+                    sha256      TEXT,
+                    sha_bytes   INTEGER,
+                    fingerprint TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_fp_user ON video_fingerprints(user_slug, created_at);
             """)
 
     # --- ADMIN TASKS (запити до розробника, яких не покривають вузькі адмін-тули) ---
@@ -1331,6 +1347,67 @@ class Store:
                 (user_slug, lo_utc, hi_utc),
             ).fetchall()
         return [_row_to_video_check(r) for r in rows]
+
+    # --- ДЕДУПЛІКАЦІЯ ВІДЕО (метадані отримання, sha256 байтів, відбиток від box CV) ---
+    VIDEO_FP_RETENTION_DAYS = 3
+
+    def save_video_meta(self, request_id: str, user_slug: Optional[str], file_unique_id: Optional[str] = None,
+                        file_size: Optional[int] = None, width: Optional[int] = None, height: Optional[int] = None,
+                        duration_s: Optional[float] = None, file_name: Optional[str] = None) -> None:
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM video_fingerprints WHERE created_at < datetime('now', ?)",
+                (f"-{int(self.VIDEO_FP_RETENTION_DAYS)} days",),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO video_fingerprints "
+                "(request_id, user_slug, file_unique_id, file_size, width, height, duration_s, file_name, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                (request_id, user_slug, file_unique_id, file_size, width, height, duration_s, file_name),
+            )
+
+    def set_video_sha(self, request_id: str, sha256: str, nbytes: int) -> None:
+        with self._connect() as con:
+            con.execute("UPDATE video_fingerprints SET sha256 = ?, sha_bytes = ? WHERE request_id = ?",
+                        (sha256, int(nbytes), request_id))
+
+    def set_video_fingerprint(self, request_id: str, fingerprint: Dict[str, Any]) -> None:
+        with self._connect() as con:
+            con.execute("UPDATE video_fingerprints SET fingerprint = ? WHERE request_id = ?",
+                        (json.dumps(fingerprint, ensure_ascii=False), request_id))
+
+    _VIDEO_FP_COLS = ("request_id", "user_slug", "file_unique_id", "file_size", "width", "height", "duration_s",
+                      "file_name", "sha256", "sha_bytes", "fingerprint", "created_at")
+
+    def _video_fp_row(self, row) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        d = dict(zip(self._VIDEO_FP_COLS, row))
+        raw = d.get("fingerprint")
+        try:
+            d["fingerprint"] = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            d["fingerprint"] = None
+        return d
+
+    def get_video_meta(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT {', '.join(self._VIDEO_FP_COLS)} FROM video_fingerprints WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return self._video_fp_row(row)
+
+    def recent_video_metas(self, user_slug: str, hours: float = 48.0, exclude_request_id: str = "") -> List[Dict[str, Any]]:
+        """Метадані відео автора за останні N годин (UTC created_at), найновіші перші."""
+        with self._connect() as con:
+            rows = con.execute(
+                f"SELECT {', '.join(self._VIDEO_FP_COLS)} FROM video_fingerprints "
+                "WHERE user_slug = ? AND request_id != ? AND created_at >= datetime('now', ?) "
+                "ORDER BY created_at DESC, rowid DESC",
+                (user_slug, exclude_request_id, f"-{int(hours * 60)} minutes"),
+            ).fetchall()
+        return [self._video_fp_row(r) for r in rows]
 
     def get_video_check_by_id(self, check_id: int) -> Optional[VideoCheck]:
         with self._connect() as con:

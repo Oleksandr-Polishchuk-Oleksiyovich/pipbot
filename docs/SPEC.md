@@ -104,6 +104,7 @@ optionToConsider/        старі плани/дослідження (див. R
 | `bot_state` | Ключ-значення: курсори `last_processed_*`, `progression_settled_through`, `lives_settled_through`, `schedule_mode`, `video_caption:<rid>`, `video_credit:<rid>`, `dispute_wait:<slug>`, overrides норм тощо |
 | `bot_texts` | Фіксовані тексти бота (правляться адміном) |
 | `prompts`, `prompt_history` | Системні промпти та їхні версії |
+| `video_fingerprints` | Метадані/`sha256`/відбиток відео для дедупу повторних завантажень (~3 доби; див. FLOWS «Повторно завантажене відео») |
 | `video_checks` | Відеозвіти (`request_id`, `file_unique_id`, `exercise`, `reps`, `confidence`, `flags`, `valid`, `status`, `location`) |
 | `cv_jobs` | Черга CV для box (`status` queued/claimed/done/failed, `claim_token`, `attempts`, `processing_sent_at`, `still_sent_at`, `replied_at`) |
 | `admin_tasks` | Черга задач розробнику (`pending` → `claimed` → `done_pending_deploy` → `announced` / `rejected`, `fix_commit`, `result`) |
@@ -175,10 +176,11 @@ Lease CV: claimed без результату довше `CV_LEASE_S` (300 с) �
     Повірю твоєму слову») і зараховує відповідь. XP/життя/норма рахуються лише в `settle_progression` від `best_reps`, тож
     подвійного нарахування немає. Диспути працюють після відповіді бота і для відео, зарахованого раніше того ж дня челенджу;
     для вже підсумованого дня — ні (потрібен відкат XP);
-  - **Число повторів розбирає LLM-тул `report_reps`, а не regex** (`agents/reps_claim.py`): `report_reps(user, count, exercise,
+  - **Число повторів розбирає LLM-тул `report_reps`, а не regex** (`agents/reps_claim.py`): `report_reps(subject_user, count, exercise,
     corrects_existing_video, request_id, confidence)`. `count` — ціле 1..1000; `exercise` — `pushups|squats` або порожньо
-    (лише якщо людина сама назвала вправу); `request_id` — відео з контексту; `user` — slug автора (claim-и про інших людей
-    відкидаються). LLM розуміє цифри, слова й сленг («двадцять три», «півсотні», «десь 20»), жарти і заперечення
+    (лише якщо людина сама назвала вправу); `request_id` — відео з контексту; `subject_user` — slug того, ЧИЇ повтори (порожній = автор повідомлення); число, яке учасник
+    називає про відео ІНШОГО учасника (за цитатою-відповіддю, іменем, відкритим питанням бота), зараховується власнику відео —
+    слова людей важливіші за CV, без повчань. LLM розуміє цифри, слова й сленг («двадцять три», «півсотні», «десь 20»), жарти і заперечення
     («50 там і не пахне, я 23 зробив»). Тул валідує аргументи й повертає claim; застосовує його `ChatFlow`
     (`_apply_video_correction`: спроба дня = рівно це число, вище чи нижче; done; `video_credit`; вправа = названа людиною →
     під яку вже зараховано відео → вправа дня; XP/норму потім рахує settle). Шляхи:

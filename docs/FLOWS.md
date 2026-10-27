@@ -156,7 +156,7 @@ sequenceDiagram
 | # | Крок | Хто запускає | Де | Файл / функція |
 |---|---|---|---|---|
 | 1 | Відео/кружечок у чаті | user | Telegram | — |
-| 2 | Gate: відхиляє GIF, <5 с, >20 MB, дублікат за `file_unique_id` («хеш-дедуп»); підпис зберігається в `bot_state: video_caption:<rid>` | Telegram → bot process | VM | `bot.py: on_message` → `flow.handle_video` |
+| 2 | Gate: відхиляє GIF, <5 с, >20 MB, дублікат за `file_unique_id` або за метаданими (той самий розмір+кадр+тривалість під новим id); далі — дедуп за вмістом після підрахунку (розділ «Повторно завантажене відео»); підпис зберігається в `bot_state: video_caption:<rid>` | Telegram → bot process | VM | `bot.py: on_message` → `flow.handle_video` |
 | 3 | `video_checks(status=offloaded, location=box)` + `enqueue_cv_job`; відповідь `processing` | bot process | VM | `Store.create_video_check`, `enqueue_cv_job` |
 | 3a | **Wake box:** якщо `cv_last_poll_ts` старший за `WAKE_STALE_S` (45 с) і немає `claimed` job у межах lease — вебхук Grok Bot routine «SportNerdBot box wake» (3 спроби, backoff 2/5/10 с, будь-який 2xx = прийнято), чекання до `WAKE_WAIT_S` (90 с) на свіжий `/cv/claim`, за потреби ще раунд. Job лишається `queued` увесь час. Якщо worker не прокинувся — **одне** повідомлення `box_waking` на епізод; watchdog (раз на хв, вебхук не частіше ніж раз на 5 хв) продовжує, поки job висить. Без секрету / `WAKE_ENABLED=0` — no-op | bot process (VM) → Grok Bot cloud → box | VM → Grok Bot cloud webhook → box | `core/wake.py: BoxWaker.ensure_awake/watchdog`, `flow._ensure_box_awake` |
 | 4 | Long-poll claim; gateway підтягує відео з Telegram (box не знає `BOT_TOKEN`); lease `CV_LEASE_S` | box worker → gateway | box → VM → Telegram | `cv_worker/box_worker.py`, `gateway/cv_queue.py: handle_claim` |
@@ -265,3 +265,33 @@ sequenceDiagram
 (спроба дня = рівно назване число, вправа: названа → кредит відео → вправа дня, `done`, `video_credit`). LLM недоступний → regex
 (`parse_dispute_reps`/`parse_claimed_reps`), шлях видно в логах. Для вже проведеного розрахунку дня — op `correct_settlement` (лише за
 підтвердженням власника).
+
+### Число про чуже відео (`subject_user`)
+
+Тул: `report_reps(subject_user, count, exercise, corrects_existing_video, request_id, confidence)`. `subject_user` — slug того, ЧИЇ повтори
+(порожній = автор повідомлення). Слово будь-якого учасника про чуже відео («Льоша зробив 36», «записуй Льоші 36», відповідь на повідомлення
+бота про відео Льоші, відповідь на питання «скільки вийшло?») зараховується ВЛАСНИКУ відео, без повчань. Контекст для LLM: усі відео за
+день (`owner=`, `request_id`), список учасників, цитата-відповідь, відкриті питання бота (`dispute_wait:<subject>` = `{rid, day, asked_by}`).
+Питання без числа ставиться один раз і прив'язане до того, ПРО КОГО питали; відповідь від того, хто питав (або будь-кого з числом),
+закриває його для правильної людини. Regex-фолбек визначає subject так: цитата «Побачив N…» → власник відео з таким N; названа інша
+людина (якщо немає «я N»); питання, задане через це повідомлення; інакше автор. Op `credit_attempt` приймає `request_id` (виправляє
+також `video_credit`).
+
+## Повторно завантажене відео (дедуп за вмістом, Task B)
+
+Інцидент 27.10: те саме відео надіслано з телефона й з ноута. Telegram видав новий `file_unique_id`, тривалість стала на 1 с іншою
+(перекодування), тож id-критерій не спрацював. Тепер:
+
+1. **VM, при отриманні** (`handle_video`): у таблицю `video_fingerprints` пишуться `file_unique_id`, `file_size`, `width`, `height`,
+   `duration_s`, `file_name` (зберігається ~3 доби, чиститься при вставці). Одразу відхиляється лише «той самий файл під іншим id»:
+   однакові розмір у байтах + кадр + тривалість, той самий автор, 48 год.
+2. **VM, при завантаженні для box** (`gateway/cv_queue._ensure_video`): рахується `sha256` байтів (файл усе одно проходить через VM).
+3. **Box worker** (`cv_worker/cv_job.py` → `core/cv/fingerprint.py`): у результат додається `fingerprint` = `{dur, ph[8 dHash кадрів], rep_t[часи піків повторів]}`;
+   `rep_counter` віддає `rep_times`. Gateway зберігає відбиток у `video_fingerprints.fingerprint`.
+4. **VM, при відповіді** (`handle_video_callback` → `_reject_duplicate_video` → `core/dedup.is_duplicate`): порівняння з раніше
+   пораханими відео цього автора за 48 год: `sha256`; `file_unique_id`; та сама вправа + |Δповторів| ≤ 1 + тривалість ±2 с і збіг таймінгів повторів
+   (≥ 85 % піків у межах 0.2 с після масштабу/зсуву — `rep_timeline`); для <5 повторів — хеші кадрів + ті самі повтори (`phash_reps`);
+   без відбитків (старий worker) — ті самі вправа+повтори ≥ 15 і тривалість ±1.5 с (`duration_reps`).
+   Дубль: підхід/`done`/`video_credit` НЕ ставляться, у `video_checks.flags` додається `duplicate_of:<rid8>:<причина>`,
+   відповідь — bot_text `video_duplicate` («Це кіно я вже бачив 🍿 …»).
+Хеші кадрів самі по собі нічого не доводять (та сама кімната щодня) — лише разом із вправою, повторами й тривалістю.

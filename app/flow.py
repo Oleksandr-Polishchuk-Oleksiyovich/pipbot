@@ -30,7 +30,7 @@ from agents.reps_claim import RepsClaim, RepsClaimAgent, last_claim_for
 from agents.report_judge import JudgeVerdict, ReportJudgeAgent, VideoFact, VideoVerdict
 from agents.router import RouteDecision, RouterAgent, has_passphrase
 from app.offload import RoutineOffloadClient
-from core import challenge, dayroll, progression
+from core import challenge, dayroll, dedup, progression
 from core.bot_texts import BotTexts
 from core.claims import (
     is_dispute,
@@ -114,6 +114,9 @@ def commit_is_deployed(fix_commit: Optional[str], deployed: Optional[set]) -> bo
     return any(c.startswith(fc) or fc.startswith(c) for c in deployed if len(c) >= 7)
 
 _EX_UNSET = object()  # «вправу не передано — розібрати regex-ом»
+
+
+DEDUP_WINDOW_H = 48.0  # вікно пошуку дублів відео того самого автора, год
 
 
 class ChatFlow:
@@ -318,13 +321,17 @@ class ChatFlow:
         duration: Optional[float] = None,
         file_size: Optional[int] = None,
         caption: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        file_name: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Gate для вхідного відео/GIF (T-30):
         1. reject animation/GIF
         2. reject duration < 5s
         3. reject file_size > 20MB
-        4. dedup by file_unique_id
+        4. dedup: file_unique_id; метадані (той самий розмір+кадр+тривалість під новим id); далі, після
+           підрахунку, — відбиток box CV (core/dedup.py; повторне завантаження/перекодування)
         5. passed -> INSERT video_checks(status='queued'), ack «Беру попкорну і йду дивитись відео»
         """
         if is_animation:
@@ -345,11 +352,25 @@ class ChatFlow:
         if file_unique_id:
             existing = self.store.get_video_check_by_file_unique_id(file_unique_id)
             if existing is not None:
-                reply = "Це відео вже надсилали (дублікат) — вдруге не зараховую."
+                reply = self._duplicate_text()
                 await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
                 return False, reply
 
         request_id = str(uuid.uuid4())
+        meta = dict(file_unique_id=file_unique_id, file_size=file_size, width=width, height=height,
+                    duration_s=float(duration) if duration is not None else None, file_name=file_name)
+        try:
+            # Той самий файл під новим id: збігаються розмір у байтах, кадр і тривалість (за 48 год, той самий автор).
+            for old in self.store.recent_video_metas(user.slug, DEDUP_WINDOW_H):
+                dup, why = dedup.is_duplicate(meta, old)
+                if dup and why in ("same_size", "file_unique_id"):
+                    logger.info("Duplicate video at receipt (%s) of %s for %s", why, old["request_id"][:8], user.slug)
+                    reply = self._duplicate_text()
+                    await self._say_reply(chat_id, reply, reply_to_message_id=message_id)
+                    return False, reply
+            self.store.save_video_meta(request_id, user.slug, **meta)
+        except Exception as e:  # noqa: BLE001  — дедуплікація не має ламати прийом відео
+            logger.warning("Video meta/dedup step failed: %s", e)
         if caption and caption.strip():
             self.store.set_state(f"video_caption:{request_id}", caption.strip())
         self.store.create_video_check(
@@ -438,6 +459,9 @@ class ChatFlow:
             logger.warning("Video check %s not found in database", request_id)
             return None
 
+        if await self._reject_duplicate_video(check, request_id):
+            return None
+
         if self.trust_mode:
             return await self._handle_video_callback_trust(check, request_id)
 
@@ -510,6 +534,57 @@ class ChatFlow:
             )
 
         return reply_text
+
+    def _duplicate_text(self) -> str:
+        return self.bot_texts.get("video_duplicate") or "Це кіно я вже бачив 🍿 — вдруге не зараховую."
+
+    def _find_duplicate_video(self, check) -> Optional[Tuple[Any, str]]:
+        """Чи це відео — повтор раніше пораховано(го) відео цього автора за 48 год. (check, причина) або None."""
+        if (check.status or "") != "done" or not check.user_slug:
+            return None
+        meta = self.store.get_video_meta(check.request_id)
+        if meta is None:
+            return None
+        new = dict(meta)
+        new.update(exercise=challenge.CV_EXERCISE_KEYS.get(check.exercise or "", check.exercise or ""),
+                   reps=check.reps or 0)
+        for old_meta in self.store.recent_video_metas(check.user_slug, DEDUP_WINDOW_H, exclude_request_id=check.request_id):
+            old_check = self.store.get_video_check(old_meta["request_id"])
+            # еталон — раніше пораховане відео (не пізніше за це) і саме не позначене дублем
+            if old_check is None or (old_check.status or "") != "done" or old_check.id >= check.id:
+                continue
+            if any(str(f).startswith("duplicate_of:") for f in (old_check.flags or [])):
+                continue
+            old = dict(old_meta)
+            old.update(exercise=challenge.CV_EXERCISE_KEYS.get(old_check.exercise or "", old_check.exercise or ""),
+                       reps=old_check.reps or 0)
+            dup, why = dedup.is_duplicate(new, old)
+            if dup:
+                return old_check, why
+        return None
+
+    async def _reject_duplicate_video(self, check, request_id: str) -> bool:
+        """Повтор відео (повторне завантаження, перекодування): не зараховуємо вдруге, відповідаємо «вже бачив»."""
+        try:
+            found = self._find_duplicate_video(check)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Duplicate check failed for %s: %s", request_id, e)
+            return False
+        if found is None:
+            return False
+        original, why = found
+        logger.info("Duplicate video %s of %s (%s) — not credited", request_id[:8], original.request_id[:8], why)
+        flags = list(check.flags or [])
+        flags.append(f"duplicate_of:{original.request_id[:8]}:{why}")
+        self.store.update_video_check(request_id, flags=flags)
+        reply_text = self._duplicate_text()
+        try:
+            await self._say_reply(check.chat_id, reply_text, reply_to_message_id=check.message_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to send duplicate reply (%s) — queuing in pending_replies", e)
+            self.store.add_pending_reply(request_id=f"vid_rep_{request_id}", chat_id=check.chat_id,
+                                         text=reply_text, reply_to_message_id=check.message_id)
+        return True
 
     async def _handle_video_callback_trust(self, check, request_id: str) -> Optional[str]:
         today = self._video_day(check)
@@ -703,7 +778,7 @@ class ChatFlow:
                 continue
             credit_reps, credit_ex = self._video_credit(c)
             lines.append(
-                f"- request_id={c.request_id}, час {self._check_local_ts(c)[11:16]}, бот порахував: {c.exercise or '?'} {int(c.reps or 0)}, "
+                f"- owner={slug}, request_id={c.request_id}, час {self._check_local_ts(c)[11:16]}, бот порахував: {c.exercise or '?'} {int(c.reps or 0)}, "
                 f"зараховано: {credit_reps} {credit_ex or '?'}"
             )
             ids.append(c.request_id)
@@ -803,27 +878,118 @@ class ChatFlow:
                 pass
         return int(check.reps or 0), challenge.CV_EXERCISE_KEYS.get(check.exercise or "")
 
-    async def _llm_dispute_claim(self, chat_id: int, m: ChatMessage, slug: str, today) -> Tuple[Optional[RepsClaim], str]:
+    # --- учасники, їхні імена й відкриті питання «скільки вийшло?» ---
+    def _participant_users(self) -> list:
+        return list(self.store.list_users())
+
+    @staticmethod
+    def _name_stems(user) -> List[str]:
+        """Основи імен для впізнавання відмінків: Льоша/Льоші/Льошу -> 'льош'."""
+        stems = []
+        for raw in [user.display_name, user.slug, user.telegram_name, user.username, *(user.aliases or [])]:
+            w = re.sub(r"[^\w]", "", (raw or "").lower())
+            if len(w) >= 3:
+                stems.append(w[:-1] if len(w) >= 4 else w)
+        return stems
+
+    def _mentioned_users(self, text: str, exclude: Optional[str] = None) -> List[str]:
+        words = re.findall(r"\w+", (text or "").lower())
+        out = []
+        for u in self._participant_users():
+            if u.slug == exclude:
+                continue
+            if any(w.startswith(st) for st in self._name_stems(u) for w in words):
+                out.append(u.slug)
+        return out
+
+    def _open_dispute_waits(self, today_iso: str) -> Dict[str, dict]:
+        """{subject_slug: {rid, day, asked_by}} — відкриті питання «скільки вийшло?» за сьогодні."""
+        waits: Dict[str, dict] = {}
+        for u in self._participant_users():
+            raw = self.store.get_state(f"dispute_wait:{u.slug}", "")
+            if not raw:
+                continue
+            try:
+                w = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(w, dict) and w.get("day") == today_iso:
+                waits[u.slug] = w
+        return waits
+
+    def _participants_block(self) -> str:
+        return "\n".join(f"- slug='{u.slug}': {u.display_name or u.slug}" for u in self._participant_users())
+
+    def _all_videos_block(self, day) -> Tuple[str, List[str]]:
+        lines, ids = [], []
+        for u in self._participant_users():
+            block, uids = self._videos_block(u.slug, day)
+            if block:
+                lines.append(block)
+                ids.extend(uids)
+        return "\n".join(lines), ids
+
+    def _owner_of_quoted_count(self, quoted_text: str, today) -> Optional[str]:
+        """Цитата відповіді бота «Побачив N <вправа>…» -> автор відео за сьогодні з таким N (останнє такс). Для regex-фолбеку."""
+        m = re.search(r"Побачив\s+(\d+)", quoted_text or "")
+        if not m:
+            return None
+        n = int(m.group(1))
+        best = None
+        for u in self._participant_users():
+            for c in self._day_video_checks(u.slug, today):
+                if c.status == "done" and int(c.reps or 0) == n:
+                    if best is None or c.id > best[0]:
+                        best = (c.id, u.slug)
+        return best[1] if best else None
+
+    def _regex_subject(self, text: str, speaker: str, quoted_text: Optional[str], waits: Dict[str, dict], today) -> str:
+        """Чий це підрахунок, коли LLM недоступний: цитата бота > названа інша людина (без «я N») > питання, поставлене цій людині > автор."""
+        owner = self._owner_of_quoted_count(quoted_text or "", today)
+        if owner and owner != speaker:
+            return owner
+        self_claim = re.search(r"\bя\s+\d|\bя\s+(?:зробив|зробила|присів|присіла|відтис)", (text or "").lower())
+        if not self_claim:
+            others = self._mentioned_users(text, exclude=speaker)
+            if others:
+                return others[0]
+        for subj, w in waits.items():
+            if subj != speaker and w.get("asked_by") == speaker:
+                return subj
+        return speaker
+
+    async def _llm_dispute_claim(self, chat_id: int, m: ChatMessage, speaker: str, today,
+                                 quoted_text: Optional[str] = None, waits: Optional[Dict[str, dict]] = None
+                                 ) -> Tuple[Optional[RepsClaim], str]:
         """
         Тул report_reps для повідомлення після відео. (claim|None, шлях): 'llm' | 'llm_none' | 'regex_fallback' | 'regex'
-        ('regex*' — claim None, рішення приймає regex-шлях). Claim інших людей відкидається.
+        ('regex*' — claim None, рішення приймає regex-шлях). Claim може стосуватись ІНШОЇ людини (subject_user):
+        слово будь-якого учасника про чуже відео зараховується власнику відео.
         """
         if self.llm is None:
             return None, "regex"
         try:
-            videos_block, ids = self._videos_block(slug, today)
-            user = self.store.find_user(slug)
+            videos_block, ids = self._all_videos_block(today)
+            user = self.store.find_user(speaker)
+            extra = ""
+            if quoted_text:
+                extra += f"ЦИТОВАНЕ ПОВІДОМЛЕННЯ (на нього відповідає автор): «{quoted_text}»\n"
+            for subj, w in (waits or {}).items():
+                u2 = self.store.find_user(subj)
+                extra += (f"ВІДКРИТЕ ПИТАННЯ БОТА: «скільки вийшло?» щодо відео {u2.display_name if u2 else subj} "
+                          f"(subject_user='{subj}', request_id={w.get('rid')}), спитано через повідомлення "
+                          f"учасника '{w.get('asked_by') or subj}'.\n")
             claims = await self._call(
-                self.claims_agent.extract, today, slug, (user.display_name if user else slug), "dispute",
+                self.claims_agent.extract, today, speaker, (user.display_name if user else speaker), "dispute",
                 m.text or "", self._recent_chat_text(chat_id, 60), videos_block, ids,
+                self._participants_block(), extra,
             )
         except Exception as e:
             logger.warning("Dispute claim via LLM failed (%s) — regex fallback", e)
             return None, "regex_fallback"
-        claim = last_claim_for(claims, slug)
-        others = [c for c in claims if c.user != slug]
-        if others:
-            logger.info("Ignoring report_reps claims for other users: %s", [(c.user, c.count) for c in others])
+        claim = claims[-1] if claims else None
+        if len({c.user for c in claims}) > 1:
+            logger.info("report_reps: several subjects, using the last: %s", [(c.user, c.count) for c in claims])
         return claim, ("llm" if claim else "llm_none")
 
     def _pick_target_check(self, slug: str, today, before_ts: str, wait: Optional[dict], request_id: Optional[str] = None):
@@ -841,57 +1007,58 @@ class ChatFlow:
     async def _handle_disputes(self, chat_id: int, pending: List[ChatMessage]) -> List[ChatMessage]:
         """
         Людина називає/оспорює кількість на відео -> її слова важливіші за CV. Число розбирає LLM-тул report_reps (цифри, слова,
-        сленг, заперечення); regex — лише фолбек, якщо LLM недоступний. З числом — виправляємо залік; без числа — один раз
-        м'яко питаємо «скільки вийшло?». Повертає повідомлення, що лишились для звичайної обробки. Працює аж до кінця дня.
+        сленг, заперечення; subject_user — чиї повтори: автора або ІНШОГО учасника, напр. власник пише про відео Льоші);
+        regex — лише фолбек, якщо LLM недоступний. З числом — виправляємо залік власника відео; без числа — один раз м'яко
+        питаємо «скільки вийшло?» (відповідь на це питання від того, кого спитали, закриває питання для потрібної людини).
+        Повертає повідомлення, що лишились для звичайної обробки. Працює аж до кінця дня.
         """
         today = self._today()
         today_iso = today.isoformat()
         remaining: List[ChatMessage] = []
         for m in pending:
-            slug = challenge.normalize_participant(m.user_name, self.store)
-            if not slug or (m.text or "").startswith("[Надіслано"):
+            speaker = challenge.normalize_participant(m.user_name, self.store)
+            if not speaker or (m.text or "").startswith("[Надіслано"):
                 remaining.append(m)
                 continue
             quoted_sender, quoted_text, _rest = split_reply_context(m.text)
             reply_to_bot = bool(quoted_text) and (
                 "Побачив" in quoted_text or "Зануда" in (quoted_sender or "") or "зарахов" in quoted_text.lower()
             )
-            wait_key = f"dispute_wait:{slug}"
-            wait = None
-            raw = self.store.get_state(wait_key, "")
-            if raw:
-                try:
-                    wait = json.loads(raw)
-                except ValueError:
-                    wait = None
-                if not isinstance(wait, dict) or wait.get("day") != today_iso:
-                    wait = None
+            all_waits = self._open_dispute_waits(today_iso)
+            # питання, що стосується цієї людини або було задане через її повідомлення; чужі — лише якщо є число
+            waits = {subj: w for subj, w in all_waits.items()
+                     if subj == speaker or w.get("asked_by") == speaker or looks_like_count(m.text)}
             regex_disputed = is_dispute(m.text, reply_to_bot_count=reply_to_bot)
-            regex_number = parse_dispute_reps(m.text)
-            # дешевий префільтр, щоб не кликати LLM на кожну репліку
-            if not (regex_disputed or wait or reply_to_bot or looks_like_count(m.text)):
+            if not (regex_disputed or waits or reply_to_bot or looks_like_count(m.text)):
                 remaining.append(m)
                 continue
-            if self._pick_target_check(slug, today, m.created_at, wait) is None:
-                remaining.append(m)  # немає відео, яке можна оспорювати -> звичайна обробка
+            if not any(self._pick_target_check(u.slug, today, m.created_at, None) for u in self._participant_users()):
+                remaining.append(m)  # жодного пораховано відео сьогодні -> звичайна обробка
                 continue
 
-            claim, path = await self._llm_dispute_claim(chat_id, m, slug, today)
+            claim, path = await self._llm_dispute_claim(chat_id, m, speaker, today, quoted_text, waits)
             ex_hint = _EX_UNSET
             if path == "llm":
-                number, disputed = claim.count, True
+                subject, number, disputed = claim.user, claim.count, True
                 ex_hint = claim.exercise
-            elif path == "llm_none":
-                number, disputed = None, regex_disputed
             else:
-                number, disputed = regex_number, regex_disputed
-            logger.info("Dispute path=%s user=%s number=%s ex=%s disputed=%s", path, slug, number,
+                subject = self._regex_subject(m.text, speaker, quoted_text, waits, today)
+                if path == "llm_none":
+                    number, disputed = None, regex_disputed
+                else:
+                    number, disputed = parse_dispute_reps(m.text), regex_disputed
+            wait = waits.get(subject)
+            logger.info("Dispute path=%s speaker=%s subject=%s number=%s ex=%s disputed=%s", path, speaker, subject, number,
                         None if ex_hint is _EX_UNSET else ex_hint, disputed)
             if not disputed and not (wait and number is not None):
                 remaining.append(m)
                 continue
 
-            target_check = self._pick_target_check(slug, today, m.created_at, wait, claim.request_id if claim else None)
+            target_check = self._pick_target_check(subject, today, m.created_at, wait,
+                                                   claim.request_id if claim else None)
+            if target_check is None:
+                remaining.append(m)  # у названої людини сьогодні нема пораховано відео
+                continue
             if number is not None and path.startswith("regex"):
                 # людина не погоджується з підрахунком CV: число, що збігається з CV, відкидаємо, якщо є інше
                 number = parse_dispute_reps(m.text, exclude=int(target_check.reps or 0) or None)
@@ -901,16 +1068,27 @@ class ChatFlow:
                     remaining.append(m)
                     continue
                 if wait:
-                    logger.info("Dispute from %s without number — already asked, waiting", slug)
+                    logger.info("Dispute from %s about %s without number — already asked, waiting", speaker, subject)
                 else:
-                    self.store.set_state(wait_key, json.dumps({"rid": target_check.request_id, "day": today_iso}))
-                    await self._say(chat_id, self.bot_texts.get("trust_dispute_ask"))
+                    self.store.set_state(f"dispute_wait:{subject}", json.dumps(
+                        {"rid": target_check.request_id, "day": today_iso, "asked_by": speaker}))
+                    if subject == speaker:
+                        await self._say(chat_id, self.bot_texts.get("trust_dispute_ask"))
+                    else:
+                        await self._say(chat_id, self.bot_texts.get("trust_dispute_ask_other",
+                                                                    name=self._display_name(subject)))
                 continue
 
-            await self._apply_video_correction(chat_id, target_check, slug, number, m.text, explicit_ex=ex_hint)
-            if wait:
-                self.store.set_state(wait_key, "")
+            await self._apply_video_correction(chat_id, target_check, subject, number, m.text, explicit_ex=ex_hint,
+                                               reporter=speaker)
+            for key in {subject, speaker}:
+                if self.store.get_state(f"dispute_wait:{key}", ""):
+                    self.store.set_state(f"dispute_wait:{key}", "")
         return remaining
+
+    def _display_name(self, slug: str) -> str:
+        u = self.store.find_user(slug)
+        return (u.display_name if u and u.display_name else slug)
 
     async def _apply_reported_claims(self, chat_id: int, claims: List[RepsClaim]) -> None:
         """Claim-и, які coach-LLM передав тулом report_reps під час відповіді: застосовуємо тихо (відповідь coach уже є)."""
@@ -925,10 +1103,11 @@ class ChatFlow:
             if check is None:
                 logger.info("report_reps from coach for %s ignored: no video today", c.user)
                 continue
-            await self._apply_video_correction(chat_id, check, c.user, c.count, "", explicit_ex=c.exercise, say=False)
+            await self._apply_video_correction(chat_id, check, c.user, c.count, "", explicit_ex=c.exercise, say=False,
+                                               reporter=c.reported_by)
 
     async def _apply_video_correction(self, chat_id: int, check, slug: str, reps: int, text: str,
-                                      explicit_ex=_EX_UNSET, say: bool = True) -> str:
+                                      explicit_ex=_EX_UNSET, say: bool = True, reporter: Optional[str] = None) -> str:
         """
         Виправляє залік до числа людини (воно ЗАВЖДИ перемагає CV, і вище, і нижче). Змінює лише денну спробу/статус —
         XP, життя й наступну норму рахує звичайний settle за best_reps дня, тож подвійного нарахування немає.
@@ -948,7 +1127,12 @@ class ChatFlow:
                              json.dumps({"reps": int(reps), "ex": ex, "disputed": True}))
         target = challenge.day_targets(self.store, today).get(slug, 10)
         ex_word = challenge.exercise_word(ex, reps)
-        parts = [self.bot_texts.get("trust_dispute_fix", claimed=reps, exercise=ex_word, reps=reps)]
+        if reporter and reporter != slug:
+            # число про чуже відео назвала інша людина (напр. власник) — зараховуємо власнику відео, без повчань
+            parts = [self.bot_texts.get("trust_dispute_fix_other", name=self._display_name(slug),
+                                        reporter=self._display_name(reporter), claimed=reps, exercise=ex_word, reps=reps)]
+        else:
+            parts = [self.bot_texts.get("trust_dispute_fix", claimed=reps, exercise=ex_word, reps=reps)]
         if ex == day_ex or prev_ex == day_ex:
             best = 0
             for c in self._day_video_checks(slug, today):

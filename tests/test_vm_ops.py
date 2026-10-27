@@ -97,6 +97,28 @@ async def test_credit_attempt_dates_and_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_credit_attempt_sets_video_credit_for_request(tmp_path):
+    client, store = await _client(tmp_path)
+    try:
+        _user(store)
+        from datetime import date
+        from core import challenge
+        ex = challenge.day_exercise(store, date(2026, 10, 25))
+        store.create_video_check(request_id="rid-dima", chat_id=CHAT, message_id=1, user_slug="dima", status="done",
+                                 exercise="squat", reps=3, valid=True)
+        store.set_state("video_credit:rid-dima", json.dumps({"reps": 3, "ex": ex}))
+        params = {"slug": "dima", "date": "2026-10-25", "exercise": ex, "reps": 7, "request_id": "rid-dima"}
+        st, out = await _ops(client, op="credit_attempt", key="t-cr-rid", params=params)
+        assert st == 200 and out["record"]["result"]["video_credit"]["reps"] == 7
+        assert json.loads(store.get_state("video_credit:rid-dima", "")) == {"reps": 7, "ex": ex, "disputed": True}
+        # чуже/невідоме відео відхиляється
+        st, out = await _ops(client, op="credit_attempt", key="t-cr-rid2", params={**params, "request_id": "nope"})
+        assert out.get("status") != "done"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_send_message_exactly_once(tmp_path, monkeypatch):
     client, store = await _client(tmp_path)
     sent = []

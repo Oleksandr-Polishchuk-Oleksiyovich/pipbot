@@ -30,12 +30,13 @@ _EX_NONE = {"", "none", "null", "nil", "unknown", "невідомо", "не на
 
 @dataclass
 class RepsClaim:
-    user: str                      # slug автора claim-у
+    user: str                      # slug SUBJECT-а: хто виконав повтори (може відрізнятись від того, хто це написав)
     count: int                     # скільки повторів людина стверджує (рівно це число)
     exercise: Optional[str]        # 'pushups' | 'squats' | None (людина вправу не називала)
     corrects_existing_video: bool  # True — виправляє вже пораховане/зараховане; False — просто називає число
     request_id: Optional[str]      # відео, до якого належить число (якщо відомо)
     confidence: float = 1.0
+    reported_by: Optional[str] = None  # slug того, хто написав повідомлення (None — невідомо / сам subject)
 
 
 def normalize_exercise(value) -> Optional[str]:
@@ -60,7 +61,7 @@ def make_report_reps_tool(
     valid_ids = set(valid_request_ids or [])
 
     def report_reps(
-        user: str,
+        subject_user: str,
         count: int,
         exercise: str = "",
         corrects_existing_video: bool = True,
@@ -69,20 +70,23 @@ def make_report_reps_tool(
     ) -> str:
         """
         Зафіксувати кількість повторів, яку людина САМА назвала або виправила («я зробив 23», «двадцять три», «півсотні»,
-        «а не 50, а 23», «десь 20»). Слова людини важливіші за підрахунок бота. Викликай один раз на автора й відео.
-        НЕ викликай, якщо числа немає, або якщо число належить іншій людині/нормі/часу/підходам.
+        «а не 50, а 23», «десь 20»), АБО яку учасник назвав про відео ІНШОГО учасника («Льоша зробив 36», «я перерахував — у нього
+        36», «записуй Льоші 36»). Слова людей важливіші за підрахунок бота. Викликай один раз на людину й відео.
+        НЕ викликай, якщо числа немає, або якщо число належить нормі/часу/вазі/підходам.
 
         Args:
-            user: slug автора повідомлення (з контексту), хто ВИКОНАВ повтори.
-            count: ціле число повторів 1..1000, яке людина стверджує (саме те, а не число бота й не заперечене «не 50»).
+            subject_user: slug учасника, ЧИЇ це повтори (хто виконав): автор повідомлення, якщо він пише про себе; інакше —
+                той, про кого/чиє відео йдеться (за цитатою-відповіддю, іменем у тексті, відкритим питанням бота).
+                Порожній рядок = сам автор повідомлення.
+            count: ціле число повторів 1..1000, яке стверджує людина (саме те, а не число бота й не заперечене «не 50»).
             exercise: 'pushups' або 'squats', ЛИШЕ якщо людина сама назвала вправу; інакше порожній рядок.
-            corrects_existing_video: true, якщо людина виправляє вже пораховане/зараховане ботом; false — просто називає число до підрахунку.
-            request_id: request_id відео з контексту, до якого належить число; порожній, якщо невідомо.
+            corrects_existing_video: true, якщо виправляє вже пораховане/зараховане ботом; false — просто називає число до підрахунку.
+            request_id: request_id відео зі списку в контексті, до якого належить число; порожній, якщо невідомо.
             confidence: 0..1, наскільки ти впевнений у числі (слова-приблизно, «десь 20» — менше).
         """
-        slug = challenge.normalize_participant(str(user), store) or (default_user if not user else None)
+        slug = challenge.normalize_participant(str(subject_user), store) if str(subject_user or "").strip() else default_user
         if not slug:
-            return "Помилка: невідомий user. Передай slug учасника з контексту."
+            return "Помилка: невідомий subject_user. Передай slug учасника з контексту."
         if isinstance(count, bool):
             return "Помилка: count має бути цілим числом 1..1000."
         try:
@@ -103,7 +107,7 @@ def make_report_reps_tool(
         except (TypeError, ValueError):
             conf = 1.0
         sink.append(RepsClaim(user=slug, count=n, exercise=ex, corrects_existing_video=bool(corrects_existing_video),
-                              request_id=rid, confidence=conf))
+                              request_id=rid, confidence=conf, reported_by=default_user))
         logger.info("report_reps tool: user=%s count=%s exercise=%s corrects=%s request_id=%s conf=%.2f",
                     slug, n, ex, bool(corrects_existing_video), rid, conf)
         return f"Прийнято: {slug} — {n} повторів" + (f" ({ex})" if ex else "") + ". Більше нічого викликати не треба."
@@ -131,6 +135,8 @@ class RepsClaimAgent(PromptAgent):
         context_text: str,
         videos_block: str,
         request_ids: List[str],
+        participants_block: str = "",
+        extra_context: str = "",
     ) -> List[RepsClaim]:
         """
         mode: 'dispute' (повідомлення після відео — виправлення/уточнення) або 'video' (підпис і сусідні тексти до нового відео).
@@ -147,7 +153,9 @@ class RepsClaimAgent(PromptAgent):
         prompt = (
             f"Дата челенджу: {today.isoformat()}. Автор: {author_name} (slug='{author_slug}').\n"
             f"{where}\n\n"
-            f"ВІДЕО АВТОРА ЗА СЬОГОДНІ (request_id, що порахував бот, що зараховано):\n{videos_block or '(немає)'}\n\n"
+            + (f"УЧАСНИКИ ЧЕЛЕНДЖУ:\n{participants_block}\n\n" if participants_block else "") +
+            f"ВІДЕО ЗА СЬОГОДНІ (owner — чиє відео; request_id, що порахував бот, що зараховано):\n{videos_block or '(немає)'}\n\n"
+            + (f"{extra_context}\n" if extra_context else "") +
             f"НЕДАВНІ ПОВІДОМЛЕННЯ В ЧАТІ (контекст):\n{context_text or '(немає)'}\n\n"
             f"ТЕКСТ ДЛЯ АНАЛІЗУ (від {author_name}):\n{target_text}\n"
         )

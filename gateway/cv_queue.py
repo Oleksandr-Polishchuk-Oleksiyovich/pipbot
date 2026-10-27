@@ -77,6 +77,22 @@ async def _ensure_video(app: web.Application, store, rid: str) -> None:
     tmp = path + ".part"
     await asyncio.to_thread(fetch, check.file_id, tmp)
     os.replace(tmp, path)
+    await asyncio.to_thread(_record_sha, store, rid, path)
+
+
+def _record_sha(store, rid: str, path: str) -> None:
+    """sha256 байтів для дедуплікації (VM має файл — рахуємо тут, box CV не потрібен). Збій не фатальний."""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        n = 0
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+                n += len(chunk)
+        store.set_video_sha(rid, h.hexdigest(), n)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("sha256 for %s failed: %s", rid, e)
 
 
 async def handle_claim(request: web.Request) -> web.Response:
@@ -168,6 +184,12 @@ async def handle_result(request: web.Request) -> web.Response:
             analyzer_version=result.get("analyzer_version", "box-cv"),
             finished=True,
         )
+        fp = result.get("fingerprint")
+        if isinstance(fp, dict):
+            try:
+                store.set_video_fingerprint(rid, fp)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("fingerprint store failed for %s: %s", rid, e)
     elif new_status == "failed":
         store.update_video_check(rid, status="failed", flags=["worker_error"], finished=True)
     else:

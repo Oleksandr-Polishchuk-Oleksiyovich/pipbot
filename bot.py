@@ -241,6 +241,9 @@ def build_app():
             file_unique_id = getattr(media_obj, "file_unique_id", None)
             duration = getattr(media_obj, "duration", None)
             file_size = getattr(media_obj, "file_size", None)
+            width = getattr(media_obj, "width", None)
+            height = getattr(media_obj, "height", None)
+            file_name = getattr(media_obj, "file_name", None)
 
             user_record = flow.record_user_message(
                 message.chat.id,
@@ -259,6 +262,9 @@ def build_app():
                 file_unique_id=file_unique_id,
                 duration=float(duration) if duration is not None else None,
                 file_size=file_size,
+                width=width,
+                height=height,
+                file_name=file_name,
                 caption=getattr(message, "caption", None),
             )
             return

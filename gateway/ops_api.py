@@ -80,6 +80,13 @@ def snapshot(store, since_days: int, date_iso: Optional[str], log_lines: int) ->
         out["video_checks"] = _rows(con, (
             "SELECT id, substr(request_id,1,8) rid, chat_id, message_id, user_slug, exercise, reps, confidence, valid, status, "
             "flags, location, duration_s, created_at, finished_at FROM video_checks WHERE created_at >= ? ORDER BY id"), (since,))
+        try:
+            out["video_fingerprints"] = _rows(con, (
+                "SELECT substr(request_id,1,8) rid, user_slug, file_unique_id, file_size, width, height, duration_s, file_name, "
+                "substr(sha256,1,12) sha12, sha_bytes, (fingerprint IS NOT NULL) has_fp, created_at "
+                "FROM video_fingerprints WHERE created_at >= ? ORDER BY created_at"), (since,))
+        except Exception:  # noqa: BLE001  — таблиці ще нема на старій БД
+            out["video_fingerprints"] = []
         out["video_checks_by_status"] = {r["status"]: r["n"] for r in _rows(con, "SELECT status, COUNT(*) n FROM video_checks GROUP BY status")}
         out["daily_attempts"] = _rows(con, "SELECT date, user_slug, exercise, best_reps, updated_at FROM daily_attempts "
                                            "WHERE date >= date('now', ?) ORDER BY date, user_slug", (f"-{since_days + 2} days",))
@@ -227,8 +234,18 @@ def _op_credit_attempt(store, p: Dict[str, Any]) -> Dict[str, Any]:
         store.set_done(slug, True, date_iso)
         done = True
     settled = store.get_state("progression_settled_through", "") >= date_iso
+    credit = None
+    rid = str(p.get("request_id") or "").strip()
+    if rid:
+        # зараховане за це відео (video_credit:<rid>) — щоб перерахунок дня/оспорювання не відкотили число
+        check = store.get_video_check(rid)
+        if check is None or check.user_slug != slug:
+            raise ValueError(f"request_id {rid[:8]} is not a video of {slug}")
+        credit = {"reps": int(reps), "ex": exercise, "disputed": True}
+        store.set_state(f"video_credit:{rid}", json.dumps(credit))
     return {"slug": slug, "date": date_iso, "exercise": exercise, "target": target, "best_before": before_best,
-            "best_after": best, "done_before": done_before, "done_after": done, "day_already_settled": settled}
+            "best_after": best, "done_before": done_before, "done_after": done, "day_already_settled": settled,
+            "video_credit": credit}
 
 
 def _telegram_send(token: str, chat_id: int, text: str, reply_to: Optional[int]) -> Dict[str, Any]:

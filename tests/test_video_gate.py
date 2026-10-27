@@ -145,7 +145,7 @@ async def test_gate_rejects_duplicate_video(tmp_path):
         file_id="vid_valid2", file_unique_id="uid_same"
     )
     assert passed2 is False
-    assert "дублікат" in reply2.lower() or "вже надсилали" in reply2.lower()
+    assert "вже бачив" in reply2.lower() or "дублікат" in reply2.lower()
     assert len(flow.store.list_video_checks()) == 1  # новий запис не створено
 
 

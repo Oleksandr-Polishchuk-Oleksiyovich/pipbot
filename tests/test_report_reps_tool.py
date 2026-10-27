@@ -67,7 +67,7 @@ def test_tool_schema_and_validation(tmp_path):
     tool = make_report_reps_tool(flow.store, sink, valid_request_ids=["r1"])
     assert tool.__name__ == "report_reps"
     assert list(tool.__code__.co_varnames[:tool.__code__.co_argcount]) == [
-        "user", "count", "exercise", "corrects_existing_video", "request_id", "confidence"]
+        "subject_user", "count", "exercise", "corrects_existing_video", "request_id", "confidence"]
     assert "Помилка" in tool("lyosha", 0)
     assert "Помилка" in tool("lyosha", 5000)
     assert "Помилка" in tool("lyosha", True)
@@ -92,7 +92,7 @@ def test_tool_schema_and_validation(tmp_path):
 ])
 async def test_dispute_words_via_llm_tool(tmp_path, text, count):
     def script(tool, prompt):
-        tool(user="lyosha", count=count, exercise="", corrects_existing_video=True, request_id="req-1", confidence=0.9)
+        tool(subject_user="lyosha", count=count, exercise="", corrects_existing_video=True, request_id="req-1", confidence=0.9)
 
     flow, sender, _ = make_flow(tmp_path, llm=ToolLLM(script), trust_mode=True)
     _video(flow, reps=4, ex="pushup")
@@ -110,7 +110,7 @@ async def test_dima_example_llm_lower_number_exact_and_exercise_from_video(tmp_p
 
     def script(tool, prompt):
         seen["prompt"] = prompt
-        tool(user="lyosha", count=23, exercise="", corrects_existing_video=True, request_id="req-1", confidence=0.95)
+        tool(subject_user="lyosha", count=23, exercise="", corrects_existing_video=True, request_id="req-1", confidence=0.95)
 
     llm = ToolLLM(script)
     flow, sender, _ = make_flow(tmp_path, llm=llm, trust_mode=True)
@@ -127,7 +127,7 @@ async def test_dima_example_llm_lower_number_exact_and_exercise_from_video(tmp_p
 
 async def test_dima_example_names_other_exercise_moves_credit(tmp_path):
     def script(tool, prompt):
-        tool(user="lyosha", count=23, exercise="squats", request_id="req-1")
+        tool(subject_user="lyosha", count=23, exercise="squats", request_id="req-1")
 
     flow, sender, _ = make_flow(tmp_path, llm=ToolLLM(script), trust_mode=True)
     _video(flow, reps=50, ex="squat")
@@ -159,9 +159,9 @@ async def test_llm_no_number_in_dispute_asks_once(tmp_path):
     assert len([t for t in sender.texts if "Скільки в тебе вийшло" in t]) == 1
 
 
-async def test_claim_for_other_user_is_ignored(tmp_path):
+async def test_claim_for_user_without_video_is_ignored(tmp_path):
     def script(tool, prompt):
-        tool(user="sasha", count=99, exercise="")
+        tool(subject_user="sasha", count=99, exercise="")
 
     flow, sender, _ = make_flow(tmp_path, llm=ToolLLM(script), trust_mode=True)
     _video(flow, reps=30, ex="pushup")
@@ -184,7 +184,7 @@ async def test_llm_unavailable_falls_back_to_regex_and_logs_path(tmp_path, caplo
 async def test_caption_words_extracted_by_llm(tmp_path):
     def script(tool, prompt):
         assert "двадцять три віджимання" in prompt
-        tool(user="lyosha", count=23, exercise="pushups", corrects_existing_video=False, request_id="req-c")
+        tool(subject_user="lyosha", count=23, exercise="pushups", corrects_existing_video=False, request_id="req-c")
 
     flow, sender, _ = make_flow(tmp_path, llm=ToolLLM(script), trust_mode=True)
     flow.store.set_state("video_caption:req-c", "двадцять три віджимання")
@@ -231,7 +231,7 @@ def test_coach_has_report_reps_tool_and_prompt_rules(tmp_path):
     sink = []
 
     def script(tool, p):
-        tool(user="lyosha", count=31, exercise="", request_id="")
+        tool(subject_user="lyosha", count=31, exercise="", request_id="")
 
     llm = ToolLLM(script)
     CoachAgent(llm, flow.store).reply(date(2026, 10, 4), [], [], sink)
