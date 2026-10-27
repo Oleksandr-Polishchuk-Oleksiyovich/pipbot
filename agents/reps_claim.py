@@ -125,6 +125,12 @@ class RepsClaimAgent(PromptAgent):
 
     prompt_key = "reps_claim"
 
+    @property
+    def system_prompt(self) -> str:
+        # Редагований промпт з БД + захищене ядро (ПРАВИЛА ДОВІРИ та приклади) в кінці.
+        from core import trust_core
+        return trust_core.ensure_core(super().system_prompt)
+
     def extract(
         self,
         today: date,

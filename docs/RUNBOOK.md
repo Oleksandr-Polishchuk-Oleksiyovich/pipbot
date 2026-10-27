@@ -213,6 +213,15 @@ echo "Backup created at $BACKUP_FILE"
 ```
 Лише після перевірки та схвалення тим самим адміністратором деплой продовжується.
 
+### 5.2a Захищене ядро довіри (ПРАВИЛА ДОВІРИ)
+`prompts_core/trust_core.md` (правила + опис тулу `report_reps`) і `prompts_core/trust_examples.json` (few-shot приклади, вони ж тест-кейси) живуть
+у git і додаються в КІНЕЦЬ промптів coach та reps_claim під час збірки (`core/trust_core.py: ensure_core`). Адмін може міняти лише редагований
+шар у БД (`coach_base`, `coach_dynamic` — персона, тон, жарти); `Store.save_prompt` вирізає блок ядра з тексту, а `CoachPromptEditor` не зберігає
+його в БД. Агент адміна бачить ядро read-only через тул `get_trust_examples`. Змінити ядро можна тільки задачею `create_admin_task`/PR у git
+(шляхи `prompts_core/*` і `core/trust_core.py` — у `FORBIDDEN_PATTERNS`, тобто потребують `/approve`), потім стандартний деплой. Перевірка після змін:
+`pytest tests/test_trust_core.py tests/test_trust_scenarios.py`; поведінка реального LLM — `python tests/eval/run_prompt_eval.py --live`
+(лише вручну, див. docs/TESTING_TRUST.md).
+
 ### 5.3 Журнал аудиту
 Усі дії адмінів фіксуються в таблиці `admin_audit`:
 ```bash

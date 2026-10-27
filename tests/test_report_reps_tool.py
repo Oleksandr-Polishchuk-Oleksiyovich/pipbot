@@ -226,7 +226,7 @@ async def test_caption_without_llm_configured_uses_regex(tmp_path):
 def test_coach_has_report_reps_tool_and_prompt_rules(tmp_path):
     flow, _, _ = make_flow(tmp_path, llm=None, trust_mode=True)
     prompt = CoachAgent(None, flow.store).build_system_prompt(date(2026, 10, 4))
-    assert "report_reps" in prompt and "Слова людини важливіші" in prompt
+    assert "report_reps" in prompt and "Слова людей важливіші" in prompt
 
     sink = []
 

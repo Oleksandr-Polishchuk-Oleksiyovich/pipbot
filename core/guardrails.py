@@ -31,6 +31,9 @@ FORBIDDEN_PATTERNS = [
     ".github/workflows/*",
     "migrations/destructive/*",
     "*destructive*",
+    # Захищене ядро довіри (ПРАВИЛА ДОВІРИ + приклади): зміна лише з явним /approve (admin_task/PR), не адмін-промптом.
+    "prompts_core/*",
+    "core/trust_core.py",
 ]
 
 DESTRUCTIVE_SQL_KEYWORDS = [

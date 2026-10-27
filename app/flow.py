@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 COACH_NAME = "Спорт Зануда"
 VIDEO_REPLY_PARAPHRASE_SYSTEM = (
-    "Ти — «Спорт Зануда», суворий і дотепний спортивний AI-тренер. "
+    "Ти — «Спорт Зануда», дотепний і доброзичливий спортивний AI-тренер. "
     "Перефразуй наданий тон-зразок відповіді на відеозвіт за правилами нижче."
 )
 
@@ -1115,6 +1115,13 @@ class ChatFlow:
         """
         today = self._today()
         today_iso = today.isoformat()
+        if self.store.get_state("progression_settled_through", "") >= today_iso:
+            # День уже підсумовано (XP/життя нараховані) — автоматично не міняємо, щоб не розсинхронізувати прогрес; це шлях адміна.
+            reply = self.bot_texts.get("trust_dispute_settled", name=self._display_name(slug), claimed=reps)
+            if say:
+                await self._say(chat_id, reply)
+            logger.info("Dispute on settled day %s: %s claimed %s — not applied (admin path)", today_iso, slug, reps)
+            return reply
         day_ex = challenge.day_exercise(self.store, today)
         # Вправа: названа людиною > вправа, під яку вже зараховано це відео (довіра) > вправа дня.
         # Вправу, яку «побачив» CV, ігноруємо: назване число зараховується на вправу дня (CV міг переплутати присідання/віджимання).

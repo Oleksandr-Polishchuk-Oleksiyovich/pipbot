@@ -294,6 +294,10 @@ def _row_to_bot_text(row: Tuple) -> Dict[str, Any]:
     }
 
 
+# Редаговані промпти, до яких під час виконання завжди додається захищене ядро довіри (core/trust_core.py).
+PROMPT_KEYS_WITH_PROTECTED_CORE = ("coach_base", "coach_dynamic", "reps_claim")
+
+
 class Store:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -1194,6 +1198,10 @@ class Store:
     def save_prompt(self, key: str, content: str, updated_by: str) -> int:
         """Зберігає нову версію промпту та архівує її в prompt_history. Повертає номер версії."""
         ensure_clean(content, f"prompts.{key}")
+        if key in PROMPT_KEYS_WITH_PROTECTED_CORE:
+            # Захищене ядро довіри живе в git і додається в кінець під час збірки; копію з тексту адміна вирізаємо.
+            from core.trust_core import strip_core
+            content = strip_core(content)
         with self._connect() as con:
             row = con.execute("SELECT version FROM prompts WHERE key = ?", (key,)).fetchone()
             version = (row[0] + 1) if row else 1

@@ -453,6 +453,14 @@ class AdminAgent(PromptAgent):
             """Показати чинні динамічні правила тренера."""
             return store.get_prompt(COACH_DYNAMIC_KEY) or "(динамічних правил немає)"
 
+        def get_trust_examples() -> str:
+            """
+            Read-only довідка: захищене ядро довіри (ПРАВИЛА ДОВІРИ + приклади «повідомлення → report_reps»). Дивись його перед
+            будь-яким переписуванням правил тренера. Змінити ядро цим агентом НЕ можна — лише через create_admin_task (PR у git).
+            """
+            from core import trust_core
+            return trust_core.core_block()
+
         def set_bot_text(key: str, text: str) -> str:
             """
             Змінити фіксований текст відповіді бота (bot_texts) за ключем — на відміну від
@@ -553,7 +561,7 @@ class AdminAgent(PromptAgent):
         return [
             _logged_tool(t) for t in (
                 set_lives, set_targets, set_schedule, swap_today_exercise, recount_reps, set_progress, update_user_profile,
-                get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt,
+                get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt, get_trust_examples,
                 set_bot_text, list_bot_texts, create_admin_task,
                 set_leave, end_leave, list_leaves,
             )

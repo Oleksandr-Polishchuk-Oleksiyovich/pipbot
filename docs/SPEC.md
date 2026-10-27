@@ -193,6 +193,11 @@ Lease CV: claimed без результату довше `CV_LEASE_S` (300 с) �
     Regex (`core/claims.py`) — лише дешевий фолбек, якщо LLM недоступний/не налаштований. Шлях логується
     (`Claim extraction path=…`, `Dispute path=…`: `llm`/`llm_none`/`regex`/`regex_fallback`), для відео пишеться
     `bot_state: video_claim_path:<request_id>`. Промпт модуля — `prompts.py: REPS_CLAIM_PROMPT` (ключ `reps_claim`).
+  - **Захищене ядро довіри** (`prompts_core/trust_core.md` «ПРАВИЛА ДОВІРИ» + `trust_examples.json` few-shot, код `core/trust_core.py`): розділено на
+    ЗАХИЩЕНИЙ шар (git) і РЕДАГОВАНИЙ шар (БД: coach_base/coach_dynamic/reps_claim — персона, тон, жарти). Збірка: редагований шар першим,
+    ядро ОСТАННІМ (`ensure_core`) у промптах coach і reps_claim; `Store.save_prompt` вирізає блок ядра з тексту адміна; адмін-агент має
+    read-only тул `get_trust_examples`; зміни ядра — лише через admin_task/PR (`prompts_core/*` у guardrails FORBIDDEN_PATTERNS → `/approve`).
+    Приклади з `trust_examples.json` одночасно будують блок у промпті й є тест-кейсами (docs/TESTING_TRUST.md).
   - `TRUST_MODE=0` повертає стару CV-поведінку (`ReportJudgeAgent.judge_video_fact`).
 
 ## 9. Відпустка/лікарняний (leaves)

@@ -11,6 +11,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 from agents.base import PromptAgent
+from core import trust_core
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,10 @@ class PromptMergerAgent(PromptAgent):
             f"НОВЕ ПРАВИЛО:\n{change.render()}\n\n"
             f"РЕКОМЕНДОВАНА СТРАТЕГІЯ: {analysis.strategy}\n"
             f"Суперечності: {analysis.conflicts or 'немає'}\n"
-            f"Що нового: {analysis.new_rules or 'немає'}"
+            f"Що нового: {analysis.new_rules or 'немає'}\n\n"
+            "ЗАХИЩЕНЕ ЯДРО ДОВІРИ (ЛИШЕ ДЛЯ ДОВІДКИ, read-only): воно додається в кінець промпту окремо й не є частиною правил. "
+            "НЕ копіюй, НЕ переписуй, НЕ суперечь йому; правило, що вимагає підозри, доказів чи ігнорування слів людей про кількість "
+            "повторів, не внось.\n" + trust_core.load_rules()
         )
         if review_feedback:
             prompt += f"\n\nПОПЕРЕДНЯ СПРОБА ВІДХИЛЕНА РЕЦЕНЗЕНТОМ. ВИПРАВ:\n{review_feedback}"
@@ -136,6 +140,7 @@ class CoachPromptEditor:
         else:
             # Обидві спроби відхилені — краще зберегти найкращу, ніж загубити наказ адміна; лог фіксує зауваження.
             logger.warning("Saving merged prompt despite review rejection: %s", feedback)
+        merged = trust_core.strip_core(merged)  # ядро довіри не зберігається в БД-промпті
         if not merged or len(merged) > MAX_DYNAMIC_PROMPT_CHARS:
             raise ValueError(f"Merged prompt rejected (length={len(merged)})")
         updater = updated_by or change.author

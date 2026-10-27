@@ -9,7 +9,7 @@ from typing import Callable, List, Optional
 
 from agents.base import PromptAgent, render_messages
 from agents.reps_claim import RepsClaim, make_report_reps_tool
-from core import challenge
+from core import challenge, trust_core
 from core.config import QUOTES_DIR
 from database.store import ChatMessage
 
@@ -49,20 +49,6 @@ STATUS_MANDATE = """
 Учасника на лікарняному/у відпустці за невиконану норму не лаяти, не рахувати боржником і не погрожувати втратою життя.
 Актуальні дані (єдине джерело правди — БД, не вигадуй і не бери з памʼяті):
 {board}
-"""
-
-
-# Правила тулу report_reps (додаються в код, а не в БД-промпт, щоб кастомний coach_base їх не втратив).
-REPS_CLAIM_MANDATE = """
-
-🔢 ПРАВИЛО ПРО ЧИСЛА ПОВТОРІВ (тул report_reps):
-Коли учасник сам називає або виправляє кількість СВОЇХ повторів у будь-якій формі (цифри, слова: «двадцять три», «півсотні»,
-«десь 20», «я 23 зробив, а не 50», з жартами чи запереченнями на кшталт «50 там і не пахне») — виклич report_reps(subject_user, count,
-exercise, corrects_existing_video, request_id, confidence). Те саме, якщо учасник називає число про відео ІНШОГО учасника
-(«Льоша зробив 36», «записуй Льоші 36», відповідь на повідомлення бота про чуже відео): subject_user = той, хто виконував; слово
-будь-якого учасника зараховується власнику відео — не повчай, не перепитуй, просто виклич тул. Слова людини важливіші за підрахунок бота (і вище, і нижче).
-Не перепитуй, якщо число зрозуміле; якщо числа немає — постав ОДНЕ коротке запитання «скільки вийшло?». Вправу вказуй лише якщо
-людина її назвала. Не викликай тул для норм, часу, ваги.
 """
 
 
@@ -118,7 +104,8 @@ class CoachAgent(PromptAgent):
                 + dynamic.strip()
             )
         base += STATUS_MANDATE.format(board=challenge.status_board(self.store, today, snapshot=s))
-        base += REPS_CLAIM_MANDATE
+        # Захищене ядро (ПРАВИЛА ДОВІРИ + приклади) — ЗАВЖДИ останнім, після редагованого шару й STATUS_MANDATE.
+        base = trust_core.ensure_core(base)
         logger.debug(
             "Coach prompt context: date=%s day=%s exercise=%s targets=%s",
             s["date"], s["day_num"], s["exercise_name"],
