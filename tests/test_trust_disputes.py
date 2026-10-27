@@ -303,3 +303,88 @@ async def test_progression_settle_after_dispute(tmp_path):
     xp2, lvl2 = flow.store.get_xp("lyosha")
     assert xp2 == 7
     assert lvl2 == lvl
+
+
+# --- Діма 26.10: «Нє нє, 50 там і не пахне, я 23 зробив» зараховано як 50 (парсер брав максимум) ---
+
+DIMA_DISPUTE = "Нє нє, 50 там і не пахне, я 23 зробив"
+
+
+def test_parse_dispute_reps_dima_case():
+    assert parse_dispute_reps(DIMA_DISPUTE) == 23
+    assert parse_dispute_reps(DIMA_DISPUTE, exclude=50) == 23
+    # число, що збігається з CV, відкидається, якщо є інше; нижче число так само валідне
+    assert parse_dispute_reps("ні, там 50 і 23 віджимання", exclude=50) == 23
+    assert parse_dispute_reps("я зробив 23", exclude=50) == 23
+    # єдине число навіть рівне CV лишається (людина підтверджує)
+    assert parse_dispute_reps("я зробив 50", exclude=50) == 50
+    # старі поведінки
+    assert parse_dispute_reps("не 4 а 40") == 40
+    assert parse_dispute_reps("насправді 60 а не 50", exclude=50) == 60
+    assert is_dispute(DIMA_DISPUTE) is True
+
+
+async def _dima_flow(tmp_path, cv_ex="squat", cv_reps=50, flags=None):
+    flow, sender, clock = make_flow(tmp_path, llm=None, trust_mode=True)
+    rid = "req-dima"
+    flow.store.create_video_check(
+        request_id=rid, chat_id=CHAT, message_id=501, user_slug="lyosha", duration_s=60.0,
+        exercise=cv_ex, reps=cv_reps, confidence=0.75, valid=True, status="done", flags=flags or [],
+    )
+    with flow.store._connect() as con:
+        con.execute("UPDATE video_checks SET created_at = ? WHERE request_id = ?", ("2026-10-04 08:00:00", rid))
+    return flow, sender, rid
+
+
+async def test_dispute_sets_stored_attempt_to_exact_lower_number(tmp_path):
+    flow, sender, rid = await _dima_flow(tmp_path)
+    await flow.handle_video_callback(rid)
+    # без підпису: бот зарахував CV-шні 50 (вправа дня — віджимання)
+    assert flow.store.get_best_attempt("2026-10-04", "lyosha") == 50
+    assert flow.store.get_day_progress("2026-10-04")["lyosha"] is True
+    sender.texts.clear()
+
+    flow.record_user_message(CHAT, SON, DIMA_DISPUTE)
+    await flow.process(CHAT, trigger="push")
+
+    assert flow.store.get_best_attempt("2026-10-04", "lyosha") == 23     # а не 50
+    import json as _json
+    credit = _json.loads(flow.store.get_state(f"video_credit:{rid}", ""))
+    assert credit["reps"] == 23 and credit["disputed"] is True and credit["ex"] == "pushups"
+    assert len(sender.texts) == 1 and "23" in sender.texts[0] and "50" not in sender.texts[0]
+
+    # settle/XP беруть саме 23
+    res = settle_progression(flow.store, date(2026, 10, 4))
+    best = res["lyosha"]["best"]
+    assert best == 23
+
+
+async def test_dispute_number_credited_to_day_exercise_not_cv_exercise(tmp_path):
+    """CV побачив присідання, людина назвала лише число -> число йде на вправу дня."""
+    flow, sender, rid = await _dima_flow(tmp_path, cv_ex="squat", cv_reps=50)
+    # відео-кредит записано «чужою» вправою (старий запис без ex дня) — виправлення має піти на вправу дня
+    flow.store.set_state(f"video_credit:{rid}", "")
+    await flow.handle_video_callback(rid)
+    flow.store.set_state(f"video_credit:{rid}", "")  # як у старих записах: без довіри
+    flow.record_user_message(CHAT, SON, "я 23 зробив")
+    await flow.process(CHAT, trigger="push")
+    assert flow.store.get_best_attempt("2026-10-04", "lyosha") == 23
+
+
+async def test_trust_soft_hint_when_cv_sees_other_exercise(tmp_path):
+    flow, sender, rid = await _dima_flow(tmp_path, cv_ex="squat", cv_reps=30)
+    reply = await flow.handle_video_callback(rid)
+    assert "не зовсім" in reply            # м'яка підказка, не відмова
+    assert flow.store.get_best_attempt("2026-10-04", "lyosha") == 30   # зараховано на слово/CV
+
+
+async def test_trust_soft_hint_on_ambiguous_flag_but_not_when_claimed(tmp_path):
+    flow, sender, rid = await _dima_flow(tmp_path, cv_ex="pushup", cv_reps=20, flags=["ambiguous_exercise"])
+    reply = await flow.handle_video_callback(rid)
+    assert "не зовсім" in reply
+
+    (tmp_path / "b").mkdir()
+    flow2, sender2, rid2 = await _dima_flow(tmp_path / "b", cv_ex="pushup", cv_reps=20, flags=["ambiguous_exercise"])
+    flow2.store.set_state(f"video_caption:{rid2}", "20 віджимань")
+    reply2 = await flow2.handle_video_callback(rid2)
+    assert "не зовсім" not in reply2       # вправа названа людиною — підказка не потрібна

@@ -162,16 +162,54 @@ def split_reply_context(text: Optional[str]) -> Tuple[Optional[str], Optional[st
     return m.group(1).strip(), m.group(2).strip(), text[m.end():].strip()
 
 
-def parse_dispute_reps(text: Optional[str]) -> Optional[int]:
+# Клаузи-заперечення: «50 там і не пахне», «50 і близько не було», «нема там 50» — число в них НЕ є виправленням
+_RE_NEGATED_CLAUSE = re.compile(
+    r"не\s+пахне|і\s+близько|близько\s+не|не\s+було|не\s+вийшло|не\s+стільки|не\s+набагато|нема\w*|немає|ні\s+разу|"
+    r"не\s+так\s+багато|не\s+вистачає|не\s+дотягу|не\s+зарахов",
+    re.IGNORECASE,
+)
+# Клауза, де людина називає свій результат: «я 23 зробив», «зробив 23», «вийшло 23»
+_RE_CLAIM_VERB = re.compile(
+    r"\b(?:я|мені|в\s+мене|у\s+мене)\b|зробив|зробила|вийшл|набрал|відтисн|присів|присіл|було|сделал|получил",
+    re.IGNORECASE,
+)
+_RE_CLAUSE_SPLIT = re.compile(r"[,;.!?\n]+|\s[—–-]\s")
+
+
+def _strip_number(text: str, number: int) -> str:
+    return re.sub(rf"(?<!\d){number}(?!\d)", " ", text)
+
+
+def parse_dispute_reps(text: Optional[str], exclude: Optional[int] = None) -> Optional[int]:
     """
-    Число, яким людина виправляє підрахунок: «не 4 а 40» -> 40, «40, а не 4» -> 40, «я зробив 50» -> 50.
-    Числа після «не» (заперечені) відкидаються. None — числа немає.
+    Число, яким людина виправляє підрахунок: «не 4 а 40» -> 40, «40, а не 4» -> 40, «я зробив 50» -> 50,
+    «Нє нє, 50 там і не пахне, я 23 зробив» -> 23 (число в клаузі-запереченні відкидається; пріоритет — клауза «я … зробив»).
+    exclude — число, яке порахував бот (CV): якщо в тексті є інше число, то воно перемагає (людина НЕ погоджується з CV).
+    Нижче число так само валідне, як і вище. None — числа немає.
     """
     if not text:
         return None
     _, _, rest = split_reply_context(text)
     cleaned = re.sub(r"(?i)\bне\s+\d+", " ", rest)
-    return parse_claimed_reps(cleaned)
+    clauses = [c.strip() for c in _RE_CLAUSE_SPLIT.split(cleaned) if c and c.strip()]
+    with_num = [c for c in clauses if parse_claimed_reps(c) is not None]
+    if len(with_num) > 1:
+        positive = [c for c in with_num if not _RE_NEGATED_CLAUSE.search(c)]
+        if positive:
+            with_num = positive
+        claim = [c for c in with_num if _RE_CLAIM_VERB.search(c)]
+        if claim:
+            with_num = claim
+    pool = " , ".join(with_num) if with_num else cleaned
+    value = parse_claimed_reps(pool)
+    if exclude is not None and value == exclude:
+        other = parse_claimed_reps(_strip_number(pool, exclude))
+        if other is not None:
+            return other
+        other = parse_claimed_reps(_strip_number(cleaned, exclude))
+        if other is not None:
+            return other
+    return value
 
 
 def is_dispute(text: Optional[str], reply_to_bot_count: bool = False) -> bool:

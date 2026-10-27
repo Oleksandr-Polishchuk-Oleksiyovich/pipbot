@@ -307,3 +307,58 @@ def test_sampling_fps_below_10_warns_and_flags(caplog):
 
     assert "low_fps_undercount_risk" in res["flags"]
     assert any("below 10 fps" in r.message for r in caplog.records)
+
+
+# --- Класифікація вправи за вікнами (Діма 26.10: стояв, потім віджимання; все відео вважали присіданнями) ---
+
+def _standing_segment(fps=12.0, duration_s=10.0):
+    """Людина просто стоїть: торс майже вертикальний, рух мінімальний."""
+    n = int(fps * duration_s)
+    P = np.zeros((n, 33, 2), dtype=float)
+    V = np.full((n, 33), 0.9)
+    P[:, 11] = [200.0, 150.0]
+    P[:, 12] = [300.0, 150.0]
+    P[:, 0] = [250.0, 110.0]
+    P[:, 23] = [210.0, 300.0]
+    P[:, 24] = [290.0, 300.0]
+    P[:, 25] = [210.0, 400.0]
+    P[:, 26] = [290.0, 400.0]
+    P[:, 27] = [210.0, 500.0]
+    P[:, 28] = [290.0, 500.0]
+    return P, V
+
+
+def _mixed_video(stand_s, push_reps, push_s, fps=12.0):
+    S, SV = _standing_segment(fps, stand_s)
+    Pp, Vp = make_synthetic_landmarks(num_reps=push_reps, fps=fps, duration_s=push_s, base_y=180.0)
+    return np.concatenate([S, Pp]), np.concatenate([SV, Vp])
+
+
+def test_window_votes_pushup_after_long_standing_intro():
+    P, V = _mixed_video(stand_s=14.0, push_reps=10, push_s=12.0)
+    meta = {"duration": 26.0, "width": 640, "height": 480, "fps": 12.0}
+    # передумова: медіана торса по всьому відео «стоїть» (>=45°) — стара глобальна логіка тут помилялась
+    sh = P[:, [11, 12]].mean(1)
+    hp = P[:, [23, 24]].mean(1)
+    d = hp - sh
+    assert np.nanmedian(np.degrees(np.arctan2(np.abs(d[:, 1]), np.abs(d[:, 0])))) >= 45
+    res = _analyze_landmarks(P, V, fps=12.0, meta=meta, request_id="mix", file_unique_id="f", t0=0.0)
+    assert res["exercise"] == "pushup"
+    assert res["reps"] == 10
+    assert res["valid"] is True
+
+
+def test_window_votes_squat_video_still_squat():
+    from core.cv.rep_counter import _window_votes, _classify_window
+    # окремо перевіряємо класифікацію вікон: вертикальний торс + великий діапазон коліна = присідання
+    assert _classify_window(80.0, 0.05, 90.0, 0.9, 0.9)[0] == "squat"
+    assert _classify_window(20.0, 0.6, 5.0, 0.9, 0.9)[0] == "pushup"
+    assert _classify_window(20.0, 0.02, 5.0, 0.9, 0.9)[0] == "idle"   # лежить у планці без руху
+    assert _classify_window(85.0, 0.02, 5.0, 0.9, 0.9)[0] == "idle"   # стоїть
+
+
+def test_winner_span_trims_loser_windows_and_keeps_idle_neighbours():
+    from core.cv.rep_counter import _winner_span
+    votes = {"winner": "pushup", "labels": ["squat", "idle", "pushup", "pushup", "idle", "squat"],
+             "bounds": [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]}
+    assert _winner_span(votes) == (10, 50)

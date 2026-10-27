@@ -680,6 +680,17 @@ class ChatFlow:
             if angle_text:
                 parts.append(angle_text)
 
+        # (f) м'яка підказка про вправу: CV сумнівається / бачить іншу вправу, а людина вправу не називала -> не відхиляємо,
+        # зараховуємо на слово й просимо уточнити (вправа дня — пріоритет).
+        if claimed_ex is None and self._exercise_doubt(check, cv_ex, day_ex):
+            doubt_text = self.bot_texts.get(
+                "trust_exercise_hint",
+                day_exercise=challenge.EXERCISES.get(day_ex, {}).get("name", day_ex),
+                exercise=challenge.EXERCISES.get(day_ex, {}).get("name", day_ex),
+            )
+            if doubt_text:
+                parts.append(doubt_text)
+
         reply_text = "\n".join(parts)
 
         chat_id = check.chat_id
@@ -701,6 +712,14 @@ class ChatFlow:
             )
 
         return reply_text
+
+    @staticmethod
+    def _exercise_doubt(check, cv_ex: Optional[str], day_ex: str) -> bool:
+        """CV не впевнений у вправі (ambiguous/mixed) або бачить іншу, ніж вправа дня, при реальних повторах."""
+        flags = check.flags or []
+        if any(f in ("ambiguous_exercise", "mixed_exercises") for f in flags):
+            return True
+        return bool(cv_ex and cv_ex != day_ex and int(check.reps or 0) > 0)
 
     # --- TRUST_MODE (м'який режим «до виправлення»): людина оспорює підрахунок CV -> вірить людині ---
     def _check_local_ts(self, check) -> str:
@@ -771,6 +790,10 @@ class ChatFlow:
                 remaining.append(m)  # немає відео, яке можна оспорювати -> звичайна обробка
                 continue
 
+            if number is not None:
+                # людина не погоджується з підрахунком CV: число, що збігається з CV, відкидаємо, якщо є інше (напр. «50 там і не пахне, я 23»)
+                number = parse_dispute_reps(m.text, exclude=int(target_check.reps or 0) or None)
+
             if number is None:
                 if wait:
                     logger.info("Dispute from %s without number — already asked, waiting", slug)
@@ -792,7 +815,10 @@ class ChatFlow:
         today = self._today()
         today_iso = today.isoformat()
         day_ex = challenge.day_exercise(self.store, today)
-        _, prev_ex = self._video_credit(check)
+        # Вправа: названа людиною > вправа, під яку вже зараховано це відео (довіра) > вправа дня.
+        # Вправу, яку «побачив» CV, ігноруємо: назване число зараховується на вправу дня (CV міг переплутати присідання/віджимання).
+        stored = self.store.get_state(f"video_credit:{check.request_id}", "")
+        prev_ex = self._video_credit(check)[1] if stored else None
         ex = parse_claimed_exercise(text) or prev_ex or day_ex
         self.store.set_state(f"video_credit:{check.request_id}",
                              json.dumps({"reps": int(reps), "ex": ex, "disputed": True}))

@@ -167,6 +167,75 @@ def angle(a: Any, b: Any, c: Any) -> Any:
     return np.degrees(np.arccos(np.clip(cos, -1, 1)))
 
 
+# --- Класифікація вправи за вікнами (а не за всім відео) -------------------------------------------------
+N_WINDOWS = 8
+VOTE_CONFIDENT_SHARE = 0.65   # частка переможця у зважених голосах, нижче — «неоднозначно»
+VOTE_MIXED_SHARE = 0.25       # частка «програвшої» вправи, вище якої ставимо mixed_exercises
+
+
+def _classify_window(torso_med: float, vert_rng: float, knee_rng: float, knee_vis: float, lower_vis: float) -> Tuple[str, float]:
+    """(клас вікна 'pushup'|'squat'|'idle'|'unknown', вага руху 0..1). Ті самі критерії, що й глобальні, але на вікні."""
+    moving_v = vert_rng >= 0.15
+    if torso_med < 45:
+        # горизонтальний торс: віджимання лише якщо є вертикальний рух; інакше — планка/лежачи без повторів
+        return ("pushup", min(vert_rng, 1.0)) if moving_v else ("idle", 0.0)
+    if moving_v and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60):
+        return "pushup", min(vert_rng, 1.0)          # фронтальне віджимання
+    if knee_rng >= 35 and knee_vis >= 0.40:
+        return "squat", min(knee_rng / 90.0, 1.0)
+    if vert_rng < 0.15 and (knee_rng < 25 or knee_vis < 0.40):
+        return "idle", 0.0
+    return "unknown", 0.0
+
+
+def _window_votes(P: Any, V: Any, fps: float, torso: Any, knee_sm: Any, n_windows: int = N_WINDOWS) -> Dict[str, Any]:
+    """
+    Ділить відео на рівні вікна, класифікує кожне і зважено голосує за вправу. Дешево: numpy на ~8 вікнах.
+    Повертає {'winner', 'share', 'weights': {pushup, squat}, 'labels': [...], 'bounds': [(a, b), ...]}.
+    """
+    n = len(P)
+    n_win = max(1, min(n_windows, int(n // max(1.0, fps * 1.5))))
+    edges = [int(round(i * n / n_win)) for i in range(n_win + 1)]
+    labels: List[str] = []
+    weights = {"pushup": 0.0, "squat": 0.0}
+    bounds: List[Tuple[int, int]] = []
+    for i in range(n_win):
+        a, b = edges[i], edges[i + 1]
+        bounds.append((a, b))
+        if b - a < 3:
+            labels.append("idle")
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            t_med = float(np.nanmedian(torso[a:b])) if not np.isnan(torso[a:b]).all() else 90.0
+            _, _, v_rng = count_pushups_vy(P[a:b], fps)
+            seg_knee = knee_sm[a:b]
+            k_rng = float(np.percentile(seg_knee, 97) - np.percentile(seg_knee, 3))
+            k_vis = float(np.nanmean(V[a:b, [25, 26]]))
+            l_vis = float(np.mean(V[a:b][:, [23, 24, 25, 26, 27, 28]].max(1) > 0.4))
+        lab, w = _classify_window(t_med, v_rng, k_rng, k_vis, l_vis)
+        labels.append(lab)
+        if lab in weights:
+            weights[lab] += w
+    total = weights["pushup"] + weights["squat"]
+    if total <= 0:
+        return {"winner": None, "share": 0.0, "weights": weights, "labels": labels, "bounds": bounds}
+    winner = "pushup" if weights["pushup"] >= weights["squat"] else "squat"
+    return {"winner": winner, "share": weights[winner] / total, "weights": weights, "labels": labels, "bounds": bounds}
+
+
+def _winner_span(votes: Dict[str, Any]) -> Tuple[int, int]:
+    """Кадровий проміжок вправи-переможця: від першого до останнього її вікна + прилеглі «idle»/unknown вікна без руху."""
+    labels, bounds, win = votes["labels"], votes["bounds"], votes["winner"]
+    idx = [i for i, l in enumerate(labels) if l == win]
+    lo, hi = idx[0], idx[-1]
+    while lo > 0 and labels[lo - 1] in ("idle",):
+        lo -= 1
+    while hi < len(labels) - 1 and labels[hi + 1] in ("idle",):
+        hi += 1
+    return bounds[lo][0], bounds[hi][1]
+
+
 def analyze_video(
     path: str,
     *,
@@ -492,25 +561,40 @@ def _analyze_landmarks(
     knee_sm = savgol_filter(knee_sig, win, 2) if len(knee_sig) > win else knee_sig
     knee_rng = float(np.percentile(knee_sm, 97) - np.percentile(knee_sm, 3))
 
-    # 3. Exercise classification
-    # Pushup criteria:
-    # a) Horizontal torso (side-view pushup, torso < 45 deg)
-    # b) OR vertical shoulder/nose amplitude >= 0.15 with knees occluded/behind body or low knee range (front pushup)
-    # Squat criteria:
-    # a) Upright torso (torso >= 45 deg) AND knee range >= 35 deg AND visible knees (knee_vis >= 0.40)
-    is_front_pushup = (vert_rng >= 0.15 and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60))
-    is_side_pushup = (torso_med < 45)
-
-    if is_side_pushup or is_front_pushup:
-        exercise = "pushup"
-    elif knee_rng >= 35 and torso_med >= 45 and knee_vis >= 0.40:
-        exercise = "squat"
+    # 3. Exercise classification — за вікнами по всьому відео (зважене голосування), а не за медіаною всього відео.
+    # Критерії вікна (_classify_window) ті самі, що раніше були глобальними. Лише сегмент вправи-переможця
+    # йде в підрахунок; якщо голоси розійшлись — прапорці ambiguous_exercise / mixed_exercises (м'яка підказка
+    # для бота: «орієнтир — вправа дня»), відео не відхиляється.
+    votes = _window_votes(P, V, fps, torso, knee_sm)
+    seg_a, seg_b = 0, n
+    if votes["winner"] is not None:
+        exercise = votes["winner"]
+        seg_a, seg_b = _winner_span(votes)
+        loser = "squat" if exercise == "pushup" else "pushup"
+        tot = votes["weights"]["pushup"] + votes["weights"]["squat"]
+        if votes["share"] < VOTE_CONFIDENT_SHARE:
+            flags.append("ambiguous_exercise")
+        if tot > 0 and votes["weights"][loser] / tot >= VOTE_MIXED_SHARE:
+            flags.append("mixed_exercises")
+        if (seg_a, seg_b) != (0, n) and seg_b - seg_a >= 3:
+            P_seg, V_seg = P[seg_a:seg_b], V[seg_a:seg_b]
+            reps_vy, pk_vy, vert_rng = count_pushups_vy(P_seg, fps)
+            knee_sm_seg = knee_sm[seg_a:seg_b]
+            knee_rng = float(np.percentile(knee_sm_seg, 97) - np.percentile(knee_sm_seg, 3))
+            knee_sm = knee_sm_seg
     else:
-        # Check if any significant motion exists
-        if vert_rng < 0.15 and (knee_rng < 25 or knee_vis < 0.40):
-            flags.append("low_amplitude_motion")
-            return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.9, flags, False, time.time() - t0)
-        exercise = "squat" if (torso_med >= 55 and knee_vis >= 0.40) else "pushup"
+        # жодного активного вікна — стара глобальна логіка (й відсів низької амплітуди)
+        is_front_pushup = (vert_rng >= 0.15 and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60))
+        is_side_pushup = (torso_med < 45)
+        if is_side_pushup or is_front_pushup:
+            exercise = "pushup"
+        elif knee_rng >= 35 and torso_med >= 45 and knee_vis >= 0.40:
+            exercise = "squat"
+        else:
+            if vert_rng < 0.15 and (knee_rng < 25 or knee_vis < 0.40):
+                flags.append("low_amplitude_motion")
+                return _make_result(request_id, file_unique_id, duration_s, "none", 0, 0.9, flags, False, time.time() - t0)
+            exercise = "squat" if (torso_med >= 55 and knee_vis >= 0.40) else "pushup"
 
     # 4. Counting reps
     if exercise == "pushup":
@@ -540,6 +624,8 @@ def _analyze_landmarks(
     confidence = 0.85
     if detected > 0.8:
         confidence += 0.05
+    if "ambiguous_exercise" in flags:
+        confidence -= 0.15
     if exercise == "squat" and abs(peaks - reps) > 3:
         confidence -= 0.15
         flags.append("peak_hysteresis_divergence")
