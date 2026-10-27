@@ -111,6 +111,29 @@ def snapshot(store, since_days: int, date_iso: Optional[str], log_lines: int) ->
             if any(b in ((r["text"] or "") + (r["variants"] or "")) for b in banned):
                 scan["bot_texts"].append(r["key"])
         out["banned_icons_in_db"] = scan
+        # Аудит промптів/текстів у БД (read-only): хто й коли правив, чи збігається з дефолтом із коду; вміст лише НЕ-дефолтних.
+        try:
+            import prompts as _pr
+            plist = []
+            for r in _rows(con, "SELECT key, content, version, updated_by, updated_at FROM prompts ORDER BY key"):
+                same = (_pr.DEFAULT_PROMPTS.get(r["key"]) == r["content"])
+                item = {"key": r["key"], "version": r["version"], "updated_by": r["updated_by"], "updated_at": r["updated_at"],
+                        "len": len(r["content"] or ""), "equals_code_default": same}
+                if not same or r["key"] in ("coach_dynamic",):
+                    item["content"] = redact((r["content"] or "")[:6000])
+                plist.append(item)
+            out["prompts_db"] = plist
+            tlist = []
+            for r in _rows(con, "SELECT key, text, variants, updated_by, updated_at FROM bot_texts ORDER BY key"):
+                same = (_pr.DEFAULT_BOT_TEXTS.get(r["key"]) == r["text"]) and not r["variants"]
+                item = {"key": r["key"], "updated_by": r["updated_by"], "updated_at": r["updated_at"], "equals_code_default": same}
+                if not same:
+                    item["text"] = redact((r["text"] or "")[:600])
+                    item["variants"] = redact((r["variants"] or "")[:1200])
+                tlist.append(item)
+            out["bot_texts_db"] = tlist
+        except Exception as e:  # noqa: BLE001
+            out["prompts_db_error"] = f"{type(e).__name__}: {e}"[:200]
         if _has(con, "chat_history"):
             # Останні повідомлення чату (read-only, текст урізано й проходить redact) — для розбору суперечок про залік.
             hist = _rows(con, "SELECT id, user_name, role, text, created_at FROM chat_history "
