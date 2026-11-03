@@ -6,6 +6,8 @@ export CV_HEAVY_BIN="${CV_HEAVY_BIN:-/workspace/bin/heavy}"
 #   stop:   kill "$(cat /tmp/sportnerd-boxcv.pid)"   (kills only this supervisor + its child)
 # Requires CV_GATEWAY_URL (and secret via CV_HMAC_SECRET_ENV / CV_ENV_FILE). Logs: $CV_LOG (default /tmp/sportnerd-boxcv.log).
 set -u
+SCRIPT="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+SCRIPT_SHA="$(sha256sum "$SCRIPT" 2>/dev/null | cut -d' ' -f1)"
 cd "$(dirname "$0")/.."
 PIDFILE="${CV_PIDFILE:-/tmp/sportnerd-boxcv.pid}"
 LOG="${CV_LOG:-/tmp/sportnerd-boxcv.log}"
@@ -35,10 +37,22 @@ while true; do
     wait "$child"
     rc=$?
     ran=$(( $(date +%s) - started ))
+    cur_sha="$(sha256sum "$SCRIPT" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$SCRIPT_SHA" ] && [ -n "$cur_sha" ] && [ "$cur_sha" != "$SCRIPT_SHA" ]; then
+        echo "$(date -Is) run_box_worker.sh changed on disk ($SCRIPT_SHA -> $cur_sha); re-execing" >>"$LOG"
+        rm -f "$PIDFILE"
+        exec bash "$0" "$@"
+    fi
     if [ "$rc" -eq 78 ]; then
         echo "$(date -Is) box_worker: CONFIG ERROR (exit 78, see log above); supervisor stops, fix env/.env and restart" >>"$LOG"
         echo "box_worker: CONFIG ERROR (CV_GATEWAY_URL/secret missing); see $LOG" >&2
         rm -f "$PIDFILE"; exit 78
+    fi
+    if [ "$rc" -eq 0 ]; then
+        backoff=5
+        echo "$(date -Is) box_worker exited cleanly (rc=0), restarting in 1s" >>"$LOG"
+        sleep 1
+        continue
     fi
     # швидкий збій (<30 с) -> експоненційний backoff до 300 с; довга робота -> скидання
     if [ "$ran" -lt 30 ]; then backoff=$(( backoff * 2 > 300 ? 300 : backoff * 2 )); else backoff=5; fi

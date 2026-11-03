@@ -31,6 +31,8 @@ DEFAULT_WORKERS_CONFIG: Dict[str, float] = {
     "ADMIN_TASKS_POLL_WAIT_SEC": 25.0,
     "ADMIN_TASKS_CHECK_INTERVAL_SEC": 0.0,
     "ADMIN_TASKS_HEARTBEAT_S": 300.0,
+    "BOX_AUTOUPDATE": 1.0,
+    "BOX_AUTOUPDATE_INTERVAL": 60.0,
 }
 
 DEFAULT_VM_CONFIG: Dict[str, str] = {
@@ -167,6 +169,8 @@ def main(argv=None) -> int:
     p_set.add_argument("--admin-wait", type=float, help="ADMIN_TASKS_POLL_WAIT_SEC")
     p_set.add_argument("--admin-interval", type=float, help="ADMIN_TASKS_CHECK_INTERVAL_SEC")
     p_set.add_argument("--admin-heartbeat", type=float, help="ADMIN_TASKS_HEARTBEAT_S")
+    p_set.add_argument("--box-autoupdate", type=float, help="BOX_AUTOUPDATE (1 or 0)")
+    p_set.add_argument("--box-autoupdate-interval", type=float, help="BOX_AUTOUPDATE_INTERVAL")
     p_set.add_argument("--autodeploy-interval", help="AUTODEPLOY_INTERVAL (e.g. 1min, 30s)")
     p_set.add_argument("--cv-claim-wait", type=float, help="CV_CLAIM_WAIT_S")
     p_set.add_argument("--cv-results-interval", type=int, help="CV_RESULTS_INTERVAL_SEC")
@@ -223,6 +227,10 @@ def main(argv=None) -> int:
             worker_updates["ADMIN_TASKS_CHECK_INTERVAL_SEC"] = _format_num(args.admin_interval)
         if args.admin_heartbeat is not None:
             worker_updates["ADMIN_TASKS_HEARTBEAT_S"] = _format_num(args.admin_heartbeat)
+        if args.box_autoupdate is not None:
+            worker_updates["BOX_AUTOUPDATE"] = _format_num(args.box_autoupdate)
+        if args.box_autoupdate_interval is not None:
+            worker_updates["BOX_AUTOUPDATE_INTERVAL"] = _format_num(args.box_autoupdate_interval)
 
         if args.autodeploy_interval is not None:
             interval = args.autodeploy_interval.strip()

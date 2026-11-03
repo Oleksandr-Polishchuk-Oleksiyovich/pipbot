@@ -62,7 +62,8 @@ def task_payload(task: Dict) -> Dict:
 class AdminTasksWorker:
     def __init__(self, client, get_config: Callable = webhook_config, poster: Callable = post_webhook,
                  sleep: Callable[[float], None] = time.sleep,
-                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None):
+                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None,
+                 autoupdater: Optional[Any] = None):
         self.client, self.get_config, self.poster, self.sleep = client, get_config, poster, sleep
         self.errors = 0
         self.stopped = False
@@ -71,6 +72,12 @@ class AdminTasksWorker:
         else:
             from tools.worker_timers import read_workers_config
             self.get_workers_config = read_workers_config
+        if autoupdater is not None:
+            self.autoupdater = autoupdater
+        else:
+            from cv_worker.autoupdate import Autoupdater
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.autoupdater = Autoupdater(repo_dir=repo_dir, logger=logger, get_config=self.get_workers_config)
 
     def _backoff(self) -> None:
         delay = BACKOFF_STEPS[min(self.errors, len(BACKOFF_STEPS) - 1)]
@@ -137,6 +144,9 @@ class AdminTasksWorker:
                 logger.info("heartbeat: alive, polling (errors=%d)", self.errors)
                 last_beat = time.monotonic()
             self.step()
+            if self.autoupdater and self.autoupdater.maybe_update(time.monotonic()):
+                logger.info("autoupdate: updated code, exiting cleanly (0)")
+                sys.exit(0)
 
 
 def setup_logging() -> None:

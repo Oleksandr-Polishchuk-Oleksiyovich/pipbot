@@ -180,7 +180,8 @@ def run_cv_subprocess(video: str) -> Dict[str, Any]:
 class BoxCVWorker:
     def __init__(self, client: GatewayClient, analyzer: Optional[Callable[[str], Dict[str, Any]]] = None,
                  sleep: Callable[[float], None] = time.sleep,
-                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None):
+                 get_workers_config: Optional[Callable[[], Dict[str, Any]]] = None,
+                 autoupdater: Optional[Any] = None):
         self.client = client
         self.analyzer = analyzer or run_cv_subprocess
         self.sleep = sleep
@@ -191,6 +192,11 @@ class BoxCVWorker:
         else:
             from tools.worker_timers import read_workers_config
             self.get_workers_config = read_workers_config
+        if autoupdater is not None:
+            self.autoupdater = autoupdater
+        else:
+            from cv_worker.autoupdate import Autoupdater
+            self.autoupdater = Autoupdater(repo_dir=REPO_DIR, logger=logger, get_config=self.get_workers_config)
 
     def process(self, job: Dict[str, Any]) -> int:
         rid = job["request_id"]
@@ -248,6 +254,11 @@ class BoxCVWorker:
                 self.errors += 1
                 logger.warning("worker error (%s); retry in %ss", e, delay)
                 self.sleep(delay)
+                continue
+
+            if self.autoupdater and self.autoupdater.maybe_update(time.monotonic()):
+                logger.info("autoupdate: updated code, exiting cleanly (0)")
+                sys.exit(0)
 
 
 def main() -> None:
