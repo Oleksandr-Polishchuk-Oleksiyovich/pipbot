@@ -328,8 +328,8 @@ def count_pushups_vy(P: Any, fps: float) -> Tuple[int, List[int], float]:
         y_sm = y_norm
 
     rng = float(np.percentile(y_sm, 97) - np.percentile(y_sm, 3))
-    min_dist = max(1, int(round(fps * 0.6)))
-    prominence = max(0.15, 0.4 * rng)
+    min_dist = max(1, int(round(fps * 0.5)))
+    prominence = max(0.12, 0.14 * rng)
     if find_peaks is not None:
         pk, _ = find_peaks(y_sm, prominence=prominence, distance=min_dist)
         return int(len(pk)), list(pk), rng
