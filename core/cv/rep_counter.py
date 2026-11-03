@@ -173,15 +173,16 @@ VOTE_CONFIDENT_SHARE = 0.65   # частка переможця у зважен�
 VOTE_MIXED_SHARE = 0.25       # частка «програвшої» вправи, вище якої ставимо mixed_exercises
 
 
-def _classify_window(torso_med: float, vert_rng: float, knee_rng: float, knee_vis: float, lower_vis: float) -> Tuple[str, float]:
+def _classify_window(torso_med: float, vert_rng: float, knee_rng: float, knee_vis: float, lower_vis: float, leg_drop: float = 2.0) -> Tuple[str, float]:
     """(клас вікна 'pushup'|'squat'|'idle'|'unknown', вага руху 0..1). Ті самі критерії, що й глобальні, але на вікні."""
     moving_v = vert_rng >= 0.15
     if torso_med < 45:
         # горизонтальний торс: віджимання лише якщо є вертикальний рух; інакше — планка/лежачи без повторів
         return ("pushup", min(vert_rng, 1.0)) if moving_v else ("idle", 0.0)
-    if moving_v and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60):
+    # Якщо ноги на рівні тазу (leg_drop < 1.0 sw), тіло горизонтальне вглиб кадру -> фронтальне віджимання
+    if moving_v and (knee_vis < 0.40 or knee_rng < 35 or lower_vis < 0.60 or leg_drop < 1.0):
         return "pushup", min(vert_rng, 1.0)          # фронтальне віджимання
-    if knee_rng >= 35 and knee_vis >= 0.40:
+    if knee_rng >= 35 and knee_vis >= 0.40 and leg_drop >= 1.0:
         return "squat", min(knee_rng / 90.0, 1.0)
     if vert_rng < 0.15 and (knee_rng < 25 or knee_vis < 0.40):
         return "idle", 0.0
@@ -213,7 +214,11 @@ def _window_votes(P: Any, V: Any, fps: float, torso: Any, knee_sm: Any, n_window
             k_rng = float(np.percentile(seg_knee, 97) - np.percentile(seg_knee, 3))
             k_vis = float(np.nanmean(V[a:b, [25, 26]]))
             l_vis = float(np.mean(V[a:b][:, [23, 24, 25, 26, 27, 28]].max(1) > 0.4))
-        lab, w = _classify_window(t_med, v_rng, k_rng, k_vis, l_vis)
+            sw = float(np.nanmedian(np.abs(P[a:b, 11, 0] - P[a:b, 12, 0]))) or 1.0
+            hip_y = np.nanmean(P[a:b, [23, 24], 1])
+            ankle_y = np.nanmean(P[a:b, [27, 28], 1])
+            leg_drop = float(ankle_y - hip_y) / sw if (not np.isnan(hip_y) and not np.isnan(ankle_y)) else 2.0
+        lab, w = _classify_window(t_med, v_rng, k_rng, k_vis, l_vis, leg_drop)
         labels.append(lab)
         if lab in weights:
             weights[lab] += w
