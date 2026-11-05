@@ -133,6 +133,14 @@ ADMIN_PASSPHRASE_MARKERS = [
     "осувари",
 ]
 
+# Повні фрази-паролі (матчаться з точністю до однієї одруківки на всю фразу).
+ADMIN_PASSPHRASE_PHRASES = [
+    "obey me",
+    "you will obey",
+    "lelouch vi britannia",
+    "лелуш ві британія",
+]
+
 # Guardrails та allowlist адмінів (T-52):
 # Список дозволених telegram_id адмінів. Якщо порожній, дозволяє доступ за наявності passphrase.
 ADMIN_TELEGRAM_IDS = [

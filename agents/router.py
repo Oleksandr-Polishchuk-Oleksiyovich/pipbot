@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 from agents.base import PromptAgent, render_messages
-from core.config import ADMIN_PASSPHRASE_MARKERS
+from core.config import ADMIN_PASSPHRASE_MARKERS, ADMIN_PASSPHRASE_PHRASES
 from database.store import ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -48,9 +48,65 @@ class RouteDecision(BaseModel):
         return self.route in ("admin", "admin_quick", "admin_dev")
 
 
+# Візуально схожі кирилиця/латиниця -> єдиний "скелет" (обидві сторони нормалізуються).
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "є": "e", "ё": "e", "о": "o", "р": "p", "с": "c",
+    "у": "y", "х": "x", "к": "k", "і": "i", "ї": "i", "и": "i", "м": "m",
+    "т": "t", "в": "b", "н": "h",
+})
+# Звичайні слова на відстані 1 від маркерів.
+_PASSPHRASE_DENY = {"okey", "obed"}
+
+
+def _norm(text: str) -> str:
+    return (text or "").lower().translate(_HOMOGLYPHS)
+
+
+def _tokens(text: str) -> List[str]:
+    return re.findall(r"[^\W\d_]+", _norm(text))
+
+
+def _within_one(a: str, b: str) -> bool:
+    """True, якщо відстань Левенштейна між a і b <= 1."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    i = 0
+    while i < la and a[i] == b[i]:
+        i += 1
+    if la == lb:
+        return a[i + 1:] == b[i + 1:]
+    return a[i:] == b[i + 1:]
+
+
 def has_passphrase(text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(marker in lowered for marker in ADMIN_PASSPHRASE_MARKERS)
+    """Пароль адміна з точністю до однієї одруківки (Левенштейн <= 1) після
+    нормалізації гомогліфів кирилиця/латиниця. Дві одруківки не проходять."""
+    norm = _norm(text)
+    if not norm:
+        return False
+    markers = ADMIN_PASSPHRASE_MARKERS + ADMIN_PASSPHRASE_PHRASES
+    if any(_norm(m) in norm for m in markers):
+        return True
+    toks = _tokens(text)
+    for phrase in markers:
+        ptoks = _tokens(phrase)
+        n = len(ptoks)
+        target = " ".join(ptoks)
+        if n == 1 and len(target) < 4:
+            continue
+        for size in {n - 1, n, n + 1} - {0}:
+            for i in range(len(toks) - size + 1):
+                win = toks[i:i + size]
+                if size == 1 and (len(win[0]) < 3 or win[0] in _PASSPHRASE_DENY):
+                    continue
+                if _within_one(" ".join(win), target):
+                    return True
+    return False
 
 
 class RouterAgent(PromptAgent):
