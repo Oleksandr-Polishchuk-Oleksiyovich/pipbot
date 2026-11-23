@@ -218,6 +218,40 @@ def set_target(store: Store, participant: str, target: int, day: date) -> None:
         store.set_state(f"override_{user.slug}_{day.isoformat()}", str(int(target)))
 
 
+def set_exercise_target(store: Store, participant: str, exercise: str, target: int, day: date) -> str:
+    """
+    Встановити норму конкретної вправи ('pushups' або 'squats') для `participant` окремо від іншої вправи.
+    - Якщо `day` — день саме цієї вправи: те саме, що set_target на сьогодні.
+    - Інакше: зберігаємо норму в next_norms цієї вправи з effective_from=`day`, тож вона діє на НАЙБЛИЖЧИЙ
+      день цієї вправи (у режимі 'ladder' — чекає, доки увімкнуть чергування), а далі прогресія рахується від неї.
+    Норма іншої вправи не змінюється. Повертає slug учасника.
+    """
+    if exercise not in EXERCISES:
+        raise ValueError(f"Unknown exercise: {exercise!r} (expected 'pushups' or 'squats')")
+    _active_users(store)
+    user = store.get_user(participant) or store.find_user(participant)
+    if user is None:
+        raise ValueError(f"Unknown participant: {participant}")
+    value = max(1, int(target))
+    if day_exercise(store, day) == exercise:
+        set_target(store, user.slug, value, day)
+    else:
+        store.set_next_norm(user.slug, exercise, value, day.isoformat(), "admin")
+    return user.slug
+
+
+def exercise_target_preview(store: Store, slug: str, exercise: str, day: date, horizon: int = 14) -> Optional[tuple]:
+    """(дата ISO, норма) найближчого дня `exercise` від `day` включно (до horizon днів) або None."""
+    for i in range(horizon + 1):
+        d = day + timedelta(days=i)
+        if day_exercise(store, d) == exercise:
+            t = day_targets(store, d)
+            if slug in t:
+                return d.isoformat(), t[slug]
+            return None
+    return None
+
+
 def set_starting_pushups(store: Store, participant: str, starting_pushups: int, day: date) -> None:
     """
     Фіксує стартову норму віджимань для нового учасника на дату приєднання `day`

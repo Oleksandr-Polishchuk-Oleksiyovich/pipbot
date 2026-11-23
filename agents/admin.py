@@ -138,6 +138,33 @@ class AdminAgent(PromptAgent):
             actions.append(f"set_targets({', '.join(changed)})")
             return "Норми оновлено: " + (", ".join(changed) or "без змін")
 
+        def set_exercise_target(participant: str, exercise: str, target: int) -> str:
+            """
+            Встановити норму КОНКРЕТНОЇ вправи учаснику окремо від іншої вправи — напр. «норма присідань для Діми 40»
+            (віджимання при цьому не змінюються). Працює і в режимі 'alternate', і в 'ladder'.
+            Якщо сьогодні саме ця вправа — норма діє вже сьогодні; інакше — з найближчого дня цієї вправи,
+            а далі прогресія йде від нової норми.
+            :param participant: ключ slug або ім'я учасника.
+            :param exercise: 'squats' (присідання) або 'pushups' (віджимання).
+            :param target: нова норма цієї вправи.
+            """
+            if exercise not in ("pushups", "squats"):
+                return f"Помилка: невідома вправа '{exercise}' (очікується 'pushups' або 'squats')."
+            slug = challenge.normalize_participant(participant, store) or participant
+            try:
+                slug = challenge.set_exercise_target(store, slug, exercise, int(target), today)
+            except ValueError as e:
+                return f"Помилка: {e}"
+            actions.append(f"set_exercise_target({slug}, {exercise}, {int(target)})")
+            name = challenge.EXERCISES[exercise]["name"]
+            prev = challenge.exercise_target_preview(store, slug, exercise, today)
+            mode = store.get_state("schedule_mode", "ladder")
+            if prev:
+                when = f"найближчий день ({name}): {prev[0]}, норма {prev[1]}"
+            else:
+                when = f"зараз режим '{mode}' без днів {challenge.EXERCISES[exercise]['genitive']} — норма {int(target)} збережена й діятиме з першого такого дня"
+            return f"Норму ({name}) для {slug} встановлено: {int(target)}; {when}. {_today_tomorrow_summary()}"
+
         def set_schedule(mode: str, squat_factor: float = 1.5, today_exercise: Optional[str] = None) -> str:
             """
             Перемкнути розклад вправ.
@@ -560,7 +587,7 @@ class AdminAgent(PromptAgent):
 
         return [
             _logged_tool(t) for t in (
-                set_lives, set_targets, set_schedule, swap_today_exercise, recount_reps, set_progress, update_user_profile,
+                set_lives, set_targets, set_exercise_target, set_schedule, swap_today_exercise, recount_reps, set_progress, update_user_profile,
                 get_chat_members_info, set_counter, update_coach_prompt, reset_coach_prompt, show_coach_prompt, get_trust_examples,
                 set_bot_text, list_bot_texts, create_admin_task,
                 set_leave, end_leave, list_leaves,
