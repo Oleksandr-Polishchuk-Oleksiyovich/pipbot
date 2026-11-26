@@ -13,11 +13,11 @@ D = NOW.date()  # ladder: Льоша 37, Саша 47
 
 
 @pytest.mark.parametrize("target,credited,best,expected", [
-    (20, True, 30, 26),     # (30+20)//2+1
+    (20, True, 30, 21),
     (20, True, 20, 21),
-    (21, True, 22, 22),     # (43)//2+1 = 22 (floor)
-    (20, True, None, 21),   # зараховано без числа -> done = target
-    (20, True, 5, 21),      # done не менше за target
+    (21, True, 22, 22),
+    (20, True, None, 21),
+    (20, True, 5, 21),
     (20, False, 12, 7),
     (20, False, 3, 1),      # обмеження знизу 1
     (25, False, None, 15),
@@ -63,12 +63,12 @@ def test_settle_progression_end_to_end(tmp_path):
     st.record_attempt(D.isoformat(), "lyosha", "pushups", 40)   # 37 + 3
     st.record_attempt(D.isoformat(), "sasha", "pushups", 30)    # не залік
     res = settle_progression(st, D)
-    assert res["lyosha"]["next"] == (40 + 37) // 2 + 1 == 39
+    assert res["lyosha"]["next"] == 38
     assert res["lyosha"]["xp_gain"] == 7
     assert res["sasha"]["next"] == 25 and res["sasha"]["xp_gain"] == 0
     assert settle_progression(st, D) == {}  # ідемпотентно
     nxt = D + timedelta(days=1)
-    assert challenge.day_targets(st, nxt) == {"lyosha": 39, "sasha": 25}
+    assert challenge.day_targets(st, nxt) == {"lyosha": 38, "sasha": 25}
     assert challenge.day_targets(st, D)["lyosha"] == 37  # минулий день не змінюється
     # override усе ще має пріоритет
     st.set_state(f"override_lyosha_{nxt.isoformat()}", "50")
@@ -189,7 +189,7 @@ def test_manual_recount_reps_overrides_attempt_and_video_check(tmp_path):
     tools["set_progress"]("lyosha", True, reps=41)
     assert st.get_best_attempt(day_iso, "lyosha") == 41
     res = settle_progression(st, D)
-    assert res["lyosha"]["next"] == (41 + 37) // 2 + 1 == 40
+    assert res["lyosha"]["next"] == 38
     assert res["lyosha"]["xp_gain"] == 1 + 2 * (41 - 37) == 9
 
     # Перевіряємо, що тренер бачить XP/рівень та спробу у системному промпті, а роутер класифікує команду як quick

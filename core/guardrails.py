@@ -6,10 +6,14 @@ import fnmatch
 import logging
 import os
 import re
-from datetime import datetime, timedelta
-from typing import List, Optional, Sequence, Tuple, Union
+from datetime import datetime, timedelta, timezone
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
-from core.config import ADMIN_DEV_RATE_LIMIT_HOUR, ADMIN_TELEGRAM_IDS
+from core.config import (
+    ADMIN_ACTIVE_REQUEST_TTL_HOURS,
+    ADMIN_DEV_RATE_LIMIT_HOUR,
+    ADMIN_TELEGRAM_IDS,
+)
 from database.store import Store
 
 logger = logging.getLogger(__name__)
@@ -138,19 +142,77 @@ def check_admin_rate_limit(
     return (True, "")
 
 
+def _parse_utc_dt(val: Any) -> Optional[datetime]:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is not None:
+            return val.astimezone(timezone.utc).replace(tzinfo=None)
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s[:19] if fmt == "%Y-%m-%d %H:%M:%S" else s, fmt)
+            except Exception:
+                continue
+    return None
+
+
 def check_active_request_limit(
     store: Store,
     author_slug: Optional[str] = None,
     author_telegram_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+    ttl_hours: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Перевіряє, чи є вже активний admin_dev запит у системі (один активний запит одночасно).
+    Ігнорує та позначає як 'expired' застарілі запити, чий created_at старіший за TTL.
     Повертає (allowed, active_request_id_or_none).
     """
-    active = store.get_active_admin_audit(
-        author_slug=author_slug,
-        author_telegram_id=author_telegram_id,
-    )
-    if active is not None:
+    ttl = ttl_hours if ttl_hours is not None else ADMIN_ACTIVE_REQUEST_TTL_HOURS
+    if now is not None:
+        if now.tzinfo is not None:
+            now_utc = now.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            now_utc = now
+    else:
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    while True:
+        active = store.get_active_admin_audit(
+            author_slug=author_slug,
+            author_telegram_id=author_telegram_id,
+        )
+        if active is None:
+            return (True, None)
+
+        created_dt = _parse_utc_dt(active.created_at)
+        is_stale = False
+        if created_dt is None:
+            is_stale = True
+        elif (now_utc - created_dt) >= timedelta(hours=ttl):
+            is_stale = True
+
+        if is_stale:
+            logger.info(
+                "Expiring stale active admin_audit request_id=%s author_slug=%s created_at=%s (ttl=%sh)",
+                active.request_id,
+                active.author_slug,
+                active.created_at,
+                ttl,
+            )
+            store.update_admin_audit(active.request_id, status="expired")
+            continue
+
         return (False, active.request_id)
-    return (True, None)

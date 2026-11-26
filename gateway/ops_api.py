@@ -196,7 +196,7 @@ async def handle_diag(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------------------------
 # Одноразові адмін-операції (HMAC+nonce), ідемпотентні за `key`, з записом у bot_state `ops:<key>`.
 #   POST /admin/ops {"op": "...", "key": "<unique>", "params": {...}, "dry_run": false}
-# Ops: adjust_user, credit_attempt, send_message, admin_task_add, cv_cleanup.
+# Ops: adjust_user, credit_attempt, send_message, admin_task_add, cv_cleanup, wake_test, set_leave, end_leave, correct_settlement, set_exercise_target.
 # Повторний виклик з тим самим key повертає збережений результат і НІЧОГО не виконує вдруге.
 # ---------------------------------------------------------------------------------------------
 import json
@@ -379,6 +379,48 @@ def _op_end_leave(store, p: Dict[str, Any]) -> Dict[str, Any]:
     return {"slug": slug, "leave": leave}
 
 
+def _op_set_exercise_target(store, p: Dict[str, Any]) -> Dict[str, Any]:
+    from datetime import date as _d, datetime as _dt, timedelta as _td
+    from core import challenge, dayroll
+    from core.config import TIMEZONE
+
+    participant = str(p.get("participant") or p.get("slug") or "").strip()
+    if not participant:
+        raise ValueError("participant or slug is required")
+    exercise = str(p.get("exercise") or "").strip()
+    target = int(p["target"])
+
+    raw_date = p.get("date") or p.get("date_iso")
+    if raw_date:
+        if isinstance(raw_date, _d):
+            day = raw_date
+        else:
+            day = _d.fromisoformat(str(raw_date)[:10])
+    else:
+        day = dayroll.challenge_date(_dt.now(TIMEZONE))
+
+    applied_today = (challenge.day_exercise(store, day) == exercise)
+    slug = challenge.set_exercise_target(store, participant, exercise, target, day)
+    preview = challenge.exercise_target_preview(store, slug, exercise, day)
+
+    today_targets = challenge.day_targets(store, day)
+    tom_targets = challenge.day_targets(store, day + _td(days=1))
+
+    return {
+        "slug": slug,
+        "exercise": exercise,
+        "target": target,
+        "date": day.isoformat(),
+        "applied_today": applied_today,
+        "applied_to_today": applied_today,
+        "preview": preview,
+        "today_target": today_targets.get(slug),
+        "tomorrow_target": tom_targets.get(slug),
+        "today_targets": today_targets,
+        "tomorrow_targets": tom_targets,
+    }
+
+
 def _op_correct_settlement(store, p: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
     """
     Виправлення вже проведеного розрахунку дня (напр. спробу зараховано 50 замість 23). Ідемпотентно за станом БД
@@ -505,6 +547,8 @@ def _run_op(store, op: str, key: str, params: Dict[str, Any], dry_run: bool) -> 
         return _op_set_leave(store, params)
     if op == "end_leave":
         return _op_end_leave(store, params)
+    if op == "set_exercise_target":
+        return _op_set_exercise_target(store, params)
     raise ValueError(f"unknown op {op}")
 
 

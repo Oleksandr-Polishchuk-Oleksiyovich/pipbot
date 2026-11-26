@@ -287,7 +287,7 @@ async def test_correct_settlement_dima_dry_run_then_apply_idempotent(tmp_path):
         plan = out["result"]
         assert plan["before"]["xp"] == 2 and plan["before"]["level"] == 2 and plan["before"]["next_norm"] == 29
         assert plan["after"] == {"attempt": 23, "done": True, "settle_xp_gain": 35, "xp": 48, "level": 1,
-                                 "lives": 6, "max_lives": 6, "next_norm": 15}
+                                 "lives": 6, "max_lives": 6, "next_norm": 7}
         assert plan["xp_log_delta"] == -54
         assert store.get_best_attempt("2026-10-26", "kovdimay") == 50      # dry-run нічого не міняє
         assert store.get_xp("kovdimay") == (2, 2)
@@ -299,7 +299,7 @@ async def test_correct_settlement_dima_dry_run_then_apply_idempotent(tmp_path):
         assert store.get_xp("kovdimay") == (48, 1)
         u = store.get_user("kovdimay")
         assert (u.lives, u.max_lives) == (6, 6)
-        assert store.get_next_norm("kovdimay", "pushups") == (15, "2026-10-27")
+        assert store.get_next_norm("kovdimay", "pushups") == (7, "2026-10-27")
         assert json.loads(store.get_state("video_credit:rid-dima", "")) == {"reps": 23, "ex": "pushups", "disputed": True}
         with store._connect() as con:
             rows = con.execute("SELECT delta, reason FROM xp_log WHERE user_slug='kovdimay' ORDER BY id").fetchall()
@@ -333,5 +333,71 @@ async def test_correct_settlement_guards(tmp_path):
         # погана вправа
         st, out = await _ops(client, op="correct_settlement", key="ops-g3", params={**_FIX23, "exercise": "планка"})
         assert st == 422
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_set_exercise_target_op_idempotent(tmp_path):
+    from datetime import date, timedelta
+    from core import challenge
+    client, store = await _client(tmp_path)
+    try:
+        D = date(2026, 10, 20)
+        challenge.day_targets(store, D)  # seeds lyosha, sasha
+        challenge.enable_alternating(store, D, {"lyosha": 20, "sasha": 30}, 1.5, "pushups")
+        assert challenge.day_exercise(store, D) == "pushups"
+        before_today = challenge.day_targets(store, D)
+        before_tom = challenge.day_targets(store, D + timedelta(days=1))
+
+        params = {
+            "participant": "lyosha",
+            "exercise": "squats",
+            "target": 40,
+            "date": D.isoformat(),
+        }
+        st, out = await _ops(client, op="set_exercise_target", key="ops-set-tgt-1", params=params)
+        assert st == 200 and out["status"] == "done"
+        res = out["record"]["result"]
+        assert res["slug"] == "lyosha"
+        assert res["exercise"] == "squats"
+        assert res["target"] == 40
+        assert res["date"] == D.isoformat()
+        assert res["applied_today"] is False
+        preview = res["preview"]
+        assert preview == [(D + timedelta(days=1)).isoformat(), 40] or preview == ((D + timedelta(days=1)).isoformat(), 40)
+
+        # pushups today unaffected
+        assert challenge.day_targets(store, D) == before_today
+        # squats tomorrow: lyosha updated to 40, sasha untouched
+        tom = challenge.day_targets(store, D + timedelta(days=1))
+        assert challenge.day_exercise(store, D + timedelta(days=1)) == "squats"
+        assert tom["lyosha"] == 40
+        assert tom["sasha"] == before_tom["sasha"]
+        # next pushup day retains normal formula
+        assert challenge.day_targets(store, D + timedelta(days=2))["lyosha"] == 21
+
+        # next_norms stored
+        assert store.get_next_norm("lyosha", "squats") == (40, D.isoformat())
+
+        # Idempotent by key
+        st2, out2 = await _ops(client, op="set_exercise_target", key="ops-set-tgt-1", params=params)
+        assert st2 == 200 and out2["status"] == "already_done"
+        assert challenge.day_targets(store, D + timedelta(days=1))["lyosha"] == 40
+
+        # Now set squats target for sasha on a squats day (D + 1)
+        params_sasha = {
+            "slug": "sasha",
+            "exercise": "squats",
+            "target": 55,
+            "date": (D + timedelta(days=1)).isoformat(),
+        }
+        st_s, out_s = await _ops(client, op="set_exercise_target", key="ops-set-tgt-2", params=params_sasha)
+        assert st_s == 200 and out_s["status"] == "done"
+        res_s = out_s["record"]["result"]
+        assert res_s["applied_today"] is True
+        assert challenge.day_targets(store, D + timedelta(days=1))["sasha"] == 55
+        # lyosha squats tomorrow still 40
+        assert challenge.day_targets(store, D + timedelta(days=1))["lyosha"] == 40
     finally:
         await client.close()

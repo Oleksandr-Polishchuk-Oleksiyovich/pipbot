@@ -1,7 +1,7 @@
 """
 Box CLI: одноразова ідемпотентна адмін-операція на VM (POST /admin/ops, HMAC).
   python tools/vm_ops.py <op> --key <unique-key> --params '<json>' [--params-file f.json] [--dry-run]
-Ops: adjust_user, credit_attempt, send_message, admin_task_add, cv_cleanup. Повтор з тим самим key нічого не виконує вдруге.
+Ops: adjust_user, credit_attempt, send_message, admin_task_add, cv_cleanup, wake_test, set_leave, end_leave, correct_settlement, set_exercise_target. Повтор з тим самим key нічого не виконує вдруге.
 """
 import argparse
 import json

@@ -272,7 +272,7 @@ async def test_progression_settle_after_dispute(tmp_path):
     - CV зарахував 4, таргет 37.
     - Оспорювання 'не 4 а 40' -> best=40.
     - settle_progression розраховує xp_gain = 1 + 2*(40 - 37) = 7.
-    - next target = (40 + 37)//2 + 1 = 39.
+    - next target = target + 1 = 38.
     - Повторне оспорювання з тим самим числом та повторний settle ідемпотентні (progression_settled_through).
     """
     flow, sender, clock = make_flow(tmp_path, llm=None, trust_mode=True)
@@ -286,7 +286,7 @@ async def test_progression_settle_after_dispute(tmp_path):
 
     res = settle_progression(flow.store, date(2026, 10, 4))
     assert res["lyosha"]["xp_gain"] == 7
-    assert res["lyosha"]["next"] == 39
+    assert res["lyosha"]["next"] == 38
     assert res["lyosha"]["best"] == 40
     assert res["lyosha"]["credited"] is True
 

@@ -145,7 +145,7 @@ optionToConsider/        старі плани/дослідження (див. R
 | `GET /cv/jobs/{rid}/video` | box CV worker | байти відео (gateway сам качав із Telegram — box не знає `BOT_TOKEN`) |
 | `POST /cv/jobs/{rid}/result` | box CV worker | `{claim_token, ok, result, error}` |
 | `GET /admin/diag` | `tools/vm_diag.py` | read-only знімок VM: cv_jobs/video_checks/daily_attempts/users/XP + хвіст логів із редакцією секретів |
-| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test`, `set_leave`, `end_leave`, `correct_settlement` (виправлення вже проведеного розрахунку дня; `dry_run` дає план before/after) |
+| `POST /admin/ops` | `tools/vm_ops.py` | одноразові ідемпотентні (за `key`, запис у `bot_state: ops:<key>`) операції: `adjust_user`, `credit_attempt`, `send_message`, `admin_task_add`, `cv_cleanup`, `wake_test`, `set_leave`, `end_leave`, `correct_settlement`, `set_exercise_target` (виправлення вже проведеного розрахунку дня; `dry_run` дає план before/after) |
 | `GET /cv/worker_status` | box CLI, діагностика | `last_poll_age_s`, `queued`, `claimed`, `worker_polling`, `wake_configured` (будь-який `/cv/claim`, зокрема порожній long-poll, оновлює `bot_state: cv_last_poll_ts`) |
 | `POST /admin/secrets/wake`, `GET /admin/secrets/wake` | `tools/set_wake_webhook.py` | зберегти URL/ключ вебхука пробудження (лише https, файл 0600; значення не логуються й не повертаються) / `{configured}` |
 | `GET /admin_tasks`, `GET /admin_tasks/claim`, `POST /admin_tasks/{id}/result` | box (worker, CLI) | список / long-poll claim / результат (`done_pending_deploy` + `fix_commit` або `rejected`) |
@@ -158,7 +158,7 @@ Lease CV: claimed без результату довше `CV_LEASE_S` (300 с) �
 
 - **Розклад:** режим `ladder` («+1 щодня») або `alternate` (дні віджимань ↔ присідань, коефіцієнт `alt_squat_factor`); старт 31.08.2026.
   Норму можна перекрити `override_<slug>_<date>` та `next_norms`.
-- **Прогресія** (`core/progression.py`, при підсумку дня): залік → `next = (done + target)//2 + 1`, `done = max(best, target)`;
+- **Прогресія** (`core/progression.py`, при підсумку дня): залік → `next = target + 1`;
   не залік, але була спроба → `max(1, best − 5)`; не робив → `max(1, target − 10)`. Наступна норма діє для наступного дня тієї ж вправи.
 - **XP:** залік = +1, плюс +2 за кожне повторення понад норму; кожні 100 XP — рівень (+1 `max_lives`, життя відновлюються).
 - **Життя:** незакритий день → −1 життя; 0 життів → дискваліфікація. Режими новачків: Хардкор 2, Норма 5, Вітальний 10.

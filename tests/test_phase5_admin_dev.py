@@ -523,6 +523,88 @@ def test_active_request_limit(store):
     assert check_active_request_limit(store, author_slug=author)[0] is True
 
 
+def test_active_request_limit_ttl_expiry(store):
+    """TTL для admin_dev active-request guard: застарілі активні аудити переходять в expired і не блокують."""
+    from core.config import ADMIN_ACTIVE_REQUEST_TTL_HOURS
+    assert ADMIN_ACTIVE_REQUEST_TTL_HOURS == 2.0
+
+    author = "ttl_author"
+    # 1. Свіжий planned аудит блокує і не експайриться
+    store.create_admin_audit(
+        request_id="fresh-001",
+        author_slug=author,
+        request="fresh dev",
+        status="planned",
+    )
+    allowed, active_id = check_active_request_limit(store, author_slug=author)
+    assert not allowed
+    assert active_id == "fresh-001"
+    assert store.get_admin_audit("fresh-001").status == "planned"
+
+    # 2. Аудит старший за TTL (3 години) не блокує і переходить в 'expired'
+    with store._connect() as con:
+        con.execute("UPDATE admin_audit SET created_at = datetime('now', '-3 hours') WHERE request_id = 'fresh-001'")
+
+    allowed, active_id = check_active_request_limit(store, author_slug=author)
+    assert allowed is True
+    assert active_id is None
+    assert store.get_admin_audit("fresh-001").status == "expired"
+
+    # 3. Якщо є старий і новий аудит: після експірації старого залишається новий і блокує
+    store.create_admin_audit(
+        request_id="fresh-002",
+        author_slug=author,
+        request="fresh dev 2",
+        status="planned",
+    )
+    store.create_admin_audit(
+        request_id="stale-002",
+        author_slug=author,
+        request="stale dev",
+        status="waiting_approval",
+    )
+    with store._connect() as con:
+        con.execute("UPDATE admin_audit SET created_at = datetime('now', '-4 hours') WHERE request_id = 'stale-002'")
+
+    allowed, active_id = check_active_request_limit(store, author_slug=author)
+    assert not allowed
+    assert active_id == "fresh-002"
+    assert store.get_admin_audit("stale-002").status == "expired"
+    assert store.get_admin_audit("fresh-002").status == "planned"
+
+    # 4. Аудит із відсутнім або битим created_at вважається stale і переходить в 'expired'
+    store.update_admin_audit("fresh-002", status="deployed")
+    store.create_admin_audit(
+        request_id="bad-date-001",
+        author_slug=author,
+        request="broken date",
+        status="running",
+    )
+    with store._connect() as con:
+        con.execute("UPDATE admin_audit SET created_at = 'unparsable-date' WHERE request_id = 'bad-date-001'")
+
+    allowed, active_id = check_active_request_limit(store, author_slug=author)
+    assert allowed is True
+    assert active_id is None
+    assert store.get_admin_audit("bad-date-001").status == "expired"
+
+    # 5. Параметри now та ttl_hours працюють
+    store.create_admin_audit(
+        request_id="custom-ttl-001",
+        author_slug=author,
+        request="custom ttl",
+        status="planned",
+    )
+    allowed, active_id = check_active_request_limit(store, author_slug=author, ttl_hours=10.0)
+    assert not allowed
+    assert active_id == "custom-ttl-001"
+    # Зсув now вперед на 11 годин експайрить при ttl_hours=10.0
+    now_future = datetime.now() + timedelta(hours=11)
+    allowed, active_id = check_active_request_limit(store, author_slug=author, now=now_future, ttl_hours=10.0)
+    assert allowed is True
+    assert store.get_admin_audit("custom-ttl-001").status == "expired"
+
+
 @pytest.mark.asyncio
 async def test_command_approve_flow(tmp_path):
     """T-52: Команда /approve <request_id> схвалює запит на деплой."""
